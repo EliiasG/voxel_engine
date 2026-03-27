@@ -35,8 +35,8 @@ impl GenPool {
         let (res_tx, res_rx) = crossbeam_channel::unbounded::<GenResult>();
 
         let num_threads = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(4);
+            .map(|n| (n.get() / 2).max(1))
+            .unwrap_or(2);
 
         for i in 0..num_threads {
             let req_rx = req_rx.clone();

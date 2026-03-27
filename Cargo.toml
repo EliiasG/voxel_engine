@@ -18,6 +18,12 @@ glam = "0.29"
 fastnoise-lite = "1"
 crossbeam-channel = "0.5"
 
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
+
 # Keep our code debuggable, but optimize all dependencies
 [profile.dev]
 opt-level = 1

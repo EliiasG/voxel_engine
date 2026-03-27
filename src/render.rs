@@ -17,22 +17,20 @@ use wgpu::{
 };
 
 use crate::chunk::meshing::ChunkFaces;
-use crate::chunk::{ChunkLod, ChunkPos, FaceData, LoadedChunkIndex};
+use crate::chunk::{ChunkLod, ChunkPos, FaceData, LoadedChunkIndex, NUM_DIRECTIONS, DIR_OFFSETS};
 
-pub const PAGE_SIZE: usize = 512;
-pub const MAX_PAGES: usize = 65536; // ~256 MB face buffer
+pub const PAGE_SIZE: usize = 96;
+pub const PAGES_PER_SLAB: usize = 174763; // 128 MB face data per slab
+const MAX_INDIRECT: usize = 1024 * 1024; // max draw args across all slabs
 
 // --- GPU Types ---
 
-/// Per-page metadata. Integer chunk_pos + packed direction/lod.
-/// Written once at upload, never needs updating.
 #[repr(C)]
 #[derive(Copy, Clone, Pod, Zeroable)]
 pub struct PageMetadata {
     pub chunk_x: i32,
     pub chunk_y: i32,
     pub chunk_z: i32,
-    /// Bits 0-7: direction (0-5), bits 8-15: lod level
     pub direction_and_lod: u32,
 }
 
@@ -45,60 +43,147 @@ pub struct DrawIndirectArgs {
     pub first_instance: u32,
 }
 
+// --- Slab ---
+
+pub struct Slab {
+    pub face_buffer: Buffer,
+    pub metadata_buffer: Buffer,
+    pub metadata_bind_group: wgpu::BindGroup,
+    free_list: Vec<u32>,
+}
+
+impl Slab {
+    fn new(device: &Device, metadata_bg_layout: &wgpu::BindGroupLayout, index: usize) -> Self {
+        let face_buffer = device.create_buffer(&BufferDescriptor {
+            label: Some(&format!("Face buffer slab {index}")),
+            size: PAGES_PER_SLAB as u64 * PAGE_SIZE as u64 * std::mem::size_of::<FaceData>() as u64,
+            usage: BufferUsages::VERTEX | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let metadata_buffer = device.create_buffer(&BufferDescriptor {
+            label: Some(&format!("Metadata buffer slab {index}")),
+            size: PAGES_PER_SLAB as u64 * std::mem::size_of::<PageMetadata>() as u64,
+            usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let metadata_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some(&format!("Metadata BG slab {index}")),
+            layout: metadata_bg_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: metadata_buffer.as_entire_binding(),
+            }],
+        });
+
+        Self {
+            face_buffer,
+            metadata_buffer,
+            metadata_bind_group,
+            free_list: (0..PAGES_PER_SLAB as u32).rev().collect(),
+        }
+    }
+
+    fn allocate(&mut self) -> Option<u32> {
+        self.free_list.pop()
+    }
+
+    fn deallocate(&mut self, page: u32) {
+        self.free_list.push(page);
+    }
+
+    fn used_count(&self) -> usize {
+        PAGES_PER_SLAB - self.free_list.len()
+    }
+
+    fn is_full(&self) -> bool {
+        self.free_list.is_empty()
+    }
+}
+
 // --- Resources ---
 
-pub struct LodDrawRange {
+/// Draw range within the indirect buffer for one slab+LOD combination.
+pub struct SlabLodDraw {
+    pub slab_index: usize,
     pub offset: u64,
     pub count: u32,
 }
 
 #[derive(Resource)]
 pub struct GpuBuffers {
-    pub face_buffer: Buffer,
-    pub metadata_buffer: Buffer,
-    pub indirect_buffer: Buffer,
-    pub metadata_bind_group: wgpu::BindGroup,
+    pub slabs: Vec<Slab>,
     pub metadata_bind_group_layout: wgpu::BindGroupLayout,
-    pub lod_draws: Vec<LodDrawRange>,
+    pub indirect_buffer: Buffer,
+    pub draws: Vec<SlabLodDraw>,
 }
 
+impl GpuBuffers {
+    fn add_slab(&mut self, device: &Device) -> usize {
+        let index = self.slabs.len();
+        self.slabs.push(Slab::new(device, &self.metadata_bind_group_layout, index));
+        println!("Created slab {index} ({}MB each)", PAGES_PER_SLAB * PAGE_SIZE * 8 / (1024 * 1024));
+        index
+    }
+}
+
+/// Allocates pages across slabs. Grows by adding new slabs on demand.
 #[derive(Resource)]
 pub struct PageAllocator {
-    free_list: Vec<u32>,
+    // Thin wrapper -- actual free lists live in slabs
 }
 
 impl PageAllocator {
     pub fn new() -> Self {
-        Self {
-            free_list: (0..MAX_PAGES as u32).rev().collect(),
+        Self {}
+    }
+
+    /// Allocate a page, returns (slab_index, page_index_within_slab).
+    pub fn allocate(gpu: &mut GpuBuffers, device: &Device) -> (usize, u32) {
+        // Try existing slabs
+        for (i, slab) in gpu.slabs.iter_mut().enumerate() {
+            if let Some(page) = slab.allocate() {
+                return (i, page);
+            }
         }
+        // All full -- create new slab
+        let i = gpu.add_slab(device);
+        let page = gpu.slabs[i].allocate().expect("fresh slab should have pages");
+        (i, page)
     }
 
-    pub fn allocate(&mut self) -> Option<u32> {
-        self.free_list.pop()
+    pub fn deallocate(gpu: &mut GpuBuffers, slab_index: usize, page_index: u32) {
+        gpu.slabs[slab_index].deallocate(page_index);
     }
 
-    pub fn deallocate(&mut self, page: u32) {
-        self.free_list.push(page);
+    pub fn total_used(gpu: &GpuBuffers) -> usize {
+        gpu.slabs.iter().map(|s| s.used_count()).sum()
     }
 
-    pub fn used_count(&self) -> usize {
-        MAX_PAGES - self.free_list.len()
+    pub fn total_capacity(gpu: &GpuBuffers) -> usize {
+        gpu.slabs.len() * PAGES_PER_SLAB
     }
 }
 
 pub struct AllocatedPage {
+    pub slab_index: u16,
     pub page_index: u32,
     pub face_count: u32,
+}
+
+pub struct DirectionPages {
+    pub pages: Vec<AllocatedPage>,
+    pub standard_faces: u32,
+    pub total_faces: u32,
 }
 
 pub struct ChunkRenderEntry {
     pub chunk_pos: IVec3,
     pub lod: u8,
-    pub pages: Vec<AllocatedPage>,
+    pub directions: [DirectionPages; NUM_DIRECTIONS],
 }
 
-/// Tracks which pages belong to which chunk entity.
 #[derive(Resource, Default)]
 pub struct ChunkRenderData {
     pub entries: HashMap<Entity, ChunkRenderEntry>,
@@ -123,27 +208,6 @@ pub struct Wireframe(pub bool);
 // --- Initialization ---
 
 pub fn create_gpu_buffers(device: &Device) -> GpuBuffers {
-    let face_buffer = device.create_buffer(&BufferDescriptor {
-        label: Some("Face buffer"),
-        size: MAX_PAGES as u64 * PAGE_SIZE as u64 * std::mem::size_of::<FaceData>() as u64,
-        usage: BufferUsages::VERTEX | BufferUsages::COPY_DST,
-        mapped_at_creation: false,
-    });
-
-    let metadata_buffer = device.create_buffer(&BufferDescriptor {
-        label: Some("Metadata buffer"),
-        size: MAX_PAGES as u64 * std::mem::size_of::<PageMetadata>() as u64,
-        usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
-        mapped_at_creation: false,
-    });
-
-    let indirect_buffer = device.create_buffer(&BufferDescriptor {
-        label: Some("Indirect buffer"),
-        size: MAX_PAGES as u64 * std::mem::size_of::<DrawIndirectArgs>() as u64,
-        usage: BufferUsages::INDIRECT | BufferUsages::COPY_DST,
-        mapped_at_creation: false,
-    });
-
     let metadata_bind_group_layout =
         device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("Metadata BG Layout"),
@@ -161,23 +225,24 @@ pub fn create_gpu_buffers(device: &Device) -> GpuBuffers {
             }],
         });
 
-    let metadata_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("Metadata BG"),
-        layout: &metadata_bind_group_layout,
-        entries: &[wgpu::BindGroupEntry {
-            binding: 0,
-            resource: metadata_buffer.as_entire_binding(),
-        }],
+    let indirect_buffer = device.create_buffer(&BufferDescriptor {
+        label: Some("Indirect buffer"),
+        size: MAX_INDIRECT as u64 * std::mem::size_of::<DrawIndirectArgs>() as u64,
+        usage: BufferUsages::INDIRECT | BufferUsages::COPY_DST,
+        mapped_at_creation: false,
     });
 
-    GpuBuffers {
-        face_buffer,
-        metadata_buffer,
-        indirect_buffer,
-        metadata_bind_group,
+    let mut gpu = GpuBuffers {
+        slabs: Vec::new(),
         metadata_bind_group_layout,
-        lod_draws: Vec::new(),
-    }
+        indirect_buffer,
+        draws: Vec::new(),
+    };
+
+    // Start with one slab
+    gpu.add_slab(device);
+
+    gpu
 }
 
 pub fn create_camera_bind_group(device: &Device) -> CameraBindGroup {
@@ -314,7 +379,6 @@ pub fn init_pipelines(
 
 // --- Synchronize System ---
 
-/// Check if a LOD N chunk is fully covered by LOD N-1 children.
 fn is_fully_covered(chunk_pos: IVec3, lod: u8, index: &LoadedChunkIndex) -> bool {
     if lod == 0 {
         return false;
@@ -333,64 +397,80 @@ fn is_fully_covered(chunk_pos: IVec3, lod: u8, index: &LoadedChunkIndex) -> bool
     true
 }
 
-/// Uploads ChunkFaces to GPU pages and rebuilds the per-LOD indirect draw buffer.
 pub fn synchronize_gpu(
     mut commands: Commands,
     query: Query<(Entity, &ChunkPos, &ChunkLod, &ChunkFaces)>,
     mut render_data: ResMut<ChunkRenderData>,
     mut loaded_index: ResMut<LoadedChunkIndex>,
-    mut allocator: ResMut<PageAllocator>,
+    _allocator: Res<PageAllocator>,
     mut gpu: ResMut<GpuBuffers>,
+    device: Res<modul_core::DeviceRes>,
     queue: Res<modul_core::QueueRes>,
     config: Res<crate::chunk::loading::LoadConfig>,
 ) {
     for (entity, pos, lod, faces) in query.iter() {
-        // Deallocate old pages for this chunk
+        // Deallocate old pages
         if let Some(old) = render_data.entries.remove(&entity) {
-            for page in &old.pages {
-                allocator.deallocate(page.page_index);
+            for dir_pages in &old.directions {
+                for page in &dir_pages.pages {
+                    PageAllocator::deallocate(&mut gpu, page.slab_index as usize, page.page_index);
+                }
             }
         }
 
-        let mut new_pages = Vec::new();
+        let meta_base = PageMetadata {
+            chunk_x: pos.0.x,
+            chunk_y: pos.0.y,
+            chunk_z: pos.0.z,
+            direction_and_lod: 0,
+        };
 
-        for (dir, dir_faces) in faces.0.iter().enumerate() {
-            if dir_faces.is_empty() {
-                continue;
-            }
+        let directions = std::array::from_fn(|dir| {
+            let dir_faces = &faces.0[dir];
+            let standard_count = dir_faces.standard.len() as u32;
+            let total_count = standard_count + dir_faces.border.len() as u32;
 
-            for face_chunk in dir_faces.chunks(PAGE_SIZE) {
-                let Some(page_idx) = allocator.allocate() else {
-                    eprintln!("Out of pages!");
-                    break;
-                };
+            let combined: Vec<FaceData> = dir_faces
+                .standard
+                .iter()
+                .chain(dir_faces.border.iter())
+                .copied()
+                .collect();
 
+            let mut pages = Vec::new();
+            for face_chunk in combined.chunks(PAGE_SIZE) {
+                let (slab_idx, page_idx) = PageAllocator::allocate(&mut gpu, &device.0);
+
+                let slab = &gpu.slabs[slab_idx];
                 let face_offset =
                     page_idx as u64 * PAGE_SIZE as u64 * std::mem::size_of::<FaceData>() as u64;
                 queue
                     .0
-                    .write_buffer(&gpu.face_buffer, face_offset, bytemuck::cast_slice(face_chunk));
+                    .write_buffer(&slab.face_buffer, face_offset, bytemuck::cast_slice(face_chunk));
 
-                let meta = PageMetadata {
-                    chunk_x: pos.0.x,
-                    chunk_y: pos.0.y,
-                    chunk_z: pos.0.z,
+                let dir_meta = PageMetadata {
                     direction_and_lod: (dir as u32) | ((lod.0 as u32) << 8),
+                    ..meta_base
                 };
                 let meta_offset = page_idx as u64 * std::mem::size_of::<PageMetadata>() as u64;
                 queue
                     .0
-                    .write_buffer(&gpu.metadata_buffer, meta_offset, bytemuck::bytes_of(&meta));
+                    .write_buffer(&slab.metadata_buffer, meta_offset, bytemuck::bytes_of(&dir_meta));
 
-                new_pages.push(AllocatedPage {
+                pages.push(AllocatedPage {
+                    slab_index: slab_idx as u16,
                     page_index: page_idx,
                     face_count: face_chunk.len() as u32,
                 });
             }
-        }
 
-        // Mark chunk as rendered in index (even if zero faces).
-        // This drives LOD visibility: parent LOD hidden only when children are actually on GPU.
+            DirectionPages {
+                pages,
+                standard_faces: standard_count,
+                total_faces: total_count,
+            }
+        });
+
         loaded_index.0.insert((pos.0, lod.0));
 
         render_data.entries.insert(
@@ -398,20 +478,23 @@ pub fn synchronize_gpu(
             ChunkRenderEntry {
                 chunk_pos: pos.0,
                 lod: lod.0,
-                pages: new_pages,
+                directions,
             },
         );
         commands.entity(entity).remove::<ChunkFaces>();
     }
 
-    // Rebuild indirect buffer grouped by LOD (every frame -- cheap, keeps LOD visibility correct)
+    // Rebuild indirect buffer: group draw args by (slab, lod)
     {
         let lod_count = config.lod_count as usize;
-        let mut args_per_lod: Vec<Vec<DrawIndirectArgs>> =
-            (0..lod_count).map(|_| Vec::new()).collect();
+        let slab_count = gpu.slabs.len();
+
+        // args_per_slab_lod[slab][lod] = Vec<DrawIndirectArgs>
+        let mut args_per_slab_lod: Vec<Vec<Vec<DrawIndirectArgs>>> = (0..slab_count)
+            .map(|_| (0..lod_count).map(|_| Vec::new()).collect())
+            .collect();
 
         for entry in render_data.entries.values() {
-            // Skip LOD N pages fully covered by LOD N-1
             if entry.lod > 0
                 && is_fully_covered(entry.chunk_pos, entry.lod, &loaded_index)
             {
@@ -419,36 +502,75 @@ pub fn synchronize_gpu(
             }
 
             let lod = (entry.lod as usize).min(lod_count - 1);
-            for page in &entry.pages {
-                args_per_lod[lod].push(DrawIndirectArgs {
-                    vertex_count: 6,
-                    instance_count: page.face_count,
-                    first_vertex: 0,
-                    first_instance: page.page_index * PAGE_SIZE as u32,
-                });
+
+            for (dir, dir_pages) in entry.directions.iter().enumerate() {
+                if dir_pages.total_faces == 0 {
+                    continue;
+                }
+
+                let neighbor_pos = entry.chunk_pos + DIR_OFFSETS[dir];
+                let neighbor_covered = entry.lod > 0
+                    && is_fully_covered(neighbor_pos, entry.lod, &loaded_index);
+                let face_limit = if neighbor_covered {
+                    dir_pages.total_faces
+                } else {
+                    dir_pages.standard_faces
+                };
+
+                if face_limit == 0 {
+                    continue;
+                }
+
+                let mut faces_remaining = face_limit;
+                for page in &dir_pages.pages {
+                    if faces_remaining == 0 {
+                        break;
+                    }
+                    let count = page.face_count.min(faces_remaining);
+                    let slab = page.slab_index as usize;
+
+                    // Grow slab_lod vec if new slabs were added
+                    while args_per_slab_lod.len() <= slab {
+                        args_per_slab_lod.push((0..lod_count).map(|_| Vec::new()).collect());
+                    }
+
+                    args_per_slab_lod[slab][lod].push(DrawIndirectArgs {
+                        vertex_count: 6,
+                        instance_count: count,
+                        first_vertex: 0,
+                        first_instance: page.page_index * PAGE_SIZE as u32,
+                    });
+                    faces_remaining -= count;
+                }
             }
         }
 
-        // Write to indirect buffer sequentially, record per-LOD ranges
-        let mut lod_draws = Vec::new();
+        // Write all args to the indirect buffer, recording (slab, offset, count) per group.
+        // Draw order: LOD 0 across all slabs, then LOD 1, etc.
+        let mut draws = Vec::new();
         let mut offset = 0u64;
         let stride = std::mem::size_of::<DrawIndirectArgs>() as u64;
 
-        for args in &args_per_lod {
-            let byte_offset = offset;
-            if !args.is_empty() {
+        for lod in 0..lod_count {
+            for (slab_idx, slab_lods) in args_per_slab_lod.iter().enumerate() {
+                let args = &slab_lods[lod];
+                if args.is_empty() {
+                    continue;
+                }
+                let byte_offset = offset;
                 queue
                     .0
                     .write_buffer(&gpu.indirect_buffer, byte_offset, bytemuck::cast_slice(args));
+                draws.push(SlabLodDraw {
+                    slab_index: slab_idx,
+                    offset: byte_offset,
+                    count: args.len() as u32,
+                });
+                offset += args.len() as u64 * stride;
             }
-            lod_draws.push(LodDrawRange {
-                offset: byte_offset,
-                count: args.len() as u32,
-            });
-            offset += args.len() as u64 * stride;
         }
 
-        gpu.lod_draws = lod_draws;
+        gpu.draws = draws;
     }
 }
 
@@ -502,14 +624,17 @@ impl Operation for VoxelDrawOperation {
             let camera_bg = &world.resource::<CameraBindGroup>().bind_group;
             let gpu = world.resource::<GpuBuffers>();
             pass.set_bind_group(0, camera_bg, &[]);
-            pass.set_bind_group(1, &gpu.metadata_bind_group, &[]);
-            pass.set_vertex_buffer(0, gpu.face_buffer.slice(..));
 
-            // Draw LOD 0 first (writes depth), then LOD 1, 2, ... (depth-rejected if behind)
-            for draw in &gpu.lod_draws {
-                if draw.count > 0 {
-                    pass.multi_draw_indirect(&gpu.indirect_buffer, draw.offset, draw.count);
+            // Draw: iterate slab+LOD groups (already ordered LOD 0 first)
+            let mut current_slab = usize::MAX;
+            for draw in &gpu.draws {
+                if draw.slab_index != current_slab {
+                    current_slab = draw.slab_index;
+                    let slab = &gpu.slabs[current_slab];
+                    pass.set_vertex_buffer(0, slab.face_buffer.slice(..));
+                    pass.set_bind_group(1, &slab.metadata_bind_group, &[]);
                 }
+                pass.multi_draw_indirect(&gpu.indirect_buffer, draw.offset, draw.count);
             }
         });
     }

@@ -16,7 +16,7 @@ struct PageMetadata {
 @group(1) @binding(0)
 var<storage, read> metadata: array<PageMetadata>;
 
-const PAGE_SIZE: u32 = 512u;
+const PAGE_SIZE: u32 = 96u;
 const CHUNK_SIZE: i32 = 32;
 
 struct FaceInstance {

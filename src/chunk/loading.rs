@@ -18,7 +18,7 @@ impl Default for LoadConfig {
         Self {
             start_radius: 5,
             step: 3,
-            end_radius: 12,
+            end_radius: 11,
             lod_count: 6,
         }
     }
@@ -60,7 +60,7 @@ pub fn update_loader(
     mut lod_maps: ResMut<LodChunkMaps>,
     mut loaded_index: ResMut<LoadedChunkIndex>,
     mut render_data: ResMut<crate::render::ChunkRenderData>,
-    mut allocator: ResMut<crate::render::PageAllocator>,
+    mut gpu: ResMut<crate::render::GpuBuffers>,
     mut commands: Commands,
     chunk_data_query: Query<(), With<ChunkData>>,
 ) {
@@ -89,8 +89,12 @@ pub fn update_loader(
                 lod_maps.maps[lod as usize].remove(pos);
                 loaded_index.0.remove(&(*pos, lod as u8));
                 if let Some(entry) = render_data.entries.remove(entity) {
-                    for page in &entry.pages {
-                        allocator.deallocate(page.page_index);
+                    for dir_pages in &entry.directions {
+                        for page in &dir_pages.pages {
+                            crate::render::PageAllocator::deallocate(
+                                &mut gpu, page.slab_index as usize, page.page_index,
+                            );
+                        }
                     }
                 }
                 commands.entity(*entity).despawn();

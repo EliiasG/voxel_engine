@@ -250,6 +250,7 @@ fn init(
     commands.insert_resource(camera_bg);
     commands.insert_resource(voxel_pipeline);
     commands.insert_resource(render::PageAllocator::new());
+    // Note: GpuBuffers starts with 1 slab, grows automatically
     commands.insert_resource(render::Wireframe(false));
     commands.insert_resource(RunningSequenceQueue(SequenceQueue(vec![sequence])));
 }
@@ -272,7 +273,7 @@ fn process_input(
     mut wireframe: ResMut<render::Wireframe>,
     mut camera: ResMut<Camera>,
     render_data: Res<render::ChunkRenderData>,
-    allocator: Res<render::PageAllocator>,
+    _allocator: Res<render::PageAllocator>,
     gpu: Res<render::GpuBuffers>,
     frame_count: Res<FrameCount>,
     loaded_index: Res<chunk::LoadedChunkIndex>,
@@ -328,7 +329,10 @@ fn process_input(
                             println!("=== DEBUG (frame {}) ===", frame_count.0);
                             println!("  Pos: ({:.1}, {:.1}, {:.1})", pos[0], pos[1], pos[2]);
                             println!("  Chunk: ({}, {}, {})", cp.x, cp.y, cp.z);
-                            println!("  Pages: {}/{}", allocator.used_count(), render::MAX_PAGES);
+                            println!("  Pages: {}/{} ({} slabs)",
+                                render::PageAllocator::total_used(&gpu),
+                                render::PageAllocator::total_capacity(&gpu),
+                                gpu.slabs.len());
                             for lod in 0..config.lod_count {
                                 let in_map = lod_maps.maps[lod as usize].iter().count();
                                 let mut has_data = 0u32;
@@ -343,12 +347,33 @@ fn process_input(
                                     if needs_remesh_q.get(entity).is_ok() { waiting_mesh += 1; }
                                     if has_faces_q.get(entity).is_ok() { has_faces += 1; }
                                 }
-                                let draw_count = gpu.lod_draws.get(lod as usize).map_or(0, |d| d.count);
                                 println!(
-                                    "  LOD {}: {} map, {} data, {} gen-wait, {} mesh-wait, {} faces, {} uploaded, {} draws",
-                                    lod, in_map, has_data, waiting_gen, waiting_mesh, has_faces, in_loaded_idx, draw_count
+                                    "  LOD {}: {} map, {} data, {} gen-wait, {} mesh-wait, {} faces, {} uploaded",
+                                    lod, in_map, has_data, waiting_gen, waiting_mesh, has_faces, in_loaded_idx
                                 );
                             }
+                            let mut total_faces = 0u32;
+                            let mut standard_faces = 0u32;
+                            let mut page_count = 0u32;
+                            let mut page_face_sum = 0u32;
+                            for entry in render_data.entries.values() {
+                                for dp in &entry.directions {
+                                    total_faces += dp.total_faces;
+                                    standard_faces += dp.standard_faces;
+                                    for page in &dp.pages {
+                                        page_count += 1;
+                                        page_face_sum += page.face_count;
+                                    }
+                                }
+                            }
+                            let avg_fill = if page_count > 0 {
+                                page_face_sum as f32 / page_count as f32 / render::PAGE_SIZE as f32 * 100.0
+                            } else { 0.0 };
+                            let total_draws: u32 = gpu.draws.iter().map(|d| d.count).sum();
+                            println!("  Faces: {} standard + {} border = {} total",
+                                standard_faces, total_faces - standard_faces, total_faces);
+                            println!("  Page fill: {:.1}% avg ({} pages)", avg_fill, page_count);
+                            println!("  Total draws: {}", total_draws);
                             println!("========================");
                         }
                         _ => {}
