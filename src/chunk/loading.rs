@@ -16,9 +16,9 @@ pub struct LoadConfig {
 impl Default for LoadConfig {
     fn default() -> Self {
         Self {
-            start_radius: 5,
-            step: 3,
-            end_radius: 11,
+            start_radius: 4,
+            step: 2,
+            end_radius: 8,
             lod_count: 6,
         }
     }
@@ -55,16 +55,23 @@ fn build_job_queue(config: &LoadConfig) -> VecDeque<LoadJob> {
 /// Main loader system: tracks camera, unloads distant chunks, spawns new ones via job queue.
 pub fn update_loader(
     camera: Res<crate::Camera>,
+    debug: Res<crate::DebugMode>,
     config: Res<LoadConfig>,
     mut loader: ResMut<Loader>,
     mut lod_maps: ResMut<LodChunkMaps>,
     mut loaded_index: ResMut<LoadedChunkIndex>,
     mut render_data: ResMut<crate::render::ChunkRenderData>,
     mut gpu: ResMut<crate::render::GpuBuffers>,
+    mut shadow_grid: ResMut<crate::shadow::grid::ShadowGrid>,
+    mut bitmask_pool: ResMut<crate::shadow::grid::BitmaskPool>,
     mut commands: Commands,
     chunk_data_query: Query<(), With<ChunkData>>,
 ) {
-    let camera_chunk = camera.0.chunk_pos();
+    let camera_chunk = if let Some(ref frozen) = debug.frozen {
+        frozen.chunk_pos
+    } else {
+        camera.0.chunk_pos()
+    };
 
     // Detect camera chunk change
     let origin_changed = loader.last_origin != Some(camera_chunk);
@@ -97,6 +104,9 @@ pub fn update_loader(
                         }
                     }
                 }
+                crate::shadow::grid::remove_chunk_from_grid(
+                    &mut shadow_grid, &mut bitmask_pool, *pos, lod as u8,
+                );
                 commands.entity(*entity).despawn();
             }
 
@@ -108,6 +118,9 @@ pub fn update_loader(
                 );
             }
         }
+
+        // Update shadow grid origins for new camera position
+        shadow_grid.rebuild_origins(camera_chunk, &config);
 
         // Rebuild job queue from current position
         loader.jobs = build_job_queue(&config);

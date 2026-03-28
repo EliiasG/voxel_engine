@@ -5,9 +5,10 @@ use bytemuck::{Pod, Zeroable};
 use glam::IVec3;
 use modul_asset::{AssetId, AssetWorldExt, Assets};
 use modul_render::{
-    DirectRenderPipelineResourceProvider, GenericDepthStencilState, GenericFragmentState,
-    GenericMultisampleState, GenericRenderPipelineDescriptor, GenericVertexBufferLayout,
-    GenericVertexState, Operation, OperationBuilder, RenderPipelineManager, RenderTargetSource,
+    BindGroupLayoutProvider, DirectRenderPipelineResourceProvider, GenericDepthStencilState,
+    GenericFragmentState, GenericMultisampleState, GenericRenderPipelineDescriptor,
+    GenericVertexBufferLayout, GenericVertexState, Operation, OperationBuilder,
+    RenderPipelineManager, RenderTargetSource,
 };
 use wgpu::{
     BlendState, Buffer, BufferDescriptor, BufferUsages, ColorWrites, CommandEncoder,
@@ -41,6 +42,80 @@ pub struct DrawIndirectArgs {
     pub instance_count: u32,
     pub first_vertex: u32,
     pub first_instance: u32,
+}
+
+// --- Bind Group Layout Providers ---
+
+pub struct CameraBGLayout;
+
+impl BindGroupLayoutProvider for CameraBGLayout {
+    fn layout(&self) -> wgpu::BindGroupLayoutDescriptor<'_> {
+        static ENTRIES: [wgpu::BindGroupLayoutEntry; 1] = [wgpu::BindGroupLayoutEntry {
+            binding: 0,
+            visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Uniform,
+                has_dynamic_offset: false,
+                min_binding_size: std::num::NonZero::new(
+                    std::mem::size_of::<crate::camera::CameraUniform>() as u64,
+                ),
+            },
+            count: None,
+        }];
+        wgpu::BindGroupLayoutDescriptor {
+            label: Some("Camera BG Layout"),
+            entries: &ENTRIES,
+        }
+    }
+
+    fn library(&self) -> &str {
+        "\
+struct CameraUniform {
+    view_proj: mat4x4<f32>,
+    chunk_offset: vec3<i32>,
+};
+
+@group(#BIND_GROUP) @binding(0)
+var<uniform> camera: CameraUniform;
+"
+    }
+}
+
+pub struct MetadataBGLayout;
+
+impl BindGroupLayoutProvider for MetadataBGLayout {
+    fn layout(&self) -> wgpu::BindGroupLayoutDescriptor<'_> {
+        static ENTRIES: [wgpu::BindGroupLayoutEntry; 1] = [wgpu::BindGroupLayoutEntry {
+            binding: 0,
+            visibility: wgpu::ShaderStages::VERTEX,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Storage { read_only: true },
+                has_dynamic_offset: false,
+                min_binding_size: std::num::NonZero::new(
+                    std::mem::size_of::<PageMetadata>() as u64,
+                ),
+            },
+            count: None,
+        }];
+        wgpu::BindGroupLayoutDescriptor {
+            label: Some("Metadata BG Layout"),
+            entries: &ENTRIES,
+        }
+    }
+
+    fn library(&self) -> &str {
+        "\
+struct PageMetadata {
+    chunk_x: i32,
+    chunk_y: i32,
+    chunk_z: i32,
+    direction_and_lod: u32,
+};
+
+@group(#BIND_GROUP) @binding(0)
+var<storage, read> metadata: array<PageMetadata>;
+"
+    }
 }
 
 // --- Slab ---
@@ -117,6 +192,7 @@ pub struct GpuBuffers {
     pub metadata_bind_group_layout: wgpu::BindGroupLayout,
     pub indirect_buffer: Buffer,
     pub draws: Vec<SlabLodDraw>,
+    pub frustum_culled: u32,
 }
 
 impl GpuBuffers {
@@ -193,7 +269,6 @@ pub struct ChunkRenderData {
 pub struct CameraBindGroup {
     pub buffer: Buffer,
     pub bind_group: wgpu::BindGroup,
-    pub layout: wgpu::BindGroupLayout,
 }
 
 #[derive(Resource)]
@@ -209,21 +284,7 @@ pub struct Wireframe(pub bool);
 
 pub fn create_gpu_buffers(device: &Device) -> GpuBuffers {
     let metadata_bind_group_layout =
-        device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("Metadata BG Layout"),
-            entries: &[wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::VERTEX,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Storage { read_only: true },
-                    has_dynamic_offset: false,
-                    min_binding_size: std::num::NonZero::new(
-                        std::mem::size_of::<PageMetadata>() as u64,
-                    ),
-                },
-                count: None,
-            }],
-        });
+        device.create_bind_group_layout(&MetadataBGLayout.layout());
 
     let indirect_buffer = device.create_buffer(&BufferDescriptor {
         label: Some("Indirect buffer"),
@@ -237,6 +298,7 @@ pub fn create_gpu_buffers(device: &Device) -> GpuBuffers {
         metadata_bind_group_layout,
         indirect_buffer,
         draws: Vec::new(),
+        frustum_culled: 0,
     };
 
     // Start with one slab
@@ -246,27 +308,11 @@ pub fn create_gpu_buffers(device: &Device) -> GpuBuffers {
 }
 
 pub fn create_camera_bind_group(device: &Device) -> CameraBindGroup {
-    use crate::camera::CameraUniform;
-
-    let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-        label: Some("Camera BG Layout"),
-        entries: &[wgpu::BindGroupLayoutEntry {
-            binding: 0,
-            visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
-            ty: wgpu::BindingType::Buffer {
-                ty: wgpu::BufferBindingType::Uniform,
-                has_dynamic_offset: false,
-                min_binding_size: std::num::NonZero::new(
-                    std::mem::size_of::<CameraUniform>() as u64,
-                ),
-            },
-            count: None,
-        }],
-    });
+    let layout = device.create_bind_group_layout(&CameraBGLayout.layout());
 
     let buffer = device.create_buffer(&BufferDescriptor {
         label: Some("Camera uniform"),
-        size: std::mem::size_of::<CameraUniform>() as u64,
+        size: std::mem::size_of::<crate::camera::CameraUniform>() as u64,
         usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
         mapped_at_creation: false,
     });
@@ -280,11 +326,7 @@ pub fn create_camera_bind_group(device: &Device) -> CameraBindGroup {
         }],
     });
 
-    CameraBindGroup {
-        buffer,
-        bind_group,
-        layout,
-    }
+    CameraBindGroup { buffer, bind_group }
 }
 
 // --- Pipeline ---
@@ -332,7 +374,7 @@ fn create_pipeline_desc(
         },
         depth_stencil: Some(GenericDepthStencilState {
             depth_write_enable: true,
-            depth_compare: CompareFunction::Less,
+            depth_compare: CompareFunction::GreaterEqual,
             stencil: StencilState::default(),
             bias: DepthBiasState::default(),
         }),
@@ -350,20 +392,26 @@ fn create_pipeline_desc(
 
 pub fn init_pipelines(
     device: &Device,
-    camera_bg: &CameraBindGroup,
-    gpu_buffers: &GpuBuffers,
+    pipelines: &mut Assets<RenderPipelineManager>,
     shaders: &mut Assets<ShaderModule>,
     layouts: &mut Assets<PipelineLayout>,
-    pipelines: &mut Assets<RenderPipelineManager>,
 ) -> VoxelPipeline {
+    // Compose shader from bind group libraries + main shader
+    let camera_wgsl = CameraBGLayout.library().replace("#BIND_GROUP", "0");
+    let metadata_wgsl = MetadataBGLayout.library().replace("#BIND_GROUP", "1");
+    let full_source = format!("{camera_wgsl}\n{metadata_wgsl}\n{}", include_str!("voxel.wgsl"));
+
     let shader = shaders.add(device.create_shader_module(ShaderModuleDescriptor {
         label: Some("Voxel shader"),
-        source: ShaderSource::Wgsl(include_str!("voxel.wgsl").into()),
+        source: ShaderSource::Wgsl(full_source.into()),
     }));
 
+    // Create pipeline layout from bind group layout providers
+    let camera_layout = device.create_bind_group_layout(&CameraBGLayout.layout());
+    let metadata_layout = device.create_bind_group_layout(&MetadataBGLayout.layout());
     let layout = layouts.add(device.create_pipeline_layout(&PipelineLayoutDescriptor {
         label: Some("Voxel pipeline layout"),
-        bind_group_layouts: &[&camera_bg.layout, &gpu_buffers.metadata_bind_group_layout],
+        bind_group_layouts: &[&camera_layout, &metadata_layout],
         push_constant_ranges: &[],
     }));
 
@@ -407,6 +455,8 @@ pub fn synchronize_gpu(
     device: Res<modul_core::DeviceRes>,
     queue: Res<modul_core::QueueRes>,
     config: Res<crate::chunk::loading::LoadConfig>,
+    camera: Res<crate::Camera>,
+    debug: Res<crate::DebugMode>,
 ) {
     for (entity, pos, lod, faces) in query.iter() {
         // Deallocate old pages
@@ -489,10 +539,28 @@ pub fn synchronize_gpu(
         let lod_count = config.lod_count as usize;
         let slab_count = gpu.slabs.len();
 
+        // Compute frustum planes for culling (frozen in debug mode)
+        let (frustum_planes, frustum_chunk_offset) = match debug.frozen {
+            Some(ref f) => (f.planes, f.chunk_pos),
+            None => {
+                let u = camera.0.uniform();
+                (
+                    crate::camera::extract_frustum_planes(&u.view_proj),
+                    IVec3::from_array(u.chunk_offset),
+                )
+            }
+        };
+
         // args_per_slab_lod[slab][lod] = Vec<DrawIndirectArgs>
         let mut args_per_slab_lod: Vec<Vec<Vec<DrawIndirectArgs>>> = (0..slab_count)
             .map(|_| (0..lod_count).map(|_| Vec::new()).collect())
             .collect();
+
+        let mut frustum_culled = 0u32;
+        let cam_world = match debug.frozen {
+            Some(ref f) => f.camera_world,
+            None => camera.0.position,
+        };
 
         for entry in render_data.entries.values() {
             if entry.lod > 0
@@ -501,10 +569,52 @@ pub fn synchronize_gpu(
                 continue;
             }
 
+            // Frustum culling: test chunk AABB against frustum planes
+            let lod_scale = 1i32 << entry.lod;
+            let rel = entry.chunk_pos * lod_scale - frustum_chunk_offset;
+            let cs = crate::chunk::CHUNK_SIZE as f32;
+            let min = [rel.x as f32 * cs, rel.y as f32 * cs, rel.z as f32 * cs];
+            let extent = lod_scale as f32 * cs;
+            let max = [min[0] + extent, min[1] + extent, min[2] + extent];
+            if !crate::camera::is_aabb_in_frustum(&frustum_planes, min, max) {
+                frustum_culled += 1;
+                continue;
+            }
+
+            // World-space chunk bounds for direction culling
+            let cs_d = crate::chunk::CHUNK_SIZE as f64;
+            let lod_scale_d = lod_scale as f64;
+            let chunk_min_w = [
+                entry.chunk_pos.x as f64 * lod_scale_d * cs_d,
+                entry.chunk_pos.y as f64 * lod_scale_d * cs_d,
+                entry.chunk_pos.z as f64 * lod_scale_d * cs_d,
+            ];
+            let w_extent = lod_scale_d * cs_d;
+            let chunk_max_w = [
+                chunk_min_w[0] + w_extent,
+                chunk_min_w[1] + w_extent,
+                chunk_min_w[2] + w_extent,
+            ];
+
             let lod = (entry.lod as usize).min(lod_count - 1);
 
             for (dir, dir_pages) in entry.directions.iter().enumerate() {
                 if dir_pages.total_faces == 0 {
+                    continue;
+                }
+
+                // Direction culling: skip direction groups whose faces are
+                // all back-facing (camera is on the opposite side of the chunk).
+                let backface = match dir {
+                    0 => cam_world[0] <= chunk_min_w[0], // +X faces, cam to -X
+                    1 => cam_world[0] >= chunk_max_w[0], // -X faces, cam to +X
+                    2 => cam_world[1] <= chunk_min_w[1], // +Y faces, cam below
+                    3 => cam_world[1] >= chunk_max_w[1], // -Y faces, cam above
+                    4 => cam_world[2] <= chunk_min_w[2], // +Z faces, cam to -Z
+                    5 => cam_world[2] >= chunk_max_w[2], // -Z faces, cam to +Z
+                    _ => false,
+                };
+                if backface {
                     continue;
                 }
 
@@ -571,6 +681,7 @@ pub fn synchronize_gpu(
         }
 
         gpu.draws = draws;
+        gpu.frustum_culled = frustum_culled;
     }
 }
 

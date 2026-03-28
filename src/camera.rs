@@ -126,13 +126,15 @@ fn look_at(eye: [f32; 3], target: [f32; 3], up: [f32; 3]) -> [[f32; 4]; 4] {
     ]
 }
 
-fn perspective(fov_y: f32, aspect: f32, near: f32, far: f32) -> [[f32; 4]; 4] {
+fn perspective(fov_y: f32, aspect: f32, near: f32, _far: f32) -> [[f32; 4]; 4] {
+    // Reversed-Z with infinite far plane: near maps to 1.0, infinity maps to 0.0.
+    // This gives vastly better depth precision at all distances.
     let f = 1.0 / (fov_y / 2.0).tan();
     [
         [f / aspect, 0.0, 0.0, 0.0],
         [0.0, f, 0.0, 0.0],
-        [0.0, 0.0, far / (near - far), -1.0],
-        [0.0, 0.0, near * far / (near - far), 0.0],
+        [0.0, 0.0, 0.0, -1.0],
+        [0.0, 0.0, near, 0.0],
     ]
 }
 
@@ -170,4 +172,52 @@ fn normalize(v: [f32; 3]) -> [f32; 3] {
         return [0.0; 3];
     }
     [v[0] / len, v[1] / len, v[2] / len]
+}
+
+/// Extract 6 frustum planes from a view-projection matrix (wgpu depth [0,1]).
+/// Each plane [a, b, c, d] where ax + by + cz + d >= 0 means inside.
+pub fn extract_frustum_planes(vp: &[[f32; 4]; 4]) -> [[f32; 4]; 6] {
+    let row = |i: usize| -> [f32; 4] { [vp[0][i], vp[1][i], vp[2][i], vp[3][i]] };
+    let r0 = row(0);
+    let r1 = row(1);
+    let r2 = row(2);
+    let r3 = row(3);
+
+    let add = |a: [f32; 4], b: [f32; 4]| [a[0] + b[0], a[1] + b[1], a[2] + b[2], a[3] + b[3]];
+    let sub = |a: [f32; 4], b: [f32; 4]| [a[0] - b[0], a[1] - b[1], a[2] - b[2], a[3] - b[3]];
+
+    let mut planes = [
+        add(r3, r0), // Left
+        sub(r3, r0), // Right
+        add(r3, r1), // Bottom
+        sub(r3, r1), // Top
+        sub(r3, r2), // Near (reversed-Z: depth=1 at near)
+        r2,          // Far (reversed-Z: depth=0 at far/infinity)
+    ];
+
+    for plane in &mut planes {
+        let len = (plane[0] * plane[0] + plane[1] * plane[1] + plane[2] * plane[2]).sqrt();
+        if len > 0.0 {
+            plane[0] /= len;
+            plane[1] /= len;
+            plane[2] /= len;
+            plane[3] /= len;
+        }
+    }
+
+    planes
+}
+
+/// Test if an AABB is at least partially inside the frustum.
+pub fn is_aabb_in_frustum(planes: &[[f32; 4]; 6], min: [f32; 3], max: [f32; 3]) -> bool {
+    for plane in planes {
+        let px = if plane[0] >= 0.0 { max[0] } else { min[0] };
+        let py = if plane[1] >= 0.0 { max[1] } else { min[1] };
+        let pz = if plane[2] >= 0.0 { max[2] } else { min[2] };
+
+        if plane[0] * px + plane[1] * py + plane[2] * pz + plane[3] < 0.0 {
+            return false;
+        }
+    }
+    true
 }

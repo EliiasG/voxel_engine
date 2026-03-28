@@ -8,6 +8,7 @@ use super::{
     ChunkChange, ChunkChangedQueue, ChunkData, ChunkLod, ChunkPos, ChunkStorage,
     NeedsGeneration, AIR, CHUNK_SIZE, CHUNK_SIZE_2, CHUNK_SIZE_3, STONE,
 };
+use crate::shadow::bitmask::{self, ChunkBitmaskResult};
 
 struct GenRequest {
     entity: Entity,
@@ -20,6 +21,7 @@ struct GenResult {
     pos: IVec3,
     lod: u8,
     storage: ChunkStorage,
+    bitmask: ChunkBitmaskResult,
 }
 
 /// Channel-based worker pool for chunk generation.
@@ -46,11 +48,13 @@ impl GenPool {
                 .spawn(move || {
                     while let Ok(req) = req_rx.recv() {
                         let storage = generate_terrain(req.pos, req.lod);
+                        let bitmask = bitmask::build_bitmask(&storage);
                         let _ = res_tx.send(GenResult {
                             entity: req.entity,
                             pos: req.pos,
                             lod: req.lod,
                             storage,
+                            bitmask,
                         });
                     }
                 })
@@ -83,10 +87,19 @@ pub fn poll_generation(
     mut commands: Commands,
     pool: Res<GenPool>,
     mut changed: ResMut<ChunkChangedQueue>,
+    mut shadow_grid: ResMut<crate::shadow::grid::ShadowGrid>,
+    mut bitmask_pool: ResMut<crate::shadow::grid::BitmaskPool>,
     entity_check: Query<()>,
 ) {
     while let Ok(result) = pool.rx.try_recv() {
         if entity_check.get(result.entity).is_ok() {
+            crate::shadow::grid::update_grid_for_chunk(
+                &mut shadow_grid,
+                &mut bitmask_pool,
+                result.pos,
+                result.lod,
+                result.bitmask,
+            );
             commands
                 .entity(result.entity)
                 .insert(ChunkData(Arc::new(result.storage)));

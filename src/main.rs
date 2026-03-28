@@ -1,6 +1,7 @@
 mod camera;
 mod chunk;
 mod render;
+mod shadow;
 
 use std::collections::HashSet;
 
@@ -17,8 +18,8 @@ use modul_render::{
 };
 use modul_util::ExitPlugin;
 use wgpu::{
-    Backends, Color, DeviceDescriptor, Features, Instance, InstanceDescriptor, PipelineLayout,
-    PowerPreference, PresentMode, RequestAdapterOptions, ShaderModule, TextureFormat,
+    Backends, Color, DeviceDescriptor, Features, Instance, InstanceDescriptor,
+    PowerPreference, PresentMode, RequestAdapterOptions, TextureFormat,
     TextureUsages,
 };
 use winit::event::{DeviceEvent, ElementState, Event, KeyEvent, WindowEvent};
@@ -71,6 +72,17 @@ impl Default for InputState {
             dt: 1.0 / 60.0,
         }
     }
+}
+
+pub struct FrozenCulling {
+    pub chunk_pos: glam::IVec3,
+    pub planes: [[f32; 4]; 6],
+    pub camera_world: [f64; 3],
+}
+
+#[derive(Resource, Default)]
+pub struct DebugMode {
+    pub frozen: Option<FrozenCulling>,
 }
 
 struct VoxelGraphicsInitializer;
@@ -147,6 +159,8 @@ fn main() {
         app.insert_resource(chunk::LoadedChunkIndex::default());
         app.insert_resource(render::ChunkRenderData::default());
         app.insert_resource(chunk::loading::Loader::default());
+        app.insert_resource(shadow::grid::ShadowGrid::new(&load_config));
+        app.insert_resource(shadow::grid::BitmaskPool::new());
         app.insert_resource(load_config);
         app.insert_resource(chunk::generation::GenPool::new());
         app.insert_resource(chunk::meshing::MeshPool::new());
@@ -156,10 +170,12 @@ fn main() {
         // Init
         app.add_systems(Init, init);
 
-        // Gameplay systems (before render)
+        // Gameplay systems (before render). process_input runs first so debug
+        // mode and camera state are up-to-date before the loader sees them.
         app.add_systems(
             Redraw,
             (
+                process_input,
                 chunk::loading::update_loader,
                 apply_deferred,
                 chunk::generation::poll_generation,
@@ -174,11 +190,16 @@ fn main() {
                 .before(RenderSystemSet),
         );
 
-        // Input handling
-        app.add_systems(Redraw, process_input.before(RenderSystemSet));
-
         // GPU synchronization
-        app.add_systems(Synchronize, (render::synchronize_gpu, update_camera));
+        app.add_systems(
+            Synchronize,
+            (
+                render::synchronize_gpu,
+                shadow::gpu::synchronize_shadow_buffers,
+                update_camera,
+                shadow::pass::update_previous_frame_data,
+            ),
+        );
     });
 }
 
@@ -186,10 +207,11 @@ fn init(
     mut commands: Commands,
     device: Res<DeviceRes>,
     main_window: Query<Entity, With<MainWindow>>,
-    mut shaders: ResMut<Assets<ShaderModule>>,
-    mut layouts: ResMut<Assets<PipelineLayout>>,
+    mut shaders: ResMut<Assets<wgpu::ShaderModule>>,
+    mut layouts: ResMut<Assets<wgpu::PipelineLayout>>,
     mut pipelines: ResMut<Assets<RenderPipelineManager>>,
     mut sequences: ResMut<Assets<Sequence>>,
+    shadow_grid: Res<shadow::grid::ShadowGrid>,
 ) {
     let window_entity = main_window.single();
 
@@ -208,9 +230,9 @@ fn init(
                 format_override: None,
             },
             depth_stencil_config: Some(RenderTargetDepthStencilConfig {
-                clear_depth: 1.0,
+                clear_depth: 0.0,
                 clear_stencil: 0,
-                usages: TextureUsages::RENDER_ATTACHMENT,
+                usages: TextureUsages::RENDER_ATTACHMENT | TextureUsages::TEXTURE_BINDING,
                 format: TextureFormat::Depth32Float,
             }),
             desired_maximum_frame_latency: 2,
@@ -220,21 +242,28 @@ fn init(
 
     let gpu_buffers = render::create_gpu_buffers(&device.0);
     let camera_bg = render::create_camera_bind_group(&device.0);
+    let shadow_gpu = shadow::gpu::ShadowGpuBuffers::new(&device.0, &shadow_grid);
 
     let voxel_pipeline = render::init_pipelines(
         &device.0,
-        &camera_bg,
-        &gpu_buffers,
+        &mut pipelines,
         &mut shaders,
         &mut layouts,
-        &mut pipelines,
+    );
+
+    let shadow_pass_res = shadow::pass::ShadowPassResources::new(
+        &device.0, &shadow_gpu, 800, 600, 1, // initial size, full res for debugging
     );
 
     let render_target = RenderTargetSource::Surface(window_entity);
     let mut builder = SequenceBuilder::new();
     builder
         .add(render::ClearAll { render_target })
+        .add(shadow::pass::ShadowTraceOperationBuilder)
         .add(render::VoxelDrawOperationBuilder {
+            target: render_target,
+        })
+        .add(shadow::pass::ShadowDebugOverlayBuilder {
             target: render_target,
         });
     let sequence = builder.finish(&mut sequences);
@@ -248,10 +277,15 @@ fn init(
     commands.insert_resource(FrameCount(0));
     commands.insert_resource(gpu_buffers);
     commands.insert_resource(camera_bg);
+    commands.insert_resource(shadow_gpu);
+    commands.insert_resource(shadow_pass_res);
+    commands.insert_resource(shadow::pass::ShadowConfig::default());
+    commands.insert_resource(shadow::pass::SunDirection::default());
+    commands.insert_resource(shadow::pass::PreviousFrameData::default());
     commands.insert_resource(voxel_pipeline);
     commands.insert_resource(render::PageAllocator::new());
-    // Note: GpuBuffers starts with 1 slab, grows automatically
     commands.insert_resource(render::Wireframe(false));
+    commands.insert_resource(DebugMode::default());
     commands.insert_resource(RunningSequenceQueue(SequenceQueue(vec![sequence])));
 }
 
@@ -271,9 +305,9 @@ fn process_input(
     events: Res<EventBuffer>,
     mut input: ResMut<InputState>,
     mut wireframe: ResMut<render::Wireframe>,
+    mut debug: ResMut<DebugMode>,
     mut camera: ResMut<Camera>,
     render_data: Res<render::ChunkRenderData>,
-    _allocator: Res<render::PageAllocator>,
     gpu: Res<render::GpuBuffers>,
     frame_count: Res<FrameCount>,
     loaded_index: Res<chunk::LoadedChunkIndex>,
@@ -322,6 +356,20 @@ fn process_input(
                         KeyCode::KeyF => {
                             wireframe.0 = !wireframe.0;
                             println!("Wireframe: {}", wireframe.0);
+                        }
+                        KeyCode::Tab => {
+                            if debug.frozen.is_some() {
+                                debug.frozen = None;
+                                println!("Debug mode OFF");
+                            } else {
+                                let u = camera.0.uniform();
+                                debug.frozen = Some(FrozenCulling {
+                                    chunk_pos: glam::IVec3::from_array(u.chunk_offset),
+                                    planes: camera::extract_frustum_planes(&u.view_proj),
+                                    camera_world: camera.0.position,
+                                });
+                                println!("Debug mode ON - frustum & loading frozen, fly freely to inspect");
+                            }
                         }
                         KeyCode::F12 => {
                             let pos = camera.0.position;
@@ -374,6 +422,10 @@ fn process_input(
                                 standard_faces, total_faces - standard_faces, total_faces);
                             println!("  Page fill: {:.1}% avg ({} pages)", avg_fill, page_count);
                             println!("  Total draws: {}", total_draws);
+                            println!("  Frustum culled: {} chunks", gpu.frustum_culled);
+                            if debug.frozen.is_some() {
+                                println!("  [DEBUG MODE ACTIVE]");
+                            }
                             println!("========================");
                         }
                         _ => {}
@@ -463,6 +515,7 @@ fn update_camera(
     mut camera: ResMut<Camera>,
     mut frame_count: ResMut<FrameCount>,
     mut fps: ResMut<FpsCounter>,
+    debug: Res<DebugMode>,
     queue: Res<QueueRes>,
     camera_bg: Res<render::CameraBindGroup>,
     rt_query: Query<&modul_render::SurfaceRenderTarget, With<MainWindow>>,
@@ -478,8 +531,12 @@ fn update_camera(
         fps.last_instant = std::time::Instant::now();
 
         if let Ok(wc) = window_query.get_single() {
-            wc.window
-                .set_title(&format!("Voxel Engine \u{2014} {:.0} FPS", fps.fps));
+            let title = if debug.frozen.is_some() {
+                format!("Voxel Engine \u{2014} {:.0} FPS [DEBUG]", fps.fps)
+            } else {
+                format!("Voxel Engine \u{2014} {:.0} FPS", fps.fps)
+            };
+            wc.window.set_title(&title);
         }
     }
 
