@@ -208,6 +208,15 @@ fn fs_shadow(in: ShadowVaryings) -> @location(0) vec4<f32> {
 
     let ray_dir = normalize(shadow.sun_direction);
 
+    // If surface faces away from sun, it's in shadow — no ray trace needed.
+    let ddx_pos = dpdx(cam_rel_pos);
+    let ddy_pos = dpdy(cam_rel_pos);
+    let approx_normal = normalize(cross(ddy_pos, ddx_pos));
+    let facing_sun = dot(approx_normal, ray_dir) > 0.0;
+    if (!facing_sun) {
+        return vec4<f32>(0.0, 0.0, 0.0, 1.0);
+    }
+
     // Determine starting LOD from world_pos (before offset)
     var current_lod = 0u;
     for (var l = 0u; l < shadow.lod_count; l++) {
@@ -224,7 +233,7 @@ fn fs_shadow(in: ShadowVaryings) -> @location(0) vec4<f32> {
 
     let start_voxel_size = f32(1u << current_lod);
     let dist = length(cam_rel_pos);
-    let bias = mix(0.1, 1.5, clamp(dist / 500.0, 0.0, 1.0));
+    let bias = mix(0.025, 1.5, clamp(dist / 500.0, 0.0, 1.0));
     var pos = world_pos + ray_dir * bias * start_voxel_size;
     var total_dist = 0.0;
 

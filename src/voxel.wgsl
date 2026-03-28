@@ -126,10 +126,13 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         0.2 + 0.2 * height_color,
     );
 
-    let light_dir = normalize(vec3<f32>(0.3, 1.0, 0.5));
-    let ndotl = max(dot(in.normal, light_dir), 0.0);
+    let light_dir = normalize(vec3<f32>(0.3, 0.47, 0.5));
+    let raw_ndotl = dot(in.normal, light_dir);
+    let ndotl = max(raw_ndotl, 0.0);
     let ambient = 0.3;
-    let diffuse = 0.7 * ndotl;
+    // Faces pointing away from sun are always in shadow regardless of shadow mask.
+    let facing_shadow = select(0.0, 1.0, raw_ndotl > 0.0);
+    let diffuse = 0.7 * ndotl * facing_shadow;
     let lit_color = base_color * (ambient + diffuse);
 
     return vec4<f32>(lit_color, 1.0);

@@ -19,7 +19,7 @@ pub struct ShadowConfig {
 impl Default for ShadowConfig {
     fn default() -> Self {
         Self {
-            scale_denominator: 1,
+            scale_denominator: 3,
             debug_overlay: true,
         }
     }
@@ -275,6 +275,20 @@ impl ShadowPassResources {
     }
 }
 
+impl ShadowPassResources {
+    pub fn resize(&mut self, device: &Device, width: u32, height: u32, scale: u32) {
+        let sw = (width / scale).max(1);
+        let sh = (height / scale).max(1);
+        if (sw, sh) == self.current_size {
+            return;
+        }
+        let (tex, view) = create_shadow_mask_texture(device, sw, sh);
+        self.shadow_mask_texture = tex;
+        self.shadow_mask_view = view;
+        self.current_size = (sw, sh);
+    }
+}
+
 // --- Systems ---
 
 pub fn update_previous_frame_data(
@@ -365,6 +379,22 @@ impl Operation for ShadowTraceOperation {
         let prev = world.resource::<PreviousFrameData>();
         if !prev.valid {
             return;
+        }
+
+        // Resize shadow mask if window size changed
+        {
+            let main_window = world
+                .query_filtered::<bevy_ecs::prelude::Entity, bevy_ecs::prelude::With<modul_core::MainWindow>>()
+                .single(world);
+            let size = world
+                .get::<modul_render::SurfaceRenderTarget>(main_window)
+                .map(|rt| modul_render::RenderTarget::size(rt));
+            if let Some((w, h)) = size {
+                let scale = world.resource::<ShadowConfig>().scale_denominator;
+                world.resource_scope(|world, mut device: bevy_ecs::prelude::Mut<modul_core::DeviceRes>| {
+                    world.resource_mut::<ShadowPassResources>().resize(&device.0, w, h, scale);
+                });
+            }
         }
 
         // Extract uniform data from resources (release borrows before query)
