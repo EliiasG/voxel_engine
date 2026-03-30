@@ -17,7 +17,7 @@ struct ShadowUniform {
     lod_count: u32,
     grid_size: u32,
     frame_index: u32,
-    _pad1: u32,
+    camera_moving: u32,
     prev_view_proj: mat4x4<f32>,
     prev_chunk_offset: vec3<i32>,
     _pad2: i32,
@@ -106,6 +106,7 @@ fn grid_lookup(lod: u32, chunk_pos: vec3<i32>) -> u32 {
 }
 
 // Trace ray through a single chunk's bitmask. Returns true if hit.
+// Flat DDA through 32x32x32 with O(1) coarse region skipping.
 fn trace_chunk_bitmask(
     slot: u32,
     ray_pos: vec3<f32>,
@@ -113,81 +114,61 @@ fn trace_chunk_bitmask(
     chunk_origin: vec3<f32>,
     voxel_size: f32,
 ) -> bool {
-    // Position in chunk-local voxel coords (0..32)
-    let local_start = (ray_pos - chunk_origin) / voxel_size;
-
-    // DDA through 4x4x4 coarse regions (each 8 voxels wide)
-    let coarse_size = 8.0;
+    let local = (ray_pos - chunk_origin) / voxel_size;
     let inv_dir = 1.0 / ray_dir;
-
-    var coarse_pos = vec3<i32>(floor(local_start / coarse_size));
     let step = vec3<i32>(sign(ray_dir));
-    let step_f = vec3<f32>(sign(ray_dir));
 
-    // Distance to next coarse boundary
+    var vpos = vec3<i32>(floor(local));
+    vpos = clamp(vpos, vec3<i32>(0), vec3<i32>(31));
+
     var t_max = (vec3<f32>(
-        select(f32(coarse_pos.x), f32(coarse_pos.x + 1), ray_dir.x >= 0.0),
-        select(f32(coarse_pos.y), f32(coarse_pos.y + 1), ray_dir.y >= 0.0),
-        select(f32(coarse_pos.z), f32(coarse_pos.z + 1), ray_dir.z >= 0.0),
-    ) * coarse_size - local_start) * inv_dir;
+        select(f32(vpos.x), f32(vpos.x + 1), ray_dir.x >= 0.0),
+        select(f32(vpos.y), f32(vpos.y + 1), ray_dir.y >= 0.0),
+        select(f32(vpos.z), f32(vpos.z + 1), ray_dir.z >= 0.0),
+    ) - local) * inv_dir;
 
-    let t_delta = abs(vec3<f32>(coarse_size) * inv_dir);
+    let t_delta = abs(inv_dir);
 
-    for (var i = 0u; i < 24u; i++) {
-        if (any(coarse_pos < vec3<i32>(0)) || any(coarse_pos >= vec3<i32>(4))) {
+    for (var i = 0u; i < 96u; i++) {
+        if (any(vpos < vec3<i32>(0)) || any(vpos >= vec3<i32>(32))) {
             break;
         }
 
-        if (test_coarse_bit(slot, u32(coarse_pos.x), u32(coarse_pos.y), u32(coarse_pos.z))) {
-            // DDA through individual voxels in this 8^3 region
-            let region_origin = vec3<f32>(coarse_pos) * coarse_size;
-            let fine_start = clamp(local_start + ray_dir * max(0.0, min(t_max.x, min(t_max.y, t_max.z)) - max(t_delta.x, max(t_delta.y, t_delta.z))), region_origin, region_origin + vec3<f32>(7.999));
+        let coarse = vec3<u32>(vpos) / 8u;
+        if (!test_coarse_bit(slot, coarse.x, coarse.y, coarse.z)) {
+            // Empty 8x8x8 region — jump to exit face in O(1)
+            let exit_face = vec3<f32>(
+                select(f32(coarse.x * 8u), f32((coarse.x + 1u) * 8u), ray_dir.x >= 0.0),
+                select(f32(coarse.y * 8u), f32((coarse.y + 1u) * 8u), ray_dir.y >= 0.0),
+                select(f32(coarse.z * 8u), f32((coarse.z + 1u) * 8u), ray_dir.z >= 0.0),
+            );
+            let t_exit = (exit_face - local) * inv_dir;
+            let t_skip = min(t_exit.x, min(t_exit.y, t_exit.z));
 
-            var fine_pos = vec3<i32>(floor(max(local_start, region_origin)));
-            // Clamp to region bounds
-            fine_pos = clamp(fine_pos, coarse_pos * 8, coarse_pos * 8 + 7);
+            let new_pos = local + ray_dir * (t_skip + 0.001);
+            vpos = vec3<i32>(floor(new_pos));
+            vpos = clamp(vpos, vec3<i32>(0), vec3<i32>(31));
 
-            var ft_max = (vec3<f32>(
-                select(f32(fine_pos.x), f32(fine_pos.x + 1), ray_dir.x >= 0.0),
-                select(f32(fine_pos.y), f32(fine_pos.y + 1), ray_dir.y >= 0.0),
-                select(f32(fine_pos.z), f32(fine_pos.z + 1), ray_dir.z >= 0.0),
-            ) - local_start) * inv_dir;
-
-            let ft_delta = abs(inv_dir);
-            let region_max = coarse_pos * 8 + 8;
-
-            for (var j = 0u; j < 32u; j++) {
-                if (any(fine_pos < coarse_pos * 8) || any(fine_pos >= region_max)) {
-                    break;
-                }
-
-                if (test_fine_bit(slot, u32(fine_pos.x), u32(fine_pos.y), u32(fine_pos.z))) {
-                    return true;
-                }
-
-                // Advance DDA
-                if (ft_max.x < ft_max.y && ft_max.x < ft_max.z) {
-                    fine_pos.x += step.x;
-                    ft_max.x += ft_delta.x;
-                } else if (ft_max.y < ft_max.z) {
-                    fine_pos.y += step.y;
-                    ft_max.y += ft_delta.y;
-                } else {
-                    fine_pos.z += step.z;
-                    ft_max.z += ft_delta.z;
-                }
-            }
+            t_max = (vec3<f32>(
+                select(f32(vpos.x), f32(vpos.x + 1), ray_dir.x >= 0.0),
+                select(f32(vpos.y), f32(vpos.y + 1), ray_dir.y >= 0.0),
+                select(f32(vpos.z), f32(vpos.z + 1), ray_dir.z >= 0.0),
+            ) - local) * inv_dir;
+            continue;
         }
 
-        // Advance coarse DDA
+        if (test_fine_bit(slot, u32(vpos.x), u32(vpos.y), u32(vpos.z))) {
+            return true;
+        }
+
         if (t_max.x < t_max.y && t_max.x < t_max.z) {
-            coarse_pos.x += step.x;
+            vpos.x += step.x;
             t_max.x += t_delta.x;
         } else if (t_max.y < t_max.z) {
-            coarse_pos.y += step.y;
+            vpos.y += step.y;
             t_max.y += t_delta.y;
         } else {
-            coarse_pos.z += step.z;
+            vpos.z += step.z;
             t_max.z += t_delta.z;
         }
     }
@@ -248,7 +229,8 @@ fn fs_shadow(in: ShadowVaryings) -> @location(0) vec4<f32> {
 
             let start_voxel_size = f32(1u << current_lod);
             let dist = length(cam_rel_pos);
-            let bias = mix(0.025, 1.5, clamp(dist / 500.0, 0.0, 1.0));
+            let t = clamp(dist / 500.0, 0.0, 1.0);
+            let bias = mix(0.025, 15.0, t * t);
             var pos = world_pos + ray_dir * bias * start_voxel_size;
             var total_dist = 0.0;
             var hit = false;
@@ -306,35 +288,11 @@ fn fs_shadow(in: ShadowVaryings) -> @location(0) vec4<f32> {
         }
     }
 
-    // Temporal accumulation with reprojection
+    // Temporal accumulation — disabled during camera motion to avoid blur
     var result = trace_result;
-    if (depth > 0.0) {
-        // Reproject current world position into previous frame's screen space
-        let ndc_reproj = vec4<f32>(
-            jittered_uv.x * 2.0 - 1.0,
-            (1.0 - jittered_uv.y) * 2.0 - 1.0,
-            depth,
-            1.0,
-        );
-        let clip_reproj = shadow.inv_view_proj * ndc_reproj;
-        let cam_rel = clip_reproj.xyz / clip_reproj.w;
-
-        // Adjust for chunk offset change between frames
-        let offset_delta = vec3<f32>((shadow.chunk_offset - shadow.prev_chunk_offset) * CHUNK_SIZE);
-        let prev_rel = cam_rel + offset_delta;
-
-        let prev_clip = shadow.prev_view_proj * vec4<f32>(prev_rel, 1.0);
-        let prev_ndc = prev_clip.xy / prev_clip.w;
-        let prev_uv = vec2<f32>(prev_ndc.x * 0.5 + 0.5, 0.5 - prev_ndc.y * 0.5);
-
-        // Only blend if previous UV is valid (on screen)
-        if (all(prev_uv >= vec2<f32>(0.0)) && all(prev_uv <= vec2<f32>(1.0))) {
-            let prev_sample = textureSample(prev_accum_tex, prev_accum_sampler, prev_uv).r;
-            // Reject temporal blending on fast motion (reduces ghosting)
-            let motion = length(prev_uv - in.uv) * shadow.shadow_tex_size.x;
-            let blend = clamp(motion * 4.0, 0.25, 1.0);
-            result = mix(prev_sample, trace_result, blend);
-        }
+    if (shadow.camera_moving == 0u && depth > 0.0) {
+        let prev_sample = textureSample(prev_accum_tex, prev_accum_sampler, in.uv).r;
+        result = mix(prev_sample, trace_result, 0.25);
     }
 
     return vec4<f32>(result, result, result, 1.0);

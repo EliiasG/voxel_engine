@@ -1,6 +1,7 @@
 use bevy_ecs::prelude::*;
 use bytemuck::{Pod, Zeroable};
-use modul_render::{Operation, OperationBuilder, RenderTargetSource};
+use modul_asset::AssetWorldExt;
+use modul_render::{BindGroupLayoutProvider, Operation, OperationBuilder, RenderTargetSource};
 use wgpu::{
     Buffer, BufferDescriptor, BufferUsages, CommandEncoder, Device, TextureFormat,
     TextureUsages,
@@ -76,7 +77,7 @@ pub struct ShadowPassUniform {
     pub lod_count: u32,
     pub grid_size: u32,
     pub frame_index: u32,
-    pub _pad1: u32,
+    pub camera_moving: u32,
     pub prev_view_proj: [[f32; 4]; 4],
     pub prev_chunk_offset: [i32; 3],
     pub _pad2: i32,
@@ -93,12 +94,38 @@ pub struct ShadowPassResources {
     pub shadow_mask_sampler: wgpu::Sampler,
     pub shadow_uniform_buffer: Buffer,
     pub shadow_pipeline: wgpu::RenderPipeline,
+    /// Downscaled depth texture for current-frame shadow tracing
+    pub shadow_depth_texture: wgpu::Texture,
+    pub shadow_depth_view: wgpu::TextureView,
     pub depth_bind_group_layout: wgpu::BindGroupLayout,
     pub prev_accum_bind_group_layout: wgpu::BindGroupLayout,
     pub uniform_bind_group_layout: wgpu::BindGroupLayout,
     pub uniform_bind_group: wgpu::BindGroup,
     pub current_size: (u32, u32),
     pub ping_pong_index: u32,
+}
+
+fn create_shadow_depth_texture(
+    device: &Device,
+    width: u32,
+    height: u32,
+) -> (wgpu::Texture, wgpu::TextureView) {
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("Shadow depth"),
+        size: wgpu::Extent3d {
+            width: width.max(1),
+            height: height.max(1),
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: TextureFormat::Depth32Float,
+        usage: TextureUsages::RENDER_ATTACHMENT | TextureUsages::TEXTURE_BINDING,
+        view_formats: &[],
+    });
+    let view = texture.create_view(&Default::default());
+    (texture, view)
 }
 
 fn create_shadow_mask_texture(
@@ -159,6 +186,7 @@ impl ShadowPassResources {
 
         let tex0 = create_shadow_mask_texture(device, sw, sh);
         let tex1 = create_shadow_mask_texture(device, sw, sh);
+        let (shadow_depth_texture, shadow_depth_view) = create_shadow_depth_texture(device, sw, sh);
 
         let shadow_mask_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("Shadow mask sampler"),
@@ -300,6 +328,8 @@ impl ShadowPassResources {
             shadow_mask_sampler,
             shadow_uniform_buffer,
             shadow_pipeline,
+            shadow_depth_texture,
+            shadow_depth_view,
             depth_bind_group_layout,
             prev_accum_bind_group_layout,
             uniform_bind_group_layout,
@@ -317,6 +347,9 @@ impl ShadowPassResources {
         }
         self.shadow_textures[0] = create_shadow_mask_texture(device, sw, sh);
         self.shadow_textures[1] = create_shadow_mask_texture(device, sw, sh);
+        let (dt, dv) = create_shadow_depth_texture(device, sw, sh);
+        self.shadow_depth_texture = dt;
+        self.shadow_depth_view = dv;
         self.current_size = (sw, sh);
         self.ping_pong_index = 0;
     }
@@ -419,16 +452,102 @@ fn invert_mat4(m: &[[f32; 4]; 4]) -> [[f32; 4]; 4] {
 
 // --- Operations ---
 
+/// Renders voxel geometry depth-only to the downscaled shadow depth texture.
+pub struct ShadowDepthOperation;
+
+impl Operation for ShadowDepthOperation {
+    fn run(&mut self, world: &mut World, command_encoder: &mut CommandEncoder) {
+        let shadow_res = world.resource::<ShadowPassResources>();
+        let (sw, sh) = shadow_res.current_size;
+        let shadow_depth_view = &shadow_res.shadow_depth_view;
+
+        // Begin depth-only render pass on the shadow depth texture
+        let mut pass = command_encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("Shadow depth pass"),
+            color_attachments: &[],
+            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                view: shadow_depth_view,
+                depth_ops: Some(wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(0.0), // reversed-Z: clear to 0
+                    store: wgpu::StoreOp::Store,
+                }),
+                stencil_ops: None,
+            }),
+            timestamp_writes: None,
+            occlusion_query_set: None,
+        });
+
+        pass.set_viewport(0.0, 0.0, sw as f32, sh as f32, 0.0, 1.0);
+
+        // Use the voxel pipeline to render depth-only
+        let voxel_pipeline = world.resource::<crate::render::VoxelPipeline>();
+        let pipeline_id = voxel_pipeline.fill;
+
+        world.asset_scope(pipeline_id, |world, pipeline_man: &mut modul_render::RenderPipelineManager| {
+            // Get a pipeline compatible with depth-only (no color)
+            let params = modul_render::PipelineParameters {
+                color_format: None,
+                depth_stencil_format: Some(TextureFormat::Depth32Float),
+                sample_count: 1,
+            };
+            let pipeline = pipeline_man.get(world, &params);
+            pass.set_pipeline(pipeline);
+
+            let camera_bg = &world.resource::<crate::render::CameraBindGroup>().bind_group;
+            let gpu = world.resource::<crate::render::GpuBuffers>();
+            let shadow_res = world.resource::<ShadowPassResources>();
+
+            // Create dummy shadow mask bind group (depth-only pass doesn't use it but pipeline requires it)
+            let shadow_mask_layout = world.resource::<modul_core::DeviceRes>().0
+                .create_bind_group_layout(&crate::render::ShadowMaskBGLayout.layout());
+            let dummy_shadow_bg = world.resource::<modul_core::DeviceRes>().0
+                .create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("Dummy shadow BG"),
+                    layout: &shadow_mask_layout,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: wgpu::BindingResource::TextureView(shadow_res.prev_view()),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: wgpu::BindingResource::Sampler(&shadow_res.shadow_mask_sampler),
+                        },
+                    ],
+                });
+
+            pass.set_bind_group(0, camera_bg, &[]);
+            pass.set_bind_group(2, &dummy_shadow_bg, &[]);
+
+            let mut current_slab = usize::MAX;
+            for draw in &gpu.draws {
+                if draw.slab_index != current_slab {
+                    current_slab = draw.slab_index;
+                    let slab = &gpu.slabs[current_slab];
+                    pass.set_vertex_buffer(0, slab.face_buffer.slice(..));
+                    pass.set_bind_group(1, &slab.metadata_bind_group, &[]);
+                }
+                pass.multi_draw_indirect(&gpu.indirect_buffer, draw.offset, draw.count);
+            }
+        });
+    }
+}
+
+pub struct ShadowDepthOperationBuilder;
+
+impl OperationBuilder for ShadowDepthOperationBuilder {
+    fn reading(&self) -> Vec<modul_render::RenderTargetSource> { Vec::new() }
+    fn writing(&self) -> Vec<modul_render::RenderTargetSource> { Vec::new() }
+    fn finish(self, _world: &World, _device: &Device) -> impl Operation + 'static {
+        ShadowDepthOperation
+    }
+}
+
 pub struct ShadowTraceOperation;
 
 impl Operation for ShadowTraceOperation {
     fn run(&mut self, world: &mut World, command_encoder: &mut CommandEncoder) {
-        let prev = world.resource::<PreviousFrameData>();
-        if !prev.valid {
-            return;
-        }
-
-        // Resize shadow mask if window size changed
+        // Resize shadow textures if window size changed
         {
             let main_window = world
                 .query_filtered::<bevy_ecs::prelude::Entity, bevy_ecs::prelude::With<modul_core::MainWindow>>()
@@ -444,30 +563,38 @@ impl Operation for ShadowTraceOperation {
             }
         }
 
-        // Extract uniform data
-        let (uniform, frame_count) = {
+        // Build uniform from CURRENT frame's camera (no one-frame delay)
+        let uniform = {
+            let camera = world.resource::<crate::Camera>();
+            let cam_uniform = camera.0.uniform();
             let prev = world.resource::<PreviousFrameData>();
             let sun = world.resource::<SunDirection>();
             let grid = world.resource::<crate::shadow::grid::ShadowGrid>();
             let fc = world.resource::<crate::FrameCount>().0;
             let shadow_res = world.resource::<ShadowPassResources>();
             let (sw, sh) = shadow_res.current_size;
-            (ShadowPassUniform {
-                inv_view_proj: prev.inv_view_proj,
-                chunk_offset: prev.chunk_offset,
+            // Detect camera motion by comparing VP matrices
+            let moving = if prev.valid {
+                cam_uniform.view_proj != prev.view_proj || cam_uniform.chunk_offset != prev.chunk_offset
+            } else {
+                false
+            };
+            ShadowPassUniform {
+                inv_view_proj: invert_mat4(&cam_uniform.view_proj),
+                chunk_offset: cam_uniform.chunk_offset,
                 _pad0: 0,
                 sun_direction: sun.0,
                 max_ray_distance: 512.0,
                 lod_count: grid.lod_count,
                 grid_size: grid.grid_size,
                 frame_index: (fc % 4) as u32,
-                _pad1: 0,
-                prev_view_proj: prev.view_proj,
-                prev_chunk_offset: prev.chunk_offset,
+                camera_moving: if moving { 1 } else { 0 },
+                prev_view_proj: cam_uniform.view_proj,
+                prev_chunk_offset: cam_uniform.chunk_offset,
                 _pad2: 0,
                 shadow_tex_size: [sw as f32, sh as f32],
                 _pad3: [0.0; 2],
-            }, fc)
+            }
         };
 
         // Upload uniform
@@ -481,20 +608,10 @@ impl Operation for ShadowTraceOperation {
             );
         }
 
-        // Get depth texture view from the surface render target
-        let main_window = world
-            .query_filtered::<bevy_ecs::prelude::Entity, bevy_ecs::prelude::With<modul_core::MainWindow>>()
-            .single(world);
-
-        let rt = world.get::<modul_render::SurfaceRenderTarget>(main_window);
-        let Some(rt) = rt else { return };
-        let Some(depth_view) = modul_render::RenderTarget::depth_stencil_view(rt) else {
-            return;
-        };
-
         let device = &world.resource::<modul_core::DeviceRes>().0;
         let shadow_res = world.resource::<ShadowPassResources>();
 
+        // Use the downscaled shadow depth texture (rendered by ShadowDepthOperation)
         let depth_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("Shadow depth sampler"),
             mag_filter: wgpu::FilterMode::Nearest,
@@ -505,11 +622,10 @@ impl Operation for ShadowTraceOperation {
         let depth_bind_group = create_depth_bind_group(
             device,
             &shadow_res.depth_bind_group_layout,
-            depth_view,
+            &shadow_res.shadow_depth_view,
             &depth_sampler,
         );
 
-        // Bind previous accumulated texture
         let prev_accum_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("Shadow prev accum BG"),
             layout: &shadow_res.prev_accum_bind_group_layout,
@@ -528,7 +644,6 @@ impl Operation for ShadowTraceOperation {
         let shadow_gpu = world.resource::<ShadowGpuBuffers>();
         let current_view = shadow_res.current_view();
 
-        // Render pass — write to current ping-pong texture
         let mut pass = command_encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("Shadow trace pass"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -552,7 +667,6 @@ impl Operation for ShadowTraceOperation {
         pass.draw(0..3, 0..1);
         drop(pass);
 
-        // Swap ping-pong for next frame
         world.resource_mut::<ShadowPassResources>().swap();
     }
 }

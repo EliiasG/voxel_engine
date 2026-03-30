@@ -259,6 +259,7 @@ fn init(
     let mut builder = SequenceBuilder::new();
     builder
         .add(render::ClearAll { render_target })
+        .add(shadow::pass::ShadowDepthOperationBuilder)
         .add(shadow::pass::ShadowTraceOperationBuilder)
         .add(render::VoxelDrawOperationBuilder {
             target: render_target,

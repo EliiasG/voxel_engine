@@ -112,7 +112,7 @@ impl FlyCamera {
             view_proj: mat4_mul(proj, view),
             chunk_offset: chunk.to_array(),
             _pad: 0,
-            screen_size: [0.0; 2], // set by update_camera
+            screen_size: [0.0; 2],
             _pad2: [0.0; 2],
         }
     }

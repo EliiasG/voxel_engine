@@ -130,9 +130,9 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let raw_ndotl = dot(in.normal, light_dir);
     let ndotl = max(raw_ndotl, 0.0);
 
-    // Sample shadow mask at screen UV
-    let screen_uv = in.clip_position.xy / camera.screen_size;
-    let shadow_val = textureSample(shadow_mask, shadow_sampler, screen_uv).r;
+    // Sample shadow mask at screen UV (same frame, no reprojection needed)
+    let shadow_uv = in.clip_position.xy / camera.screen_size;
+    let shadow_val = textureSample(shadow_mask, shadow_sampler, shadow_uv).r;
 
     // Faces pointing away from sun are always in shadow regardless of mask
     let shadow = select(shadow_val, 0.0, raw_ndotl <= 0.0);
