@@ -129,11 +129,22 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let light_dir = normalize(vec3<f32>(0.3, 0.47, 0.5));
     let raw_ndotl = dot(in.normal, light_dir);
     let ndotl = max(raw_ndotl, 0.0);
-    let ambient = 0.3;
-    // Faces pointing away from sun are always in shadow regardless of shadow mask.
-    let facing_shadow = select(0.0, 1.0, raw_ndotl > 0.0);
-    let diffuse = 0.7 * ndotl * facing_shadow;
-    let lit_color = base_color * (ambient + diffuse);
+
+    // Sample shadow mask at screen UV
+    let screen_uv = in.clip_position.xy / camera.screen_size;
+    let shadow_val = textureSample(shadow_mask, shadow_sampler, screen_uv).r;
+
+    // Faces pointing away from sun are always in shadow regardless of mask
+    let shadow = select(shadow_val, 0.0, raw_ndotl <= 0.0);
+
+    // Indirect sky light — surfaces facing up are brighter even in shadow
+    let sky_light = max(in.normal.y * 0.5 + 0.5, 0.0) * 0.15;
+
+    // Shadow doesn't fully kill diffuse — scattered light remains
+    let effective_shadow = mix(0.15, 1.0, shadow);
+    let ambient = 0.25;
+    let diffuse = 0.7 * ndotl * effective_shadow;
+    let lit_color = base_color * (ambient + sky_light + diffuse);
 
     return vec4<f32>(lit_color, 1.0);
 }

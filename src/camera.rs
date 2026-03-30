@@ -10,6 +10,8 @@ pub struct CameraUniform {
     /// Camera's chunk coordinate, subtracted from page metadata chunk_pos in the shader.
     pub chunk_offset: [i32; 3],
     pub _pad: i32,
+    pub screen_size: [f32; 2],
+    pub _pad2: [f32; 2],
 }
 
 pub struct FlyCamera {
@@ -110,6 +112,8 @@ impl FlyCamera {
             view_proj: mat4_mul(proj, view),
             chunk_offset: chunk.to_array(),
             _pad: 0,
+            screen_size: [0.0; 2], // set by update_camera
+            _pad2: [0.0; 2],
         }
     }
 }

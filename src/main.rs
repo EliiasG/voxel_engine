@@ -547,7 +547,11 @@ fn update_camera(
         }
     }
 
-    let uniform = camera.0.uniform();
+    let mut uniform = camera.0.uniform();
+    if let Ok(rt) = rt_query.get_single() {
+        let (w, h) = modul_render::RenderTarget::size(rt);
+        uniform.screen_size = [w as f32, h as f32];
+    }
     queue
         .0
         .write_buffer(&camera_bg.buffer, 0, bytemuck::bytes_of(&uniform));

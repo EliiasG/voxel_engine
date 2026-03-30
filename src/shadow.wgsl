@@ -16,7 +16,13 @@ struct ShadowUniform {
     max_ray_distance: f32,
     lod_count: u32,
     grid_size: u32,
-    _pad1: vec2<u32>,
+    frame_index: u32,
+    _pad1: u32,
+    prev_view_proj: mat4x4<f32>,
+    prev_chunk_offset: vec3<i32>,
+    _pad2: i32,
+    shadow_tex_size: vec2<f32>,
+    _pad3: vec2<f32>,
 };
 
 struct LodInfo {
@@ -40,6 +46,11 @@ var depth_sampler: sampler;
 
 @group(2) @binding(0)
 var<uniform> lod_infos: array<LodInfo, 6>;
+
+@group(3) @binding(0)
+var prev_accum_tex: texture_2d<f32>;
+@group(3) @binding(1)
+var prev_accum_sampler: sampler;
 @group(2) @binding(1)
 var<storage, read> grid: array<u32>;
 @group(2) @binding(2)
@@ -184,114 +195,147 @@ fn trace_chunk_bitmask(
     return false;
 }
 
+// 4-sample Halton(2,3) jitter pattern
+fn jitter_offset(frame: u32) -> vec2<f32> {
+    switch frame % 4u {
+        case 0u: { return vec2<f32>(0.0, 0.0); }
+        case 1u: { return vec2<f32>(0.5, 0.333); }
+        case 2u: { return vec2<f32>(0.25, 0.667); }
+        case 3u: { return vec2<f32>(0.75, 0.111); }
+        default: { return vec2<f32>(0.0, 0.0); }
+    }
+}
+
 @fragment
 fn fs_shadow(in: ShadowVaryings) -> @location(0) vec4<f32> {
-    let depth = textureSample(depth_tex, depth_sampler, in.uv);
+    // Jitter UV by sub-pixel offset
+    let jitter = (jitter_offset(shadow.frame_index) - 0.5) / shadow.shadow_tex_size;
+    let jittered_uv = in.uv + jitter;
+    let depth = textureSample(depth_tex, depth_sampler, jittered_uv);
+
+    // Trace result: 0.0 = shadow, 1.0 = lit
+    var trace_result = 1.0;
 
     // Sky pixels are always lit (reversed-Z: sky = 0.0)
-    if (depth <= 0.0) {
-        return vec4<f32>(1.0);
-    }
-
-    // Reconstruct world position from depth
-    let ndc = vec4<f32>(
-        in.uv.x * 2.0 - 1.0,
-        (1.0 - in.uv.y) * 2.0 - 1.0,  // flip Y for wgpu NDC
-        depth,
-        1.0,
-    );
-    let clip = shadow.inv_view_proj * ndc;
-    let cam_rel_pos = clip.xyz / clip.w;
-
-    // World position = camera-relative + chunk_offset * CHUNK_SIZE
-    let world_pos = cam_rel_pos + vec3<f32>(shadow.chunk_offset * CHUNK_SIZE);
-
-    let ray_dir = normalize(shadow.sun_direction);
-
-    // If surface faces away from sun, it's in shadow — no ray trace needed.
-    let ddx_pos = dpdx(cam_rel_pos);
-    let ddy_pos = dpdy(cam_rel_pos);
-    let approx_normal = normalize(cross(ddy_pos, ddx_pos));
-    let facing_sun = dot(approx_normal, ray_dir) > 0.0;
-    if (!facing_sun) {
-        return vec4<f32>(0.0, 0.0, 0.0, 1.0);
-    }
-
-    // Determine starting LOD from world_pos (before offset)
-    var current_lod = 0u;
-    for (var l = 0u; l < shadow.lod_count; l++) {
-        let info = lod_infos[l];
-        let lod_scale = i32(info.lod_scale);
-        let chunk_pos = vec3<i32>(floor(world_pos / f32(CHUNK_SIZE * lod_scale)));
-        let local = chunk_pos - vec3<i32>(info.grid_origin_x, info.grid_origin_y, info.grid_origin_z);
-        let s = i32(info.grid_size);
-        if (all(local >= vec3<i32>(0)) && all(local < vec3<i32>(s))) {
-            current_lod = l;
-            break;
-        }
-    }
-
-    let start_voxel_size = f32(1u << current_lod);
-    let dist = length(cam_rel_pos);
-    let bias = mix(0.025, 1.5, clamp(dist / 500.0, 0.0, 1.0));
-    var pos = world_pos + ray_dir * bias * start_voxel_size;
-    var total_dist = 0.0;
-
-    // Main ray march loop
-    for (var step_count = 0u; step_count < MAX_STEPS; step_count++) {
-        if (total_dist > shadow.max_ray_distance) {
-            break;
-        }
-
-        let info = lod_infos[current_lod];
-        let lod_scale = i32(info.lod_scale);
-        let chunk_world_size = f32(CHUNK_SIZE * lod_scale);
-
-        // Current chunk position at this LOD
-        let chunk_pos = vec3<i32>(floor(pos / chunk_world_size));
-
-        // Check if we're within this LOD's grid
-        let local = chunk_pos - vec3<i32>(info.grid_origin_x, info.grid_origin_y, info.grid_origin_z);
-        let s = i32(info.grid_size);
-        if (any(local < vec3<i32>(0)) || any(local >= vec3<i32>(s))) {
-            // Try stepping up to next LOD
-            if (current_lod + 1u < shadow.lod_count) {
-                current_lod += 1u;
-                continue;
-            }
-            break;  // Outside all grids — lit
-        }
-
-        let slot = grid_lookup(current_lod, chunk_pos);
-
-        if (slot == GRID_SOLID) {
-            return vec4<f32>(0.0, 0.0, 0.0, 1.0);  // shadow
-        }
-
-        if (slot != GRID_EMPTY) {
-            // Partial chunk — trace through bitmask
-            let chunk_origin = vec3<f32>(chunk_pos * CHUNK_SIZE * lod_scale);
-            let voxel_size = f32(lod_scale);
-            if (trace_chunk_bitmask(slot, pos, ray_dir, chunk_origin, voxel_size)) {
-                return vec4<f32>(0.0, 0.0, 0.0, 1.0);  // shadow
-            }
-        }
-
-        // DDA step to next chunk boundary
-        let chunk_min = vec3<f32>(chunk_pos) * chunk_world_size;
-        let chunk_max = chunk_min + vec3<f32>(chunk_world_size);
-        let inv_dir = 1.0 / ray_dir;
-
-        let t_exit = vec3<f32>(
-            select((chunk_min.x - pos.x) * inv_dir.x, (chunk_max.x - pos.x) * inv_dir.x, ray_dir.x >= 0.0),
-            select((chunk_min.y - pos.y) * inv_dir.y, (chunk_max.y - pos.y) * inv_dir.y, ray_dir.y >= 0.0),
-            select((chunk_min.z - pos.z) * inv_dir.z, (chunk_max.z - pos.z) * inv_dir.z, ray_dir.z >= 0.0),
+    if (depth > 0.0) {
+        // Reconstruct world position from depth (use jittered UV for NDC)
+        let ndc = vec4<f32>(
+            jittered_uv.x * 2.0 - 1.0,
+            (1.0 - jittered_uv.y) * 2.0 - 1.0,
+            depth,
+            1.0,
         );
+        let clip = shadow.inv_view_proj * ndc;
+        let cam_rel_pos = clip.xyz / clip.w;
+        let world_pos = cam_rel_pos + vec3<f32>(shadow.chunk_offset * CHUNK_SIZE);
 
-        let t_step = max(0.001, min(t_exit.x, min(t_exit.y, t_exit.z)));
-        pos += ray_dir * (t_step + 0.01);
-        total_dist += t_step + 0.01;
+        let ray_dir = normalize(shadow.sun_direction);
+
+        {
+            // Determine starting LOD
+            var current_lod = 0u;
+            for (var l = 0u; l < shadow.lod_count; l++) {
+                let info = lod_infos[l];
+                let lod_scale = i32(info.lod_scale);
+                let chunk_pos = vec3<i32>(floor(world_pos / f32(CHUNK_SIZE * lod_scale)));
+                let local = chunk_pos - vec3<i32>(info.grid_origin_x, info.grid_origin_y, info.grid_origin_z);
+                let s = i32(info.grid_size);
+                if (all(local >= vec3<i32>(0)) && all(local < vec3<i32>(s))) {
+                    current_lod = l;
+                    break;
+                }
+            }
+
+            let start_voxel_size = f32(1u << current_lod);
+            let dist = length(cam_rel_pos);
+            let bias = mix(0.025, 1.5, clamp(dist / 500.0, 0.0, 1.0));
+            var pos = world_pos + ray_dir * bias * start_voxel_size;
+            var total_dist = 0.0;
+            var hit = false;
+
+            for (var step_count = 0u; step_count < MAX_STEPS; step_count++) {
+                if (total_dist > shadow.max_ray_distance || hit) {
+                    break;
+                }
+
+                let info = lod_infos[current_lod];
+                let lod_scale = i32(info.lod_scale);
+                let chunk_world_size = f32(CHUNK_SIZE * lod_scale);
+                let chunk_pos = vec3<i32>(floor(pos / chunk_world_size));
+                let local = chunk_pos - vec3<i32>(info.grid_origin_x, info.grid_origin_y, info.grid_origin_z);
+                let s = i32(info.grid_size);
+
+                if (any(local < vec3<i32>(0)) || any(local >= vec3<i32>(s))) {
+                    if (current_lod + 1u < shadow.lod_count) {
+                        current_lod += 1u;
+                        continue;
+                    }
+                    break;
+                }
+
+                let slot = grid_lookup(current_lod, chunk_pos);
+
+                if (slot == GRID_SOLID) {
+                    hit = true;
+                } else if (slot != GRID_EMPTY) {
+                    let chunk_origin = vec3<f32>(chunk_pos * CHUNK_SIZE * lod_scale);
+                    let voxel_size = f32(lod_scale);
+                    if (trace_chunk_bitmask(slot, pos, ray_dir, chunk_origin, voxel_size)) {
+                        hit = true;
+                    }
+                }
+
+                if (!hit) {
+                    let chunk_min = vec3<f32>(chunk_pos) * chunk_world_size;
+                    let chunk_max = chunk_min + vec3<f32>(chunk_world_size);
+                    let inv_dir = 1.0 / ray_dir;
+                    let t_exit = vec3<f32>(
+                        select((chunk_min.x - pos.x) * inv_dir.x, (chunk_max.x - pos.x) * inv_dir.x, ray_dir.x >= 0.0),
+                        select((chunk_min.y - pos.y) * inv_dir.y, (chunk_max.y - pos.y) * inv_dir.y, ray_dir.y >= 0.0),
+                        select((chunk_min.z - pos.z) * inv_dir.z, (chunk_max.z - pos.z) * inv_dir.z, ray_dir.z >= 0.0),
+                    );
+                    let t_step = max(0.001, min(t_exit.x, min(t_exit.y, t_exit.z)));
+                    pos += ray_dir * (t_step + 0.01);
+                    total_dist += t_step + 0.01;
+                }
+            }
+
+            if (hit) {
+                trace_result = 0.0;
+            }
+        }
     }
 
-    return vec4<f32>(1.0, 1.0, 1.0, 1.0);  // lit
+    // Temporal accumulation with reprojection
+    var result = trace_result;
+    if (depth > 0.0) {
+        // Reproject current world position into previous frame's screen space
+        let ndc_reproj = vec4<f32>(
+            jittered_uv.x * 2.0 - 1.0,
+            (1.0 - jittered_uv.y) * 2.0 - 1.0,
+            depth,
+            1.0,
+        );
+        let clip_reproj = shadow.inv_view_proj * ndc_reproj;
+        let cam_rel = clip_reproj.xyz / clip_reproj.w;
+
+        // Adjust for chunk offset change between frames
+        let offset_delta = vec3<f32>((shadow.chunk_offset - shadow.prev_chunk_offset) * CHUNK_SIZE);
+        let prev_rel = cam_rel + offset_delta;
+
+        let prev_clip = shadow.prev_view_proj * vec4<f32>(prev_rel, 1.0);
+        let prev_ndc = prev_clip.xy / prev_clip.w;
+        let prev_uv = vec2<f32>(prev_ndc.x * 0.5 + 0.5, 0.5 - prev_ndc.y * 0.5);
+
+        // Only blend if previous UV is valid (on screen)
+        if (all(prev_uv >= vec2<f32>(0.0)) && all(prev_uv <= vec2<f32>(1.0))) {
+            let prev_sample = textureSample(prev_accum_tex, prev_accum_sampler, prev_uv).r;
+            // Reject temporal blending on fast motion (reduces ghosting)
+            let motion = length(prev_uv - in.uv) * shadow.shadow_tex_size.x;
+            let blend = clamp(motion * 4.0, 0.25, 1.0);
+            result = mix(prev_sample, trace_result, blend);
+        }
+    }
+
+    return vec4<f32>(result, result, result, 1.0);
 }

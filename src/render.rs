@@ -73,6 +73,9 @@ impl BindGroupLayoutProvider for CameraBGLayout {
 struct CameraUniform {
     view_proj: mat4x4<f32>,
     chunk_offset: vec3<i32>,
+    _pad: i32,
+    screen_size: vec2<f32>,
+    _pad2: vec2<f32>,
 };
 
 @group(#BIND_GROUP) @binding(0)
@@ -114,6 +117,44 @@ struct PageMetadata {
 
 @group(#BIND_GROUP) @binding(0)
 var<storage, read> metadata: array<PageMetadata>;
+"
+    }
+}
+
+pub struct ShadowMaskBGLayout;
+
+impl BindGroupLayoutProvider for ShadowMaskBGLayout {
+    fn layout(&self) -> wgpu::BindGroupLayoutDescriptor<'_> {
+        static ENTRIES: [wgpu::BindGroupLayoutEntry; 2] = [
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 1,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                count: None,
+            },
+        ];
+        wgpu::BindGroupLayoutDescriptor {
+            label: Some("Shadow Mask BG Layout"),
+            entries: &ENTRIES,
+        }
+    }
+
+    fn library(&self) -> &str {
+        "\
+@group(#BIND_GROUP) @binding(0)
+var shadow_mask: texture_2d<f32>;
+@group(#BIND_GROUP) @binding(1)
+var shadow_sampler: sampler;
 "
     }
 }
@@ -399,7 +440,11 @@ pub fn init_pipelines(
     // Compose shader from bind group libraries + main shader
     let camera_wgsl = CameraBGLayout.library().replace("#BIND_GROUP", "0");
     let metadata_wgsl = MetadataBGLayout.library().replace("#BIND_GROUP", "1");
-    let full_source = format!("{camera_wgsl}\n{metadata_wgsl}\n{}", include_str!("voxel.wgsl"));
+    let shadow_mask_wgsl = ShadowMaskBGLayout.library().replace("#BIND_GROUP", "2");
+    let full_source = format!(
+        "{camera_wgsl}\n{metadata_wgsl}\n{shadow_mask_wgsl}\n{}",
+        include_str!("voxel.wgsl")
+    );
 
     let shader = shaders.add(device.create_shader_module(ShaderModuleDescriptor {
         label: Some("Voxel shader"),
@@ -409,9 +454,10 @@ pub fn init_pipelines(
     // Create pipeline layout from bind group layout providers
     let camera_layout = device.create_bind_group_layout(&CameraBGLayout.layout());
     let metadata_layout = device.create_bind_group_layout(&MetadataBGLayout.layout());
+    let shadow_mask_layout = device.create_bind_group_layout(&ShadowMaskBGLayout.layout());
     let layout = layouts.add(device.create_pipeline_layout(&PipelineLayoutDescriptor {
         label: Some("Voxel pipeline layout"),
-        bind_group_layouts: &[&camera_layout, &metadata_layout],
+        bind_group_layouts: &[&camera_layout, &metadata_layout, &shadow_mask_layout],
         push_constant_ranges: &[],
     }));
 
@@ -734,7 +780,29 @@ impl Operation for VoxelDrawOperation {
 
             let camera_bg = &world.resource::<CameraBindGroup>().bind_group;
             let gpu = world.resource::<GpuBuffers>();
+            let shadow_res = world.resource::<crate::shadow::pass::ShadowPassResources>();
+
+            // Create shadow mask bind group from current accumulated texture
+            let shadow_mask_layout = world.resource::<modul_core::DeviceRes>().0
+                .create_bind_group_layout(&ShadowMaskBGLayout.layout());
+            let shadow_mask_bg = world.resource::<modul_core::DeviceRes>().0
+                .create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("Shadow mask BG"),
+                    layout: &shadow_mask_layout,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: wgpu::BindingResource::TextureView(shadow_res.prev_view()),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: wgpu::BindingResource::Sampler(&shadow_res.shadow_mask_sampler),
+                        },
+                    ],
+                });
+
             pass.set_bind_group(0, camera_bg, &[]);
+            pass.set_bind_group(2, &shadow_mask_bg, &[]);
 
             // Draw: iterate slab+LOD groups (already ordered LOD 0 first)
             let mut current_slab = usize::MAX;

@@ -19,8 +19,8 @@ pub struct ShadowConfig {
 impl Default for ShadowConfig {
     fn default() -> Self {
         Self {
-            scale_denominator: 3,
-            debug_overlay: true,
+            scale_denominator: 2,
+            debug_overlay: false,
         }
     }
 }
@@ -75,22 +75,30 @@ pub struct ShadowPassUniform {
     pub max_ray_distance: f32,
     pub lod_count: u32,
     pub grid_size: u32,
-    pub _pad1: [u32; 2],
+    pub frame_index: u32,
+    pub _pad1: u32,
+    pub prev_view_proj: [[f32; 4]; 4],
+    pub prev_chunk_offset: [i32; 3],
+    pub _pad2: i32,
+    pub shadow_tex_size: [f32; 2],
+    pub _pad3: [f32; 2],
 }
 
 // --- Shadow Pass Resources ---
 
 #[derive(Resource)]
 pub struct ShadowPassResources {
-    pub shadow_mask_texture: wgpu::Texture,
-    pub shadow_mask_view: wgpu::TextureView,
+    /// Ping-pong: [0] = current output, [1] = previous accumulated (swap each frame)
+    pub shadow_textures: [(wgpu::Texture, wgpu::TextureView); 2],
     pub shadow_mask_sampler: wgpu::Sampler,
     pub shadow_uniform_buffer: Buffer,
     pub shadow_pipeline: wgpu::RenderPipeline,
     pub depth_bind_group_layout: wgpu::BindGroupLayout,
+    pub prev_accum_bind_group_layout: wgpu::BindGroupLayout,
     pub uniform_bind_group_layout: wgpu::BindGroupLayout,
     pub uniform_bind_group: wgpu::BindGroup,
     pub current_size: (u32, u32),
+    pub ping_pong_index: u32,
 }
 
 fn create_shadow_mask_texture(
@@ -146,10 +154,11 @@ impl ShadowPassResources {
         height: u32,
         scale: u32,
     ) -> Self {
-        let sw = width / scale;
-        let sh = height / scale;
+        let sw = (width / scale).max(1);
+        let sh = (height / scale).max(1);
 
-        let (shadow_mask_texture, shadow_mask_view) = create_shadow_mask_texture(device, sw, sh);
+        let tex0 = create_shadow_mask_texture(device, sw, sh);
+        let tex1 = create_shadow_mask_texture(device, sw, sh);
 
         let shadow_mask_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("Shadow mask sampler"),
@@ -216,13 +225,38 @@ impl ShadowPassResources {
                 ],
             });
 
-        // Pipeline
+        // Previous accumulated texture bind group (group 3)
+        let prev_accum_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("Shadow prev accum BG layout"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                        count: None,
+                    },
+                ],
+            });
+
+        // Pipeline with 4 bind groups
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("Shadow pipeline layout"),
             bind_group_layouts: &[
                 &uniform_bind_group_layout,
                 &depth_bind_group_layout,
                 &shadow_gpu.bind_group_layout,
+                &prev_accum_bind_group_layout,
             ],
             push_constant_ranges: &[],
         });
@@ -262,30 +296,43 @@ impl ShadowPassResources {
         });
 
         Self {
-            shadow_mask_texture,
-            shadow_mask_view,
+            shadow_textures: [tex0, tex1],
             shadow_mask_sampler,
             shadow_uniform_buffer,
             shadow_pipeline,
             depth_bind_group_layout,
+            prev_accum_bind_group_layout,
             uniform_bind_group_layout,
             uniform_bind_group,
             current_size: (sw, sh),
+            ping_pong_index: 0,
         }
     }
-}
 
-impl ShadowPassResources {
     pub fn resize(&mut self, device: &Device, width: u32, height: u32, scale: u32) {
         let sw = (width / scale).max(1);
         let sh = (height / scale).max(1);
         if (sw, sh) == self.current_size {
             return;
         }
-        let (tex, view) = create_shadow_mask_texture(device, sw, sh);
-        self.shadow_mask_texture = tex;
-        self.shadow_mask_view = view;
+        self.shadow_textures[0] = create_shadow_mask_texture(device, sw, sh);
+        self.shadow_textures[1] = create_shadow_mask_texture(device, sw, sh);
         self.current_size = (sw, sh);
+        self.ping_pong_index = 0;
+    }
+
+    /// Current output texture view (write to this)
+    pub fn current_view(&self) -> &wgpu::TextureView {
+        &self.shadow_textures[self.ping_pong_index as usize].1
+    }
+
+    /// Previous accumulated texture view (read from this)
+    pub fn prev_view(&self) -> &wgpu::TextureView {
+        &self.shadow_textures[1 - self.ping_pong_index as usize].1
+    }
+
+    pub fn swap(&mut self) {
+        self.ping_pong_index = 1 - self.ping_pong_index;
     }
 }
 
@@ -397,12 +444,15 @@ impl Operation for ShadowTraceOperation {
             }
         }
 
-        // Extract uniform data from resources (release borrows before query)
-        let uniform = {
+        // Extract uniform data
+        let (uniform, frame_count) = {
             let prev = world.resource::<PreviousFrameData>();
             let sun = world.resource::<SunDirection>();
             let grid = world.resource::<crate::shadow::grid::ShadowGrid>();
-            ShadowPassUniform {
+            let fc = world.resource::<crate::FrameCount>().0;
+            let shadow_res = world.resource::<ShadowPassResources>();
+            let (sw, sh) = shadow_res.current_size;
+            (ShadowPassUniform {
                 inv_view_proj: prev.inv_view_proj,
                 chunk_offset: prev.chunk_offset,
                 _pad0: 0,
@@ -410,8 +460,14 @@ impl Operation for ShadowTraceOperation {
                 max_ray_distance: 512.0,
                 lod_count: grid.lod_count,
                 grid_size: grid.grid_size,
-                _pad1: [0; 2],
-            }
+                frame_index: (fc % 4) as u32,
+                _pad1: 0,
+                prev_view_proj: prev.view_proj,
+                prev_chunk_offset: prev.chunk_offset,
+                _pad2: 0,
+                shadow_tex_size: [sw as f32, sh as f32],
+                _pad3: [0.0; 2],
+            }, fc)
         };
 
         // Upload uniform
@@ -453,13 +509,30 @@ impl Operation for ShadowTraceOperation {
             &depth_sampler,
         );
 
-        let shadow_gpu = world.resource::<ShadowGpuBuffers>();
+        // Bind previous accumulated texture
+        let prev_accum_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Shadow prev accum BG"),
+            layout: &shadow_res.prev_accum_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(shadow_res.prev_view()),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&shadow_res.shadow_mask_sampler),
+                },
+            ],
+        });
 
-        // Render pass on the shadow mask texture
+        let shadow_gpu = world.resource::<ShadowGpuBuffers>();
+        let current_view = shadow_res.current_view();
+
+        // Render pass — write to current ping-pong texture
         let mut pass = command_encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("Shadow trace pass"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: &shadow_res.shadow_mask_view,
+                view: current_view,
                 resolve_target: None,
                 ops: wgpu::Operations {
                     load: wgpu::LoadOp::Clear(wgpu::Color::WHITE),
@@ -475,7 +548,12 @@ impl Operation for ShadowTraceOperation {
         pass.set_bind_group(0, &shadow_res.uniform_bind_group, &[]);
         pass.set_bind_group(1, &depth_bind_group, &[]);
         pass.set_bind_group(2, &shadow_gpu.bind_group, &[]);
+        pass.set_bind_group(3, &prev_accum_bind_group, &[]);
         pass.draw(0..3, 0..1);
+        drop(pass);
+
+        // Swap ping-pong for next frame
+        world.resource_mut::<ShadowPassResources>().swap();
     }
 }
 
@@ -520,7 +598,7 @@ impl Operation for ShadowDebugOverlay {
                 entries: &[
                     wgpu::BindGroupEntry {
                         binding: 0,
-                        resource: wgpu::BindingResource::TextureView(&shadow_res.shadow_mask_view),
+                        resource: wgpu::BindingResource::TextureView(shadow_res.prev_view()),
                     },
                     wgpu::BindGroupEntry {
                         binding: 1,
