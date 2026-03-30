@@ -1,5 +1,5 @@
-// Shadow ray trace shader
-// Reads previous frame's depth buffer, reconstructs world position,
+// Shadow ray trace compute shader
+// Reads depth buffer, reconstructs world position,
 // traces a ray toward the sun through the bitmask acceleration structure.
 // Outputs: 0.0 = shadow, 1.0 = lit.
 
@@ -22,7 +22,8 @@ struct ShadowUniform {
     prev_chunk_offset: vec3<i32>,
     _pad2: i32,
     shadow_tex_size: vec2<f32>,
-    _pad3: vec2<f32>,
+    scale_factor: f32,
+    _pad3: f32,
 };
 
 struct LodInfo {
@@ -43,32 +44,22 @@ var<uniform> shadow: ShadowUniform;
 var depth_tex: texture_depth_2d;
 @group(1) @binding(1)
 var depth_sampler: sampler;
+@group(1) @binding(2)
+var normal_tex: texture_2d<f32>;
 
 @group(2) @binding(0)
 var<uniform> lod_infos: array<LodInfo, 6>;
-
-@group(3) @binding(0)
-var prev_accum_tex: texture_2d<f32>;
-@group(3) @binding(1)
-var prev_accum_sampler: sampler;
 @group(2) @binding(1)
 var<storage, read> grid: array<u32>;
 @group(2) @binding(2)
 var<storage, read> bitmask_data: array<u32>;
 
-struct ShadowVaryings {
-    @builtin(position) position: vec4<f32>,
-    @location(0) uv: vec2<f32>,
-};
-
-@vertex
-fn vs_shadow(@builtin(vertex_index) vi: u32) -> ShadowVaryings {
-    var out: ShadowVaryings;
-    let uv = vec2<f32>(f32((vi << 1u) & 2u), f32(vi & 2u));
-    out.position = vec4<f32>(uv * 2.0 - 1.0, 0.0, 1.0);
-    out.uv = vec2<f32>(uv.x, 1.0 - uv.y);
-    return out;
-}
+@group(3) @binding(0)
+var prev_accum_tex: texture_2d<f32>;
+@group(3) @binding(1)
+var prev_accum_sampler: sampler;
+@group(3) @binding(2)
+var output_tex: texture_storage_2d<rgba8unorm, write>;
 
 // Read a bit from the fine bitmask (32x32x32 = 32768 bits = 1024 u32s per slot)
 fn test_fine_bit(slot: u32, x: u32, y: u32, z: u32) -> bool {
@@ -187,19 +178,65 @@ fn jitter_offset(frame: u32) -> vec2<f32> {
     }
 }
 
-@fragment
-fn fs_shadow(in: ShadowVaryings) -> @location(0) vec4<f32> {
-    // Jitter UV by sub-pixel offset
+@compute @workgroup_size(8, 8)
+fn cs_shadow(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let pixel = gid.xy;
+    let dims = vec2<u32>(shadow.shadow_tex_size);
+    if (pixel.x >= dims.x || pixel.y >= dims.y) {
+        return;
+    }
+
+    let uv = (vec2<f32>(pixel) + 0.5) / shadow.shadow_tex_size;
+
+    // Checkerboard: only trace half the pixels per frame, reuse previous for the other half
+    let checker = (pixel.x / 2u + pixel.y / 2u + shadow.frame_index) % 2u;
+
+    // Jitter UV by sub-pixel offset for temporal anti-aliasing
     let jitter = (jitter_offset(shadow.frame_index) - 0.5) / shadow.shadow_tex_size;
-    let jittered_uv = in.uv + jitter;
-    let depth = textureSample(depth_tex, depth_sampler, jittered_uv);
+    let jittered_uv = uv + jitter;
+    let depth = textureSampleLevel(depth_tex, depth_sampler, jittered_uv, 0u);
+
+    // Skipped pixels: return previous frame's value directly
+    if (checker != 0u && depth > 0.0) {
+        var prev_uv = uv;
+        if (shadow.camera_moving != 0u) {
+            let ndc = vec4<f32>(
+                jittered_uv.x * 2.0 - 1.0,
+                (1.0 - jittered_uv.y) * 2.0 - 1.0,
+                depth, 1.0,
+            );
+            let clip = shadow.inv_view_proj * ndc;
+            let cam_rel = clip.xyz / clip.w;
+            let chunk_shift = vec3<f32>((shadow.chunk_offset - shadow.prev_chunk_offset) * CHUNK_SIZE);
+            let prev_clip = shadow.prev_view_proj * vec4<f32>(cam_rel + chunk_shift, 1.0);
+            let prev_ndc = prev_clip.xyz / prev_clip.w;
+            prev_uv = vec2<f32>(prev_ndc.x * 0.5 + 0.5, 1.0 - (prev_ndc.y * 0.5 + 0.5));
+            if (any(prev_uv < vec2<f32>(0.0)) || any(prev_uv > vec2<f32>(1.0))) {
+                prev_uv = uv;
+            }
+        }
+        let prev = textureSampleLevel(prev_accum_tex, prev_accum_sampler, prev_uv, 0.0).r;
+        textureStore(output_tex, pixel, vec4<f32>(prev, prev, prev, 1.0));
+        return;
+    }
+
+    // Back-facing early-out: surfaces facing away from sun are always in shadow
+    if (depth > 0.0) {
+        let face_normal_early = textureSampleLevel(normal_tex, depth_sampler, jittered_uv, 0.0).xyz * 2.0 - 1.0;
+        let ndotl_early = dot(face_normal_early, normalize(shadow.sun_direction));
+        if (ndotl_early <= 0.0) {
+            textureStore(output_tex, pixel, vec4<f32>(0.0, 0.0, 0.0, 1.0));
+            return;
+        }
+    }
 
     // Trace result: 0.0 = shadow, 1.0 = lit
     var trace_result = 1.0;
+    var cam_rel_pos = vec3<f32>(0.0);
 
     // Sky pixels are always lit (reversed-Z: sky = 0.0)
     if (depth > 0.0) {
-        // Reconstruct world position from depth (use jittered UV for NDC)
+        // Reconstruct world position from depth
         let ndc = vec4<f32>(
             jittered_uv.x * 2.0 - 1.0,
             (1.0 - jittered_uv.y) * 2.0 - 1.0,
@@ -207,7 +244,7 @@ fn fs_shadow(in: ShadowVaryings) -> @location(0) vec4<f32> {
             1.0,
         );
         let clip = shadow.inv_view_proj * ndc;
-        let cam_rel_pos = clip.xyz / clip.w;
+        cam_rel_pos = clip.xyz / clip.w;
         let world_pos = cam_rel_pos + vec3<f32>(shadow.chunk_offset * CHUNK_SIZE);
 
         let ray_dir = normalize(shadow.sun_direction);
@@ -230,8 +267,19 @@ fn fs_shadow(in: ShadowVaryings) -> @location(0) vec4<f32> {
             let start_voxel_size = f32(1u << current_lod);
             let dist = length(cam_rel_pos);
             let t = clamp(dist / 500.0, 0.0, 1.0);
-            let bias = mix(0.025, 15.0, t * t);
-            var pos = world_pos + ray_dir * bias * start_voxel_size;
+
+            // Sample face normal from geometry pass (encoded as n*0.5+0.5)
+            let face_normal = textureSampleLevel(normal_tex, depth_sampler, jittered_uv, 0.0).xyz * 2.0 - 1.0;
+            let ndotl = abs(dot(face_normal, ray_dir));
+
+            // Directional bias (along ray), scaled by downscale factor
+            let sf = shadow.scale_factor;
+            let dir_bias = mix(0.01 * sf, 1.0 * sf, t * t);
+            // Normal offset: push ray origin out of surface, scales with distance like dir_bias
+            let tn = clamp(dist / 200.0, 0.0, 1.0);
+            let normal_bias = mix(0.05 * sf, 1.0 * sf, tn * tn);
+            let normal_push = face_normal * (1.0 - ndotl) * start_voxel_size * normal_bias;
+            var pos = world_pos + normal_push + ray_dir * dir_bias * start_voxel_size;
             var total_dist = 0.0;
             var hit = false;
 
@@ -288,12 +336,35 @@ fn fs_shadow(in: ShadowVaryings) -> @location(0) vec4<f32> {
         }
     }
 
-    // Temporal accumulation — disabled during camera motion to avoid blur
+    // Temporal accumulation with reprojection
     var result = trace_result;
-    if (shadow.camera_moving == 0u && depth > 0.0) {
-        let prev_sample = textureSample(prev_accum_tex, prev_accum_sampler, in.uv).r;
-        result = mix(prev_sample, trace_result, 0.25);
+    if (depth > 0.0) {
+        var prev_uv = uv;
+        var reprojection_valid = true;
+
+        if (shadow.camera_moving != 0u) {
+            // Reproject current world position into previous frame's screen space
+            let chunk_shift = vec3<f32>((shadow.chunk_offset - shadow.prev_chunk_offset) * CHUNK_SIZE);
+            let prev_cam_rel = cam_rel_pos + chunk_shift;
+            let prev_clip = shadow.prev_view_proj * vec4<f32>(prev_cam_rel, 1.0);
+            let prev_ndc = prev_clip.xyz / prev_clip.w;
+            prev_uv = vec2<f32>(prev_ndc.x * 0.5 + 0.5, 1.0 - (prev_ndc.y * 0.5 + 0.5));
+            reprojection_valid = all(prev_uv >= vec2<f32>(0.0)) && all(prev_uv <= vec2<f32>(1.0));
+        }
+
+        if (reprojection_valid) {
+            let prev_sample = textureSampleLevel(prev_accum_tex, prev_accum_sampler, prev_uv, 0.0).r;
+            let dist = length(cam_rel_pos);
+            let t = clamp((dist - 30.0) / 170.0, 0.0, 1.0); // 30..200 range
+            // Moving: aggressive blend so near shadows respond fast
+            // Static: gentle blend so jitter converges smoothly without visible flicker
+            var blend = mix(0.6, 0.2, t);
+            if (shadow.camera_moving == 0u) {
+                blend = mix(0.12, 0.04, t);
+            }
+            result = mix(prev_sample, trace_result, blend);
+        }
     }
 
-    return vec4<f32>(result, result, result, 1.0);
+    textureStore(output_tex, pixel, vec4<f32>(result, result, result, 1.0));
 }

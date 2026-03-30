@@ -316,6 +316,7 @@ pub struct CameraBindGroup {
 pub struct VoxelPipeline {
     pub fill: AssetId<RenderPipelineManager>,
     pub wireframe: AssetId<RenderPipelineManager>,
+    pub normal_fill: AssetId<RenderPipelineManager>,
 }
 
 #[derive(Resource)]
@@ -377,6 +378,7 @@ fn create_pipeline_desc(
     layout: AssetId<PipelineLayout>,
     polygon_mode: PolygonMode,
     label: &str,
+    frag_entry: &str,
 ) -> GenericRenderPipelineDescriptor {
     GenericRenderPipelineDescriptor {
         resource_provider: Box::new(DirectRenderPipelineResourceProvider {
@@ -424,7 +426,7 @@ fn create_pipeline_desc(
             alpha_to_coverage_enabled: false,
         },
         fragment: Some(GenericFragmentState {
-            entry_point: "fs_main".into(),
+            entry_point: frag_entry.into(),
             target_blend: Some(BlendState::REPLACE),
             target_color_writes: ColorWrites::ALL,
         }),
@@ -462,13 +464,16 @@ pub fn init_pipelines(
     }));
 
     let fill = pipelines.add(RenderPipelineManager::new(create_pipeline_desc(
-        shader, layout, PolygonMode::Fill, "Voxel fill pipeline",
+        shader, layout, PolygonMode::Fill, "Voxel fill pipeline", "fs_main",
     )));
     let wireframe = pipelines.add(RenderPipelineManager::new(create_pipeline_desc(
-        shader, layout, PolygonMode::Line, "Voxel wireframe pipeline",
+        shader, layout, PolygonMode::Line, "Voxel wireframe pipeline", "fs_main",
+    )));
+    let normal_fill = pipelines.add(RenderPipelineManager::new(create_pipeline_desc(
+        shader, layout, PolygonMode::Fill, "Voxel normal pipeline", "fs_normal",
     )));
 
-    VoxelPipeline { fill, wireframe }
+    VoxelPipeline { fill, wireframe, normal_fill }
 }
 
 // --- Synchronize System ---

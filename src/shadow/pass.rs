@@ -82,7 +82,8 @@ pub struct ShadowPassUniform {
     pub prev_chunk_offset: [i32; 3],
     pub _pad2: i32,
     pub shadow_tex_size: [f32; 2],
-    pub _pad3: [f32; 2],
+    pub scale_factor: f32,
+    pub _pad3: f32,
 }
 
 // --- Shadow Pass Resources ---
@@ -93,10 +94,13 @@ pub struct ShadowPassResources {
     pub shadow_textures: [(wgpu::Texture, wgpu::TextureView); 2],
     pub shadow_mask_sampler: wgpu::Sampler,
     pub shadow_uniform_buffer: Buffer,
-    pub shadow_pipeline: wgpu::RenderPipeline,
+    pub shadow_pipeline: wgpu::ComputePipeline,
     /// Downscaled depth texture for current-frame shadow tracing
     pub shadow_depth_texture: wgpu::Texture,
     pub shadow_depth_view: wgpu::TextureView,
+    /// Face normals rendered alongside depth (for slope-aware shadow bias)
+    pub shadow_normal_texture: wgpu::Texture,
+    pub shadow_normal_view: wgpu::TextureView,
     pub depth_bind_group_layout: wgpu::BindGroupLayout,
     pub prev_accum_bind_group_layout: wgpu::BindGroupLayout,
     pub uniform_bind_group_layout: wgpu::BindGroupLayout,
@@ -128,6 +132,29 @@ fn create_shadow_depth_texture(
     (texture, view)
 }
 
+fn create_shadow_normal_texture(
+    device: &Device,
+    width: u32,
+    height: u32,
+) -> (wgpu::Texture, wgpu::TextureView) {
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("Shadow normal"),
+        size: wgpu::Extent3d {
+            width: width.max(1),
+            height: height.max(1),
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: TextureFormat::Rgba8Unorm,
+        usage: TextureUsages::RENDER_ATTACHMENT | TextureUsages::TEXTURE_BINDING,
+        view_formats: &[],
+    });
+    let view = texture.create_view(&Default::default());
+    (texture, view)
+}
+
 fn create_shadow_mask_texture(
     device: &Device,
     width: u32,
@@ -143,8 +170,8 @@ fn create_shadow_mask_texture(
         mip_level_count: 1,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
-        format: TextureFormat::R8Unorm,
-        usage: TextureUsages::RENDER_ATTACHMENT | TextureUsages::TEXTURE_BINDING,
+        format: TextureFormat::Rgba8Unorm,
+        usage: TextureUsages::STORAGE_BINDING | TextureUsages::TEXTURE_BINDING,
         view_formats: &[],
     });
     let view = texture.create_view(&Default::default());
@@ -156,6 +183,7 @@ fn create_depth_bind_group(
     layout: &wgpu::BindGroupLayout,
     depth_view: &wgpu::TextureView,
     depth_sampler: &wgpu::Sampler,
+    normal_view: &wgpu::TextureView,
 ) -> wgpu::BindGroup {
     device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("Shadow depth BG"),
@@ -168,6 +196,10 @@ fn create_depth_bind_group(
             wgpu::BindGroupEntry {
                 binding: 1,
                 resource: wgpu::BindingResource::Sampler(depth_sampler),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: wgpu::BindingResource::TextureView(normal_view),
             },
         ],
     })
@@ -187,6 +219,7 @@ impl ShadowPassResources {
         let tex0 = create_shadow_mask_texture(device, sw, sh);
         let tex1 = create_shadow_mask_texture(device, sw, sh);
         let (shadow_depth_texture, shadow_depth_view) = create_shadow_depth_texture(device, sw, sh);
+        let (shadow_normal_texture, shadow_normal_view) = create_shadow_normal_texture(device, sw, sh);
 
         let shadow_mask_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("Shadow mask sampler"),
@@ -201,7 +234,7 @@ impl ShadowPassResources {
                 label: Some("Shadow uniform BG layout"),
                 entries: &[wgpu::BindGroupLayoutEntry {
                     binding: 0,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    visibility: wgpu::ShaderStages::COMPUTE,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Uniform,
                         has_dynamic_offset: false,
@@ -229,14 +262,14 @@ impl ShadowPassResources {
             }],
         });
 
-        // Depth bind group (group 1)
+        // Depth + normal bind group (group 1)
         let depth_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("Shadow depth BG layout"),
                 entries: &[
                     wgpu::BindGroupLayoutEntry {
                         binding: 0,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        visibility: wgpu::ShaderStages::COMPUTE,
                         ty: wgpu::BindingType::Texture {
                             sample_type: wgpu::TextureSampleType::Depth,
                             view_dimension: wgpu::TextureViewDimension::D2,
@@ -246,21 +279,31 @@ impl ShadowPassResources {
                     },
                     wgpu::BindGroupLayoutEntry {
                         binding: 1,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        visibility: wgpu::ShaderStages::COMPUTE,
                         ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
                         count: None,
                     },
                 ],
             });
 
-        // Previous accumulated texture bind group (group 3)
+        // Previous accum + output storage texture bind group (group 3)
         let prev_accum_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("Shadow prev accum BG layout"),
+                label: Some("Shadow prev accum + output BG layout"),
                 entries: &[
                     wgpu::BindGroupLayoutEntry {
                         binding: 0,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        visibility: wgpu::ShaderStages::COMPUTE,
                         ty: wgpu::BindingType::Texture {
                             sample_type: wgpu::TextureSampleType::Float { filterable: true },
                             view_dimension: wgpu::TextureViewDimension::D2,
@@ -270,16 +313,26 @@ impl ShadowPassResources {
                     },
                     wgpu::BindGroupLayoutEntry {
                         binding: 1,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        visibility: wgpu::ShaderStages::COMPUTE,
                         ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::StorageTexture {
+                            access: wgpu::StorageTextureAccess::WriteOnly,
+                            format: TextureFormat::Rgba8Unorm,
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                        },
                         count: None,
                     },
                 ],
             });
 
-        // Pipeline with 4 bind groups
+        // Compute pipeline with 4 bind groups
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("Shadow pipeline layout"),
+            label: Some("Shadow compute pipeline layout"),
             bind_group_layouts: &[
                 &uniform_bind_group_layout,
                 &depth_bind_group_layout,
@@ -289,37 +342,21 @@ impl ShadowPassResources {
             push_constant_ranges: &[],
         });
 
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("Shadow shader"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("../shadow.wgsl").into()),
-        });
+        // SAFETY: shadow shader does its own bounds checking on grid/bitmask accesses
+        let shader = unsafe { device.create_shader_module_trusted(
+            wgpu::ShaderModuleDescriptor {
+                label: Some("Shadow compute shader"),
+                source: wgpu::ShaderSource::Wgsl(include_str!("../shadow.wgsl").into()),
+            },
+            wgpu::ShaderRuntimeChecks::unchecked(),
+        ) };
 
-        let shadow_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("Shadow pipeline"),
+        let shadow_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("Shadow compute pipeline"),
             layout: Some(&pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("vs_shadow"),
-                compilation_options: Default::default(),
-                buffers: &[],
-            },
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleList,
-                ..Default::default()
-            },
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState::default(),
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: Some("fs_shadow"),
-                compilation_options: Default::default(),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: TextureFormat::R8Unorm,
-                    blend: None,
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-            }),
-            multiview: None,
+            module: &shader,
+            entry_point: Some("cs_shadow"),
+            compilation_options: Default::default(),
             cache: None,
         });
 
@@ -330,6 +367,8 @@ impl ShadowPassResources {
             shadow_pipeline,
             shadow_depth_texture,
             shadow_depth_view,
+            shadow_normal_texture,
+            shadow_normal_view,
             depth_bind_group_layout,
             prev_accum_bind_group_layout,
             uniform_bind_group_layout,
@@ -350,6 +389,9 @@ impl ShadowPassResources {
         let (dt, dv) = create_shadow_depth_texture(device, sw, sh);
         self.shadow_depth_texture = dt;
         self.shadow_depth_view = dv;
+        let (nt, nv) = create_shadow_normal_texture(device, sw, sh);
+        self.shadow_normal_texture = nt;
+        self.shadow_normal_view = nv;
         self.current_size = (sw, sh);
         self.ping_pong_index = 0;
     }
@@ -452,7 +494,7 @@ fn invert_mat4(m: &[[f32; 4]; 4]) -> [[f32; 4]; 4] {
 
 // --- Operations ---
 
-/// Renders voxel geometry depth-only to the downscaled shadow depth texture.
+/// Renders voxel geometry depth + face normals to downscaled shadow textures.
 pub struct ShadowDepthOperation;
 
 impl Operation for ShadowDepthOperation {
@@ -460,11 +502,20 @@ impl Operation for ShadowDepthOperation {
         let shadow_res = world.resource::<ShadowPassResources>();
         let (sw, sh) = shadow_res.current_size;
         let shadow_depth_view = &shadow_res.shadow_depth_view;
+        let shadow_normal_view = &shadow_res.shadow_normal_view;
 
-        // Begin depth-only render pass on the shadow depth texture
+        // Render depth + normals
         let mut pass = command_encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("Shadow depth pass"),
-            color_attachments: &[],
+            label: Some("Shadow depth+normal pass"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: shadow_normal_view,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    // Clear to encoded up-normal (0,1,0) → (0.5, 1.0, 0.5)
+                    load: wgpu::LoadOp::Clear(wgpu::Color { r: 0.5, g: 1.0, b: 0.5, a: 1.0 }),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
             depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                 view: shadow_depth_view,
                 depth_ops: Some(wgpu::Operations {
@@ -479,14 +530,13 @@ impl Operation for ShadowDepthOperation {
 
         pass.set_viewport(0.0, 0.0, sw as f32, sh as f32, 0.0, 1.0);
 
-        // Use the voxel pipeline to render depth-only
+        // Use the normal-output pipeline (same vertex shader, fs_normal fragment)
         let voxel_pipeline = world.resource::<crate::render::VoxelPipeline>();
-        let pipeline_id = voxel_pipeline.fill;
+        let pipeline_id = voxel_pipeline.normal_fill;
 
         world.asset_scope(pipeline_id, |world, pipeline_man: &mut modul_render::RenderPipelineManager| {
-            // Get a pipeline compatible with depth-only (no color)
             let params = modul_render::PipelineParameters {
-                color_format: None,
+                color_format: Some(TextureFormat::Rgba8Unorm),
                 depth_stencil_format: Some(TextureFormat::Depth32Float),
                 sample_count: 1,
             };
@@ -497,7 +547,7 @@ impl Operation for ShadowDepthOperation {
             let gpu = world.resource::<crate::render::GpuBuffers>();
             let shadow_res = world.resource::<ShadowPassResources>();
 
-            // Create dummy shadow mask bind group (depth-only pass doesn't use it but pipeline requires it)
+            // Dummy shadow mask bind group (pipeline layout requires it but fs_normal doesn't use it)
             let shadow_mask_layout = world.resource::<modul_core::DeviceRes>().0
                 .create_bind_group_layout(&crate::render::ShadowMaskBGLayout.layout());
             let dummy_shadow_bg = world.resource::<modul_core::DeviceRes>().0
@@ -565,6 +615,7 @@ impl Operation for ShadowTraceOperation {
 
         // Build uniform from CURRENT frame's camera (no one-frame delay)
         let uniform = {
+            let scale = world.resource::<ShadowConfig>().scale_denominator;
             let camera = world.resource::<crate::Camera>();
             let cam_uniform = camera.0.uniform();
             let prev = world.resource::<PreviousFrameData>();
@@ -589,11 +640,12 @@ impl Operation for ShadowTraceOperation {
                 grid_size: grid.grid_size,
                 frame_index: (fc % 4) as u32,
                 camera_moving: if moving { 1 } else { 0 },
-                prev_view_proj: cam_uniform.view_proj,
-                prev_chunk_offset: cam_uniform.chunk_offset,
+                prev_view_proj: if prev.valid { prev.view_proj } else { cam_uniform.view_proj },
+                prev_chunk_offset: if prev.valid { prev.chunk_offset } else { cam_uniform.chunk_offset },
                 _pad2: 0,
                 shadow_tex_size: [sw as f32, sh as f32],
-                _pad3: [0.0; 2],
+                scale_factor: scale as f32,
+                _pad3: 0.0,
             }
         };
 
@@ -624,10 +676,11 @@ impl Operation for ShadowTraceOperation {
             &shadow_res.depth_bind_group_layout,
             &shadow_res.shadow_depth_view,
             &depth_sampler,
+            &shadow_res.shadow_normal_view,
         );
 
         let prev_accum_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("Shadow prev accum BG"),
+            label: Some("Shadow prev accum + output BG"),
             layout: &shadow_res.prev_accum_bind_group_layout,
             entries: &[
                 wgpu::BindGroupEntry {
@@ -638,25 +691,19 @@ impl Operation for ShadowTraceOperation {
                     binding: 1,
                     resource: wgpu::BindingResource::Sampler(&shadow_res.shadow_mask_sampler),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::TextureView(shadow_res.current_view()),
+                },
             ],
         });
 
         let shadow_gpu = world.resource::<ShadowGpuBuffers>();
-        let current_view = shadow_res.current_view();
+        let (sw, sh) = shadow_res.current_size;
 
-        let mut pass = command_encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("Shadow trace pass"),
-            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: current_view,
-                resolve_target: None,
-                ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(wgpu::Color::WHITE),
-                    store: wgpu::StoreOp::Store,
-                },
-            })],
-            depth_stencil_attachment: None,
+        let mut pass = command_encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("Shadow trace compute"),
             timestamp_writes: None,
-            occlusion_query_set: None,
         });
 
         pass.set_pipeline(&shadow_res.shadow_pipeline);
@@ -664,7 +711,7 @@ impl Operation for ShadowTraceOperation {
         pass.set_bind_group(1, &depth_bind_group, &[]);
         pass.set_bind_group(2, &shadow_gpu.bind_group, &[]);
         pass.set_bind_group(3, &prev_accum_bind_group, &[]);
-        pass.draw(0..3, 0..1);
+        pass.dispatch_workgroups((sw + 7) / 8, (sh + 7) / 8, 1);
         drop(pass);
 
         world.resource_mut::<ShadowPassResources>().swap();
