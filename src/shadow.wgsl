@@ -59,7 +59,7 @@ var prev_accum_tex: texture_2d<f32>;
 @group(3) @binding(1)
 var prev_accum_sampler: sampler;
 @group(3) @binding(2)
-var output_tex: texture_storage_2d<rgba8unorm, write>;
+var output_tex: texture_storage_2d<rgba16float, write>;
 
 // Read a bit from the fine bitmask (32x32x32 = 32768 bits = 1024 u32s per slot)
 fn test_fine_bit(slot: u32, x: u32, y: u32, z: u32) -> bool {
@@ -196,27 +196,36 @@ fn cs_shadow(@builtin(global_invocation_id) gid: vec3<u32>) {
     let jittered_uv = uv + jitter;
     let depth = textureSampleLevel(depth_tex, depth_sampler, jittered_uv, 0u);
 
+    // Reconstruct camera-relative position for depth output and early-outs
+    var normal_height = 0.0;
+    var cam_rel_early = vec3<f32>(0.0);
+    if (depth > 0.0) {
+        let ndc_e = vec4<f32>(
+            jittered_uv.x * 2.0 - 1.0,
+            (1.0 - jittered_uv.y) * 2.0 - 1.0,
+            depth, 1.0,
+        );
+        let clip_e = shadow.inv_view_proj * ndc_e;
+        cam_rel_early = clip_e.xyz / clip_e.w;
+        // Store height along surface normal — distinguishes parallel surfaces at different positions
+        let face_n = textureSampleLevel(normal_tex, depth_sampler, jittered_uv, 0.0).xyz * 2.0 - 1.0;
+        normal_height = dot(cam_rel_early, face_n);
+    }
+
     // Skipped pixels: return previous frame's value directly
     if (checker != 0u && depth > 0.0) {
         var prev_uv = uv;
         if (shadow.camera_moving != 0u) {
-            let ndc = vec4<f32>(
-                jittered_uv.x * 2.0 - 1.0,
-                (1.0 - jittered_uv.y) * 2.0 - 1.0,
-                depth, 1.0,
-            );
-            let clip = shadow.inv_view_proj * ndc;
-            let cam_rel = clip.xyz / clip.w;
             let chunk_shift = vec3<f32>((shadow.chunk_offset - shadow.prev_chunk_offset) * CHUNK_SIZE);
-            let prev_clip = shadow.prev_view_proj * vec4<f32>(cam_rel + chunk_shift, 1.0);
+            let prev_clip = shadow.prev_view_proj * vec4<f32>(cam_rel_early + chunk_shift, 1.0);
             let prev_ndc = prev_clip.xyz / prev_clip.w;
             prev_uv = vec2<f32>(prev_ndc.x * 0.5 + 0.5, 1.0 - (prev_ndc.y * 0.5 + 0.5));
             if (any(prev_uv < vec2<f32>(0.0)) || any(prev_uv > vec2<f32>(1.0))) {
                 prev_uv = uv;
             }
         }
-        let prev = textureSampleLevel(prev_accum_tex, prev_accum_sampler, prev_uv, 0.0).r;
-        textureStore(output_tex, pixel, vec4<f32>(prev, prev, prev, 1.0));
+        let prev = textureSampleLevel(prev_accum_tex, prev_accum_sampler, prev_uv, 0.0);
+        textureStore(output_tex, pixel, vec4<f32>(prev.r, prev.g, 0.0, 0.0));
         return;
     }
 
@@ -225,7 +234,7 @@ fn cs_shadow(@builtin(global_invocation_id) gid: vec3<u32>) {
         let face_normal_early = textureSampleLevel(normal_tex, depth_sampler, jittered_uv, 0.0).xyz * 2.0 - 1.0;
         let ndotl_early = dot(face_normal_early, normalize(shadow.sun_direction));
         if (ndotl_early <= 0.0) {
-            textureStore(output_tex, pixel, vec4<f32>(0.0, 0.0, 0.0, 1.0));
+            textureStore(output_tex, pixel, vec4<f32>(0.0, normal_height, 0.0, 0.0));
             return;
         }
     }
@@ -366,5 +375,5 @@ fn cs_shadow(@builtin(global_invocation_id) gid: vec3<u32>) {
         }
     }
 
-    textureStore(output_tex, pixel, vec4<f32>(result, result, result, 1.0));
+    textureStore(output_tex, pixel, vec4<f32>(result, normal_height, 0.0, 0.0));
 }

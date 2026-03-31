@@ -130,9 +130,49 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let raw_ndotl = dot(in.normal, light_dir);
     let ndotl = max(raw_ndotl, 0.0);
 
-    // Sample shadow mask at screen UV (same frame, no reprojection needed)
+    // Edge-aware shadow upscale: 2x2 bilinear with hard accept/reject
     let shadow_uv = in.clip_position.xy / camera.screen_size;
-    let shadow_val = textureSample(shadow_mask, shadow_sampler, shadow_uv).r;
+    let shadow_dims = vec2<f32>(textureDimensions(shadow_mask));
+    let frag_height = dot(in.world_pos, in.normal);
+
+    // Find the 2x2 texel footprint and sub-texel position
+    let texel_pos = shadow_uv * shadow_dims - 0.5;
+    let base = floor(texel_pos);
+    let f = texel_pos - base; // sub-texel fraction [0,1]
+
+    // Bilinear weights for the 4 texels
+    let bw = vec4<f32>(
+        (1.0 - f.x) * (1.0 - f.y), // top-left
+        f.x * (1.0 - f.y),          // top-right
+        (1.0 - f.x) * f.y,          // bottom-left
+        f.x * f.y,                   // bottom-right
+    );
+
+    // Load the 4 texels directly (no interpolation)
+    let base_i = vec2<i32>(base);
+    let dims_i = vec2<i32>(shadow_dims);
+    var shadow_vals: array<f32, 4>;
+    var weights: array<f32, 4>;
+    for (var i = 0; i < 4; i++) {
+        let tc = clamp(base_i + vec2<i32>(i % 2, i / 2), vec2<i32>(0), dims_i - 1);
+        let ss = textureLoad(shadow_mask, tc, 0);
+        let n = textureLoad(shadow_normal, tc, 0).xyz * 2.0 - 1.0;
+        let height_diff = abs(ss.g - frag_height);
+        let accept = select(0.0, 1.0, dot(n, in.normal) > 0.9 && height_diff < 0.3);
+        shadow_vals[i] = ss.r;
+        weights[i] = bw[i] * accept;
+    }
+
+    let total_w = weights[0] + weights[1] + weights[2] + weights[3];
+    var shadow_val: f32;
+    if (total_w > 0.001) {
+        shadow_val = (shadow_vals[0] * weights[0] + shadow_vals[1] * weights[1]
+                    + shadow_vals[2] * weights[2] + shadow_vals[3] * weights[3]) / total_w;
+    } else {
+        // No texel matched — pick nearest
+        let nearest = vec2<u32>(clamp(vec2<i32>(round(texel_pos)), vec2<i32>(0), vec2<i32>(shadow_dims) - 1));
+        shadow_val = textureLoad(shadow_mask, nearest, 0).r;
+    }
 
     // Faces pointing away from sun are always in shadow regardless of mask
     let shadow = select(shadow_val, 0.0, raw_ndotl <= 0.0);

@@ -125,7 +125,7 @@ pub struct ShadowMaskBGLayout;
 
 impl BindGroupLayoutProvider for ShadowMaskBGLayout {
     fn layout(&self) -> wgpu::BindGroupLayoutDescriptor<'_> {
-        static ENTRIES: [wgpu::BindGroupLayoutEntry; 2] = [
+        static ENTRIES: [wgpu::BindGroupLayoutEntry; 3] = [
             wgpu::BindGroupLayoutEntry {
                 binding: 0,
                 visibility: wgpu::ShaderStages::FRAGMENT,
@@ -142,6 +142,16 @@ impl BindGroupLayoutProvider for ShadowMaskBGLayout {
                 ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                 count: None,
             },
+            wgpu::BindGroupLayoutEntry {
+                binding: 2,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
         ];
         wgpu::BindGroupLayoutDescriptor {
             label: Some("Shadow Mask BG Layout"),
@@ -155,6 +165,8 @@ impl BindGroupLayoutProvider for ShadowMaskBGLayout {
 var shadow_mask: texture_2d<f32>;
 @group(#BIND_GROUP) @binding(1)
 var shadow_sampler: sampler;
+@group(#BIND_GROUP) @binding(2)
+var shadow_normal: texture_2d<f32>;
 "
     }
 }
@@ -802,6 +814,10 @@ impl Operation for VoxelDrawOperation {
                         wgpu::BindGroupEntry {
                             binding: 1,
                             resource: wgpu::BindingResource::Sampler(&shadow_res.shadow_mask_sampler),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: wgpu::BindingResource::TextureView(&shadow_res.shadow_normal_view),
                         },
                     ],
                 });

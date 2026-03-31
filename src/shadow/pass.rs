@@ -20,7 +20,7 @@ pub struct ShadowConfig {
 impl Default for ShadowConfig {
     fn default() -> Self {
         Self {
-            scale_denominator: 2,
+            scale_denominator: 3,
             debug_overlay: false,
         }
     }
@@ -170,7 +170,7 @@ fn create_shadow_mask_texture(
         mip_level_count: 1,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
-        format: TextureFormat::Rgba8Unorm,
+        format: TextureFormat::Rgba16Float,
         usage: TextureUsages::STORAGE_BINDING | TextureUsages::TEXTURE_BINDING,
         view_formats: &[],
     });
@@ -322,7 +322,7 @@ impl ShadowPassResources {
                         visibility: wgpu::ShaderStages::COMPUTE,
                         ty: wgpu::BindingType::StorageTexture {
                             access: wgpu::StorageTextureAccess::WriteOnly,
-                            format: TextureFormat::Rgba8Unorm,
+                            format: TextureFormat::Rgba16Float,
                             view_dimension: wgpu::TextureViewDimension::D2,
                         },
                         count: None,
@@ -550,6 +550,8 @@ impl Operation for ShadowDepthOperation {
             // Dummy shadow mask bind group (pipeline layout requires it but fs_normal doesn't use it)
             let shadow_mask_layout = world.resource::<modul_core::DeviceRes>().0
                 .create_bind_group_layout(&crate::render::ShadowMaskBGLayout.layout());
+            // Use prev_view as dummy for both texture slots — fs_normal doesn't read them,
+            // and the real normal texture is a color target in this pass (can't also be a resource)
             let dummy_shadow_bg = world.resource::<modul_core::DeviceRes>().0
                 .create_bind_group(&wgpu::BindGroupDescriptor {
                     label: Some("Dummy shadow BG"),
@@ -562,6 +564,10 @@ impl Operation for ShadowDepthOperation {
                         wgpu::BindGroupEntry {
                             binding: 1,
                             resource: wgpu::BindingResource::Sampler(&shadow_res.shadow_mask_sampler),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: wgpu::BindingResource::TextureView(shadow_res.prev_view()),
                         },
                     ],
                 });
