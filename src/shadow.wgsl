@@ -286,7 +286,7 @@ fn cs_shadow(@builtin(global_invocation_id) gid: vec3<u32>) {
             let dir_bias = mix(0.01 * sf, 1.0 * sf, t * t);
             // Normal offset: push ray origin out of surface, scales with distance like dir_bias
             let tn = clamp(dist / 200.0, 0.0, 1.0);
-            let normal_bias = mix(0.05 * sf, 1.0 * sf, tn * tn);
+            let normal_bias = mix(0.05 * sf, 2.0 * sf, tn * tn);
             let normal_push = face_normal * (1.0 - ndotl) * start_voxel_size * normal_bias;
             var pos = world_pos + normal_push + ray_dir * dir_bias * start_voxel_size;
             var total_dist = 0.0;
