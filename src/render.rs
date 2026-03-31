@@ -80,7 +80,7 @@ struct CameraUniform {
     prev_jittered_view_proj: mat4x4<f32>,
     prev_chunk_offset: vec3<i32>,
     frame_index: u32,
-    _pad3: vec3<f32>,
+    camera_local_pos: vec3<f32>,
     _pad4: f32,
 };
 
@@ -461,8 +461,9 @@ pub fn init_pipelines(
     let camera_wgsl = CameraBGLayout.library().replace("#BIND_GROUP", "0");
     let metadata_wgsl = MetadataBGLayout.library().replace("#BIND_GROUP", "1");
     let shadow_mask_wgsl = ShadowMaskBGLayout.library().replace("#BIND_GROUP", "2");
+    let atmosphere_wgsl = crate::atmosphere::AtmosphereBGLayout.library().replace("#BIND_GROUP", "3");
     let full_source = format!(
-        "{camera_wgsl}\n{metadata_wgsl}\n{shadow_mask_wgsl}\n{}",
+        "{camera_wgsl}\n{metadata_wgsl}\n{shadow_mask_wgsl}\n{atmosphere_wgsl}\n{}",
         include_str!("voxel.wgsl")
     );
 
@@ -475,9 +476,10 @@ pub fn init_pipelines(
     let camera_layout = device.create_bind_group_layout(&CameraBGLayout.layout());
     let metadata_layout = device.create_bind_group_layout(&MetadataBGLayout.layout());
     let shadow_mask_layout = device.create_bind_group_layout(&ShadowMaskBGLayout.layout());
+    let atmosphere_layout = device.create_bind_group_layout(&crate::atmosphere::AtmosphereBGLayout.layout());
     let layout = layouts.add(device.create_pipeline_layout(&PipelineLayoutDescriptor {
         label: Some("Voxel pipeline layout"),
-        bind_group_layouts: &[&camera_layout, &metadata_layout, &shadow_mask_layout],
+        bind_group_layouts: &[&camera_layout, &metadata_layout, &shadow_mask_layout, &atmosphere_layout],
         push_constant_ranges: &[],
     }));
 

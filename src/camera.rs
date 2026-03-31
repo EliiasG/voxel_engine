@@ -21,7 +21,8 @@ pub struct CameraUniform {
     pub prev_chunk_offset: [i32; 3],
     /// Frame index for Halton jitter sequence
     pub frame_index: u32,
-    pub _pad3: [f32; 3],
+    /// Camera position relative to its own chunk origin (small f32, range [0, CHUNK_SIZE))
+    pub camera_local_pos: [f32; 3],
     pub _pad4: f32,
 }
 
@@ -129,7 +130,7 @@ impl FlyCamera {
             prev_jittered_view_proj: [[0.0; 4]; 4],
             prev_chunk_offset: [0; 3],
             frame_index: 0,
-            _pad3: [0.0; 3],
+            camera_local_pos: local_eye,
             _pad4: 0.0,
         }
     }

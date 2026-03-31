@@ -150,7 +150,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         0.2 + 0.2 * height_color,
     );
 
-    let light_dir = normalize(vec3<f32>(0.3, 0.47, 0.5));
+    let light_dir = atmosphere.sun_direction;
     let raw_ndotl = dot(in.normal, light_dir);
     let ndotl = max(raw_ndotl, 0.0);
 
@@ -210,7 +210,20 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let ao = mix(0.4, 1.0, in.ao);
     let lit_color = base_color * (ambient * ao + sky_light * ao + diffuse);
 
-    return vec4<f32>(lit_color, 1.0);
+    // Exponential distance fog — blend toward sky horizon color
+    let view_dir = normalize(in.world_pos - camera.camera_local_pos);
+    let sun_yaw = atan2(atmosphere.sun_direction.x, atmosphere.sun_direction.z);
+    let fog_yaw = atan2(view_dir.x, view_dir.z);
+    let fog_rel_yaw = fog_yaw - sun_yaw;
+    let fog_u = fog_rel_yaw / (2.0 * 3.14159265359) + 0.5;
+    let fog_elevation = asin(clamp(view_dir.y, 0.15, 1.0)*0.8); // clamp to at/above horizon
+    let fog_v = (fog_elevation) / 3.14159265359 + 0.5;
+    let fog_color = textureSample(fog_lut, sky_sampler, vec3<f32>(fog_u, fog_v, atmosphere.lut_w)).rgb;
+    let dist = length(in.world_pos);
+    let fog_factor = 1.0 - exp(-dist * atmosphere.fog_density);
+    let final_color = mix(lit_color, fog_color, fog_factor);
+
+    return vec4<f32>(final_color, 1.0);
 }
 
 @fragment

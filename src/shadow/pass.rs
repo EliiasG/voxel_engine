@@ -511,8 +511,13 @@ impl Operation for ShadowDepthOperation {
                     ],
                 });
 
+            let atmo_res = world.resource::<crate::atmosphere::AtmosphereResources>();
+            let atmo_bg_ptr = &atmo_res.bind_group as *const wgpu::BindGroup;
+            let atmo_bg = unsafe { &*atmo_bg_ptr };
+
             pass.set_bind_group(0, camera_bg, &[]);
             pass.set_bind_group(2, &dummy_shadow_bg, &[]);
+            pass.set_bind_group(3, atmo_bg, &[]);
 
             let mut current_slab = usize::MAX;
             for draw in &gpu.draws {

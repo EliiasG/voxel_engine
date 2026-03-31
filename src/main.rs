@@ -1,3 +1,4 @@
+mod atmosphere;
 mod camera;
 mod chunk;
 mod render;
@@ -49,6 +50,18 @@ impl Default for FpsCounter {
             frame_count: 0,
             fps: 0.0,
         }
+    }
+}
+
+#[derive(Resource)]
+struct DayCycle {
+    angle: f32, // radians, 0 = sunrise east, π/2 = noon overhead
+}
+
+impl Default for DayCycle {
+    fn default() -> Self {
+        // Start at ~25° above horizon to match old default
+        Self { angle: 0.44 }
     }
 }
 
@@ -197,6 +210,8 @@ fn main() {
             (
                 render::synchronize_gpu,
                 shadow::gpu::synchronize_shadow_buffers,
+                update_day_cycle,
+                atmosphere::update_atmosphere,
                 update_camera,
                 shadow::pass::update_previous_frame_data,
             ),
@@ -207,6 +222,7 @@ fn main() {
 fn init(
     mut commands: Commands,
     device: Res<DeviceRes>,
+    queue: Res<QueueRes>,
     main_window: Query<Entity, With<MainWindow>>,
     mut shaders: ResMut<Assets<wgpu::ShaderModule>>,
     mut layouts: ResMut<Assets<wgpu::PipelineLayout>>,
@@ -259,6 +275,12 @@ fn init(
 
     let taa_res = taa::TaaResources::new(&device.0, surface_fmt.0, 800, 600);
 
+    let sun_dir = shadow::pass::SunDirection::default();
+    let atmo_config = atmosphere::AtmosphereConfig::default();
+    let atmo_res = atmosphere::AtmosphereResources::new(
+        &device.0, &queue.0, &sun_dir, &atmo_config, surface_fmt.0,
+    );
+
     let render_target = RenderTargetSource::Surface(window_entity);
     let mut builder = SequenceBuilder::new();
     builder
@@ -266,6 +288,7 @@ fn init(
         .add(shadow::pass::ShadowDepthOperationBuilder)
         .add(shadow::pass::ShadowTraceOperationBuilder)
         .add(taa::TaaVoxelDrawOperationBuilder)
+        .add(atmosphere::SkyPassOperationBuilder)
         .add(taa::TaaResolveOperationBuilder {
             surface_entity: window_entity,
         })
@@ -287,12 +310,15 @@ fn init(
     commands.insert_resource(shadow_gpu);
     commands.insert_resource(shadow_pass_res);
     commands.insert_resource(shadow::pass::ShadowConfig::default());
-    commands.insert_resource(shadow::pass::SunDirection::default());
+    commands.insert_resource(sun_dir);
+    commands.insert_resource(DayCycle::default());
     commands.insert_resource(shadow::pass::PreviousFrameData::default());
     commands.insert_resource(voxel_pipeline);
     commands.insert_resource(render::PageAllocator::new());
     commands.insert_resource(render::Wireframe(false));
     commands.insert_resource(DebugMode::default());
+    commands.insert_resource(atmo_config);
+    commands.insert_resource(atmo_res);
     commands.insert_resource(RunningSequenceQueue(SequenceQueue(vec![sequence])));
 }
 
@@ -516,6 +542,19 @@ fn process_input(
     if forward != 0.0 || right != 0.0 || up != 0.0 {
         camera.0.move_dir(forward, right, up, dt);
     }
+}
+
+fn update_day_cycle(
+    input: Res<InputState>,
+    mut cycle: ResMut<DayCycle>,
+    mut sun_dir: ResMut<shadow::pass::SunDirection>,
+) {
+    let dt = input.dt.min(0.1);
+    let day_length = 30.0; // seconds per full rotation
+    cycle.angle += dt * std::f32::consts::TAU / day_length;
+    cycle.angle %= std::f32::consts::TAU;
+
+    sun_dir.0 = atmosphere::sun_direction_at_angle(cycle.angle);
 }
 
 fn update_camera(
