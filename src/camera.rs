@@ -11,7 +11,18 @@ pub struct CameraUniform {
     pub chunk_offset: [i32; 3],
     pub _pad: i32,
     pub screen_size: [f32; 2],
-    pub _pad2: [f32; 2],
+    /// Sub-pixel jitter in pixel coordinates ([-0.5, +0.5] range)
+    pub jitter_offset: [f32; 2],
+    /// Inverse of the jittered view_proj (for depth → world position reconstruction)
+    pub inv_view_proj: [[f32; 4]; 4],
+    /// Previous frame's jittered view_proj (for TAA reprojection)
+    pub prev_jittered_view_proj: [[f32; 4]; 4],
+    /// Previous frame's chunk offset
+    pub prev_chunk_offset: [i32; 3],
+    /// Frame index for Halton jitter sequence
+    pub frame_index: u32,
+    pub _pad3: [f32; 3],
+    pub _pad4: f32,
 }
 
 pub struct FlyCamera {
@@ -113,7 +124,13 @@ impl FlyCamera {
             chunk_offset: chunk.to_array(),
             _pad: 0,
             screen_size: [0.0; 2],
-            _pad2: [0.0; 2],
+            jitter_offset: [0.0; 2],
+            inv_view_proj: [[0.0; 4]; 4],
+            prev_jittered_view_proj: [[0.0; 4]; 4],
+            prev_chunk_offset: [0; 3],
+            frame_index: 0,
+            _pad3: [0.0; 3],
+            _pad4: 0.0,
         }
     }
 }
@@ -176,6 +193,106 @@ fn normalize(v: [f32; 3]) -> [f32; 3] {
         return [0.0; 3];
     }
     [v[0] / len, v[1] / len, v[2] / len]
+}
+
+// --- TAA jitter helpers ---
+
+fn halton_2(mut index: u32) -> f32 {
+    let mut f = 0.5f32;
+    let mut result = 0.0f32;
+    while index > 0 {
+        if index & 1 != 0 {
+            result += f;
+        }
+        f *= 0.5;
+        index >>= 1;
+    }
+    result
+}
+
+fn halton_3(mut index: u32) -> f32 {
+    let mut f = 1.0f32 / 3.0;
+    let mut result = 0.0f32;
+    while index > 0 {
+        result += f * (index % 3) as f32;
+        index /= 3;
+        f /= 3.0;
+    }
+    result
+}
+
+/// Returns (jx, jy) in [-0.5, +0.5] pixel range for the given frame index.
+pub fn taa_jitter(frame_index: u32) -> (f32, f32) {
+    let idx = (frame_index % 16) + 1;
+    (halton_2(idx) - 0.5, halton_3(idx) - 0.5)
+}
+
+/// Apply sub-pixel jitter to a combined view_proj matrix.
+/// jx, jy are in pixel coordinates; width, height are screen dimensions.
+pub fn apply_jitter(
+    view_proj: &mut [[f32; 4]; 4],
+    jx: f32,
+    jy: f32,
+    width: f32,
+    height: f32,
+) {
+    let jx_ndc = 2.0 * jx / width;
+    let jy_ndc = 2.0 * jy / height;
+    for col in 0..4 {
+        view_proj[col][0] += jx_ndc * view_proj[col][3];
+        view_proj[col][1] += jy_ndc * view_proj[col][3];
+    }
+}
+
+/// 4x4 matrix inverse via Gaussian elimination (column-major storage).
+pub fn invert_mat4(m: &[[f32; 4]; 4]) -> [[f32; 4]; 4] {
+    let mut a = *m;
+    let mut inv = [
+        [1.0, 0.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0, 0.0],
+        [0.0, 0.0, 1.0, 0.0],
+        [0.0, 0.0, 0.0, 1.0],
+    ];
+    for col in 0..4 {
+        let mut max_val = 0.0f32;
+        let mut max_row = col;
+        for row in col..4 {
+            let v = a[col][row].abs();
+            if v > max_val {
+                max_val = v;
+                max_row = row;
+            }
+        }
+        if max_row != col {
+            for c in 0..4 {
+                let tmp = a[c][col];
+                a[c][col] = a[c][max_row];
+                a[c][max_row] = tmp;
+                let tmp = inv[c][col];
+                inv[c][col] = inv[c][max_row];
+                inv[c][max_row] = tmp;
+            }
+        }
+        let pivot = a[col][col];
+        if pivot.abs() < 1e-12 {
+            return inv;
+        }
+        for c in 0..4 {
+            a[c][col] /= pivot;
+            inv[c][col] /= pivot;
+        }
+        for row in 0..4 {
+            if row == col {
+                continue;
+            }
+            let factor = a[col][row];
+            for c in 0..4 {
+                a[c][row] -= factor * a[c][col];
+                inv[c][row] -= factor * inv[c][col];
+            }
+        }
+    }
+    inv
 }
 
 /// Extract 6 frustum planes from a view-projection matrix (wgpu depth [0,1]).

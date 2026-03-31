@@ -189,10 +189,13 @@ fn cs_shadow(@builtin(global_invocation_id) gid: vec3<u32>) {
     let uv = (vec2<f32>(pixel) + 0.5) / shadow.shadow_tex_size;
 
     // Checkerboard: only trace half the pixels per frame, reuse previous for the other half
-    let checker = (pixel.x / 2u + pixel.y / 2u + shadow.frame_index) % 2u;
+    let checker = (pixel.x + pixel.y + shadow.frame_index) % 2u;
 
-    // Jitter UV by sub-pixel offset for temporal anti-aliasing
-    let jitter = (jitter_offset(shadow.frame_index) - 0.5) / shadow.shadow_tex_size;
+    // Jitter UV by sub-pixel offset for temporal anti-aliasing (skip when static — deterministic traces prevent flicker)
+    var jitter = vec2<f32>(0.0);
+    if (shadow.camera_moving != 0u) {
+        jitter = (jitter_offset(shadow.frame_index) - 0.5) / shadow.shadow_tex_size;
+    }
     let jittered_uv = uv + jitter;
     let depth = textureSampleLevel(depth_tex, depth_sampler, jittered_uv, 0u);
 
@@ -283,10 +286,10 @@ fn cs_shadow(@builtin(global_invocation_id) gid: vec3<u32>) {
 
             // Directional bias (along ray), scaled by downscale factor
             let sf = shadow.scale_factor;
-            let dir_bias = mix(0.01 * sf, 1.0 * sf, t * t);
+            let dir_bias = mix(0.01 * sf, 1 * sf, t * t);
             // Normal offset: push ray origin out of surface, scales with distance like dir_bias
             let tn = clamp(dist / 200.0, 0.0, 1.0);
-            let normal_bias = mix(0.05 * sf, 2.0 * sf, tn * tn);
+            let normal_bias = mix(0.05 * sf, 2 * sf, tn * tn);
             let normal_push = face_normal * (1.0 - ndotl) * start_voxel_size * normal_bias;
             var pos = world_pos + normal_push + ray_dir * dir_bias * start_voxel_size;
             var total_dist = 0.0;
@@ -367,9 +370,9 @@ fn cs_shadow(@builtin(global_invocation_id) gid: vec3<u32>) {
             let t = clamp((dist - 30.0) / 170.0, 0.0, 1.0); // 30..200 range
             // Moving: aggressive blend so near shadows respond fast
             // Static: gentle blend so jitter converges smoothly without visible flicker
-            var blend = mix(0.6, 0.2, t);
+            var blend = mix(0.7, 0.5, t);
             if (shadow.camera_moving == 0u) {
-                blend = mix(0.12, 0.04, t);
+                blend = mix(0.06, 0.02, t);
             }
             result = mix(prev_sample, trace_result, blend);
         }

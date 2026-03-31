@@ -426,70 +426,9 @@ pub fn update_previous_frame_data(
     // Store current frame's data in staging (will be used next frame)
     let uniform = camera.0.uniform();
     prev.next_view_proj = uniform.view_proj;
-    prev.next_inv_view_proj = invert_mat4(&uniform.view_proj);
+    prev.next_inv_view_proj = crate::camera::invert_mat4(&uniform.view_proj);
     prev.next_chunk_offset = uniform.chunk_offset;
     prev.next_valid = true;
-}
-
-fn invert_mat4(m: &[[f32; 4]; 4]) -> [[f32; 4]; 4] {
-    // Gaussian elimination for 4x4 matrix inverse
-    let mut a = *m;
-    let mut inv = [
-        [1.0, 0.0, 0.0, 0.0],
-        [0.0, 1.0, 0.0, 0.0],
-        [0.0, 0.0, 1.0, 0.0],
-        [0.0, 0.0, 0.0, 1.0],
-    ];
-
-    for col in 0..4 {
-        // Find pivot
-        let mut max_val = 0.0f32;
-        let mut max_row = col;
-        for row in col..4 {
-            let v = a[col][row].abs();
-            if v > max_val {
-                max_val = v;
-                max_row = row;
-            }
-        }
-
-        // Swap rows
-        if max_row != col {
-            for c in 0..4 {
-                let tmp = a[c][col];
-                a[c][col] = a[c][max_row];
-                a[c][max_row] = tmp;
-                let tmp = inv[c][col];
-                inv[c][col] = inv[c][max_row];
-                inv[c][max_row] = tmp;
-            }
-        }
-
-        let pivot = a[col][col];
-        if pivot.abs() < 1e-12 {
-            return inv; // singular
-        }
-
-        // Scale pivot row
-        for c in 0..4 {
-            a[c][col] /= pivot;
-            inv[c][col] /= pivot;
-        }
-
-        // Eliminate column
-        for row in 0..4 {
-            if row == col {
-                continue;
-            }
-            let factor = a[col][row];
-            for c in 0..4 {
-                a[c][row] -= factor * a[c][col];
-                inv[c][row] -= factor * inv[c][col];
-            }
-        }
-    }
-
-    inv
 }
 
 // --- Operations ---
@@ -623,21 +562,25 @@ impl Operation for ShadowTraceOperation {
         let uniform = {
             let scale = world.resource::<ShadowConfig>().scale_denominator;
             let camera = world.resource::<crate::Camera>();
-            let cam_uniform = camera.0.uniform();
+            let cam_uniform = camera.0.uniform(); // unjittered — for motion detection
+            let taa_res = world.resource::<crate::taa::TaaResources>();
+            // The shadow depth pass rendered with the jittered VP (from camera bind group),
+            // so we must reconstruct world positions using the same jittered VP's inverse.
+            let jittered_vp = taa_res.prev_jittered_view_proj;
             let prev = world.resource::<PreviousFrameData>();
             let sun = world.resource::<SunDirection>();
             let grid = world.resource::<crate::shadow::grid::ShadowGrid>();
             let fc = world.resource::<crate::FrameCount>().0;
             let shadow_res = world.resource::<ShadowPassResources>();
             let (sw, sh) = shadow_res.current_size;
-            // Detect camera motion by comparing VP matrices
+            // Detect camera motion using unjittered VP (jitter changes every frame)
             let moving = if prev.valid {
                 cam_uniform.view_proj != prev.view_proj || cam_uniform.chunk_offset != prev.chunk_offset
             } else {
                 false
             };
             ShadowPassUniform {
-                inv_view_proj: invert_mat4(&cam_uniform.view_proj),
+                inv_view_proj: crate::camera::invert_mat4(&jittered_vp),
                 chunk_offset: cam_uniform.chunk_offset,
                 _pad0: 0,
                 sun_direction: sun.0,

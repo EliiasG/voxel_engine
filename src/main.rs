@@ -2,6 +2,7 @@ mod camera;
 mod chunk;
 mod render;
 mod shadow;
+mod taa;
 
 use std::collections::HashSet;
 
@@ -212,6 +213,7 @@ fn init(
     mut pipelines: ResMut<Assets<RenderPipelineManager>>,
     mut sequences: ResMut<Assets<Sequence>>,
     shadow_grid: Res<shadow::grid::ShadowGrid>,
+    surface_fmt: Res<modul_core::SurfaceFormat>,
 ) {
     let window_entity = main_window.single();
 
@@ -255,14 +257,17 @@ fn init(
         &device.0, &shadow_gpu, 800, 600, 1, // initial size, full res for debugging
     );
 
+    let taa_res = taa::TaaResources::new(&device.0, surface_fmt.0, 800, 600);
+
     let render_target = RenderTargetSource::Surface(window_entity);
     let mut builder = SequenceBuilder::new();
     builder
         .add(render::ClearAll { render_target })
         .add(shadow::pass::ShadowDepthOperationBuilder)
         .add(shadow::pass::ShadowTraceOperationBuilder)
-        .add(render::VoxelDrawOperationBuilder {
-            target: render_target,
+        .add(taa::TaaVoxelDrawOperationBuilder)
+        .add(taa::TaaResolveOperationBuilder {
+            surface_entity: window_entity,
         })
         .add(shadow::pass::ShadowDebugOverlayBuilder {
             target: render_target,
@@ -276,6 +281,7 @@ fn init(
 
     commands.insert_resource(Camera(cam));
     commands.insert_resource(FrameCount(0));
+    commands.insert_resource(taa_res);
     commands.insert_resource(gpu_buffers);
     commands.insert_resource(camera_bg);
     commands.insert_resource(shadow_gpu);
@@ -516,6 +522,7 @@ fn update_camera(
     mut camera: ResMut<Camera>,
     mut frame_count: ResMut<FrameCount>,
     mut fps: ResMut<FpsCounter>,
+    mut taa_res: ResMut<taa::TaaResources>,
     debug: Res<DebugMode>,
     queue: Res<QueueRes>,
     camera_bg: Res<render::CameraBindGroup>,
@@ -553,6 +560,36 @@ fn update_camera(
         let (w, h) = modul_render::RenderTarget::size(rt);
         uniform.screen_size = [w as f32, h as f32];
     }
+
+    // Fill prev fields from TaaResources (stored last frame)
+    uniform.frame_index = (frame_count.0 % 16) as u32;
+    if taa_res.prev_valid {
+        uniform.prev_jittered_view_proj = taa_res.prev_jittered_view_proj;
+        uniform.prev_chunk_offset = taa_res.prev_chunk_offset;
+    } else {
+        uniform.prev_jittered_view_proj = uniform.view_proj;
+        uniform.prev_chunk_offset = uniform.chunk_offset;
+    }
+
+    // Apply sub-pixel jitter
+    let (jx, jy) = camera::taa_jitter(uniform.frame_index);
+    uniform.jitter_offset = [jx, -jy]; // y negated for UV-space (UV.y is flipped vs NDC.y)
+    camera::apply_jitter(
+        &mut uniform.view_proj,
+        jx,
+        jy,
+        uniform.screen_size[0],
+        uniform.screen_size[1],
+    );
+
+    // Inverse of jittered VP (for depth reconstruction in TAA resolve)
+    uniform.inv_view_proj = camera::invert_mat4(&uniform.view_proj);
+
+    // Store this frame's jittered data for next frame's reprojection
+    taa_res.prev_jittered_view_proj = uniform.view_proj;
+    taa_res.prev_chunk_offset = uniform.chunk_offset;
+    taa_res.prev_valid = true;
+
     queue
         .0
         .write_buffer(&camera_bg.buffer, 0, bytemuck::bytes_of(&uniform));

@@ -75,7 +75,13 @@ struct CameraUniform {
     chunk_offset: vec3<i32>,
     _pad: i32,
     screen_size: vec2<f32>,
-    _pad2: vec2<f32>,
+    jitter_offset: vec2<f32>,
+    inv_view_proj: mat4x4<f32>,
+    prev_jittered_view_proj: mat4x4<f32>,
+    prev_chunk_offset: vec3<i32>,
+    frame_index: u32,
+    _pad3: vec3<f32>,
+    _pad4: f32,
 };
 
 @group(#BIND_GROUP) @binding(0)
