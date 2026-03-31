@@ -293,7 +293,7 @@ fn cs_shadow(@builtin(global_invocation_id) gid: vec3<u32>) {
             var hit = false;
 
             for (var step_count = 0u; step_count < MAX_STEPS; step_count++) {
-                if (total_dist > shadow.max_ray_distance || hit) {
+                if (hit) {
                     break;
                 }
 
