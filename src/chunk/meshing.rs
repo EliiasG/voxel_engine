@@ -152,6 +152,126 @@ pub fn poll_meshing(
 
 // --- Meshing internals ---
 
+/// Check if a block at (x, y, z) is solid, handling cross-chunk lookups.
+/// Coordinates outside all accessible chunks (diagonal neighbors) default to air.
+fn is_solid_at(
+    x: i32,
+    y: i32,
+    z: i32,
+    storage: &ChunkStorage,
+    neighbors: &[Option<Arc<ChunkStorage>>; 6],
+) -> bool {
+    let cs = CHUNK_SIZE as i32;
+    if x >= 0 && x < cs && y >= 0 && y < cs && z >= 0 && z < cs {
+        return storage.get(x as usize, y as usize, z as usize) != AIR;
+    }
+    // Determine which axis is out of bounds and the corrected coordinate
+    let (nx, dir_x) = if x < 0 {
+        (x + cs, Some(DIR_NEG_X))
+    } else if x >= cs {
+        (x - cs, Some(DIR_POS_X))
+    } else {
+        (x, None)
+    };
+    let (ny, dir_y) = if y < 0 {
+        (y + cs, Some(DIR_NEG_Y))
+    } else if y >= cs {
+        (y - cs, Some(DIR_POS_Y))
+    } else {
+        (y, None)
+    };
+    let (nz, dir_z) = if z < 0 {
+        (z + cs, Some(DIR_NEG_Z))
+    } else if z >= cs {
+        (z - cs, Some(DIR_POS_Z))
+    } else {
+        (z, None)
+    };
+    // Must be out of bounds in exactly one axis (face neighbor)
+    let active_dir = match (dir_x, dir_y, dir_z) {
+        (Some(d), None, None) => d,
+        (None, Some(d), None) => d,
+        (None, None, Some(d)) => d,
+        _ => return false, // diagonal/corner neighbor — no data, treat as air
+    };
+    match &neighbors[active_dir] {
+        Some(n) => n.get(nx as usize, ny as usize, nz as usize) != AIR,
+        None => false,
+    }
+}
+
+// AO neighbor offsets: normal, tangent_u, tangent_v per direction (matches shader tangents)
+const AO_NORMAL: [[i32; 3]; 6] = [
+    [1, 0, 0],  // +X
+    [-1, 0, 0], // -X
+    [0, 1, 0],  // +Y
+    [0, -1, 0], // -Y
+    [0, 0, 1],  // +Z
+    [0, 0, -1], // -Z
+];
+const AO_TAN_U: [[i32; 3]; 6] = [
+    [0, 1, 0], // +X: u = Y
+    [0, 0, 1], // -X: u = Z
+    [0, 0, 1], // +Y: u = Z
+    [1, 0, 0], // -Y: u = X
+    [1, 0, 0], // +Z: u = X
+    [0, 1, 0], // -Z: u = Y
+];
+const AO_TAN_V: [[i32; 3]; 6] = [
+    [0, 0, 1], // +X: v = Z
+    [0, 1, 0], // -X: v = Y
+    [1, 0, 0], // +Y: v = X
+    [0, 0, 1], // -Y: v = Z
+    [0, 1, 0], // +Z: v = Y
+    [1, 0, 0], // -Z: v = X
+];
+
+/// Compute packed AO byte for a face: 4 corners × 2 bits each.
+/// Bits 0-1: corner (u=0,v=0), 2-3: (u=1,v=0), 4-5: (u=0,v=1), 6-7: (u=1,v=1).
+fn compute_ao(
+    dir: usize,
+    x: usize,
+    y: usize,
+    z: usize,
+    storage: &ChunkStorage,
+    neighbors: &[Option<Arc<ChunkStorage>>; 6],
+) -> u8 {
+    let n = AO_NORMAL[dir];
+    let tu = AO_TAN_U[dir];
+    let tv = AO_TAN_V[dir];
+    // Air block position (one step in normal direction from face-owning block)
+    let ax = x as i32 + n[0];
+    let ay = y as i32 + n[1];
+    let az = z as i32 + n[2];
+
+    let mut ao_byte: u8 = 0;
+    for corner in 0..4u8 {
+        let us = if corner & 1 == 0 { -1i32 } else { 1 };
+        let vs = if corner & 2 == 0 { -1i32 } else { 1 };
+        let side_u = is_solid_at(
+            ax + us * tu[0], ay + us * tu[1], az + us * tu[2],
+            storage, neighbors,
+        );
+        let side_v = is_solid_at(
+            ax + vs * tv[0], ay + vs * tv[1], az + vs * tv[2],
+            storage, neighbors,
+        );
+        let ao_val = if side_u && side_v {
+            0u8
+        } else {
+            let diag = is_solid_at(
+                ax + us * tu[0] + vs * tv[0],
+                ay + us * tu[1] + vs * tv[1],
+                az + us * tu[2] + vs * tv[2],
+                storage, neighbors,
+            );
+            3 - (side_u as u8 + side_v as u8 + diag as u8)
+        };
+        ao_byte |= ao_val << (corner * 2);
+    }
+    ao_byte
+}
+
 fn get_neighbor_block(
     storage: &Option<Arc<ChunkStorage>>,
     x: usize,
@@ -228,8 +348,8 @@ fn mesh_chunk(
 
     // Stage 2: greedy mesh each set separately per direction.
     std::array::from_fn(|dir| DirFaces {
-        standard: greedy_mesh_buffer(dir, &std_buffers[dir]),
-        border: greedy_mesh_buffer(dir, &border_buffers[dir]),
+        standard: greedy_mesh_buffer(dir, &std_buffers[dir], storage, neighbors),
+        border: greedy_mesh_buffer(dir, &border_buffers[dir], storage, neighbors),
     })
 }
 
@@ -269,8 +389,26 @@ fn check_face(
     }
 }
 
-/// Greedy mesh a single direction's face buffer.
-fn greedy_mesh_buffer(dir: usize, buffer: &[BlockId]) -> Vec<FaceData> {
+/// Convert greedy-mesh (d, u, v) coordinates to block (x, y, z) for a given direction.
+fn duv_to_xyz(dir: usize, d: usize, u: usize, v: usize) -> (usize, usize, usize) {
+    match dir {
+        DIR_POS_X => (d, u, v),
+        DIR_NEG_X => (d, v, u),
+        DIR_POS_Y => (v, d, u),
+        DIR_NEG_Y => (u, d, v),
+        DIR_POS_Z => (u, v, d),
+        DIR_NEG_Z => (v, u, d),
+        _ => unreachable!(),
+    }
+}
+
+/// Greedy mesh a single direction's face buffer with AO.
+fn greedy_mesh_buffer(
+    dir: usize,
+    buffer: &[BlockId],
+    storage: &ChunkStorage,
+    neighbors: &[Option<Arc<ChunkStorage>>; 6],
+) -> Vec<FaceData> {
     const CS: usize = CHUNK_SIZE;
     const CS2: usize = CHUNK_SIZE_2;
 
@@ -284,9 +422,21 @@ fn greedy_mesh_buffer(dir: usize, buffer: &[BlockId]) -> Vec<FaceData> {
 
     let mut faces = Vec::new();
     let mut consumed = [false; CHUNK_SIZE_2];
+    let mut ao_cache = [0u8; CHUNK_SIZE_2];
 
     for d in 0..CHUNK_SIZE {
         consumed.fill(false);
+
+        // Pre-compute AO for all faces in this depth slice
+        for u in 0..CHUNK_SIZE {
+            for v in 0..CHUNK_SIZE {
+                let idx = d * ds + u * us + v * vs;
+                if buffer[idx] != AIR {
+                    let (x, y, z) = duv_to_xyz(dir, d, u, v);
+                    ao_cache[u * CHUNK_SIZE + v] = compute_ao(dir, x, y, z, storage, neighbors);
+                }
+            }
+        }
 
         for u in 0..CHUNK_SIZE {
             for v in 0..CHUNK_SIZE {
@@ -300,10 +450,15 @@ fn greedy_mesh_buffer(dir: usize, buffer: &[BlockId]) -> Vec<FaceData> {
                     continue;
                 }
 
+                let ao = ao_cache[grid_idx];
+
                 let mut hv = 1usize;
                 while v + hv < CHUNK_SIZE {
                     let ni = u * CHUNK_SIZE + (v + hv);
-                    if consumed[ni] || buffer[d * ds + u * us + (v + hv) * vs] != block {
+                    if consumed[ni]
+                        || buffer[d * ds + u * us + (v + hv) * vs] != block
+                        || ao_cache[ni] != ao
+                    {
                         break;
                     }
                     hv += 1;
@@ -315,6 +470,7 @@ fn greedy_mesh_buffer(dir: usize, buffer: &[BlockId]) -> Vec<FaceData> {
                         let ni = (u + hu) * CHUNK_SIZE + (v + dv);
                         if consumed[ni]
                             || buffer[d * ds + (u + hu) * us + (v + dv) * vs] != block
+                            || ao_cache[ni] != ao
                         {
                             break 'expand_u;
                         }
@@ -328,15 +484,7 @@ fn greedy_mesh_buffer(dir: usize, buffer: &[BlockId]) -> Vec<FaceData> {
                     }
                 }
 
-                let (x, y, z) = match dir {
-                    DIR_POS_X => (d, u, v),
-                    DIR_NEG_X => (d, v, u),
-                    DIR_POS_Y => (v, d, u),
-                    DIR_NEG_Y => (u, d, v),
-                    DIR_POS_Z => (u, v, d),
-                    DIR_NEG_Z => (v, u, d),
-                    _ => unreachable!(),
-                };
+                let (x, y, z) = duv_to_xyz(dir, d, u, v);
 
                 faces.push(FaceData {
                     x: x as u8,
@@ -344,7 +492,7 @@ fn greedy_mesh_buffer(dir: usize, buffer: &[BlockId]) -> Vec<FaceData> {
                     z: z as u8,
                     w: hu as u8,
                     h: hv as u8,
-                    material: [0; 3],
+                    material: [ao, 0, 0],
                 });
             }
         }

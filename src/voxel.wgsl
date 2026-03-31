@@ -10,6 +10,7 @@ struct VertexOutput {
     @builtin(position) clip_position: vec4<f32>,
     @location(0) world_pos: vec3<f32>,
     @location(1) normal: vec3<f32>,
+    @location(2) ao: f32,
 };
 
 fn get_normal(dir: u32) -> vec3<f32> {
@@ -51,16 +52,38 @@ fn vs_main(
     let w = f32(face.data0.w);
     let h = f32(face.data1.x);
 
+    // Unpack AO corners: 2 bits each, packed in material[0] = data1.y
+    let ao_packed = face.data1.y;
+    let ao_00 = f32(ao_packed & 3u) / 3.0;
+    let ao_10 = f32((ao_packed >> 2u) & 3u) / 3.0;
+    let ao_01 = f32((ao_packed >> 4u) & 3u) / 3.0;
+    let ao_11 = f32((ao_packed >> 6u) & 3u) / 3.0;
+
+    // Flip quad diagonal when AO is asymmetric to fix interpolation artifacts
+    let flip = ao_00 + ao_11 < ao_10 + ao_01;
+
     var u_factor: f32;
     var v_factor: f32;
-    switch vertex_index {
-        case 0u: { u_factor = 0.0; v_factor = 0.0; }
-        case 1u: { u_factor = 1.0; v_factor = 0.0; }
-        case 2u: { u_factor = 1.0; v_factor = 1.0; }
-        case 3u: { u_factor = 0.0; v_factor = 0.0; }
-        case 4u: { u_factor = 1.0; v_factor = 1.0; }
-        case 5u: { u_factor = 0.0; v_factor = 1.0; }
-        default: { u_factor = 0.0; v_factor = 0.0; }
+    if flip {
+        switch vertex_index {
+            case 0u: { u_factor = 0.0; v_factor = 0.0; }
+            case 1u: { u_factor = 1.0; v_factor = 0.0; }
+            case 2u: { u_factor = 0.0; v_factor = 1.0; }
+            case 3u: { u_factor = 1.0; v_factor = 0.0; }
+            case 4u: { u_factor = 1.0; v_factor = 1.0; }
+            case 5u: { u_factor = 0.0; v_factor = 1.0; }
+            default: { u_factor = 0.0; v_factor = 0.0; }
+        }
+    } else {
+        switch vertex_index {
+            case 0u: { u_factor = 0.0; v_factor = 0.0; }
+            case 1u: { u_factor = 1.0; v_factor = 0.0; }
+            case 2u: { u_factor = 1.0; v_factor = 1.0; }
+            case 3u: { u_factor = 0.0; v_factor = 0.0; }
+            case 4u: { u_factor = 1.0; v_factor = 1.0; }
+            case 5u: { u_factor = 0.0; v_factor = 1.0; }
+            default: { u_factor = 0.0; v_factor = 0.0; }
+        }
     }
 
     var tangent_u: vec3<f32>;
@@ -112,6 +135,7 @@ fn vs_main(
     out.clip_position = camera.view_proj * vec4<f32>(rel_pos, 1.0);
     out.world_pos = rel_pos;
     out.normal = get_normal(direction);
+    out.ao = mix(mix(ao_00, ao_10, u_factor), mix(ao_01, ao_11, u_factor), v_factor);
 
     return out;
 }
@@ -180,10 +204,11 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let sky_light = max(in.normal.y * 0.5 + 0.5, 0.0) * 0.15;
 
     // Shadow doesn't fully kill diffuse — scattered light remains
-    let effective_shadow = mix(0.15, 1.0, shadow);
+    let effective_shadow = mix(0.0, 1.0, shadow);
     let ambient = 0.25;
     let diffuse = 0.7 * ndotl * effective_shadow;
-    let lit_color = base_color * (ambient + sky_light + diffuse);
+    let ao = mix(0.4, 1.0, in.ao);
+    let lit_color = base_color * (ambient * ao + sky_light * ao + diffuse);
 
     return vec4<f32>(lit_color, 1.0);
 }

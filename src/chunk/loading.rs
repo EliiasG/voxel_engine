@@ -19,7 +19,7 @@ impl Default for LoadConfig {
             start_radius: 4,
             step: 2,
             end_radius: 8,
-            lod_count: 6,
+            lod_count: 8,
         }
     }
 }
