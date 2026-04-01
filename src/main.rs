@@ -217,7 +217,7 @@ fn main() {
                 render::shadow::gpu::synchronize_shadow_buffers,
                 update_day_cycle,
                 render::atmosphere::update_atmosphere,
-                update_camera,
+                update_camera.before(render::shadow::pass::update_previous_frame_data),
                 render::shadow::pass::update_previous_frame_data,
             ),
         );
