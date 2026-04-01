@@ -1,7 +1,7 @@
 use bevy_ecs::prelude::*;
 use bytemuck::{Pod, Zeroable};
 use modul_asset::AssetWorldExt;
-use modul_render::{BindGroupLayoutDef, Operation, OperationBuilder, RenderTargetSource};
+use modul_render::{Operation, OperationBuilder, RenderTargetSource};
 use wgpu::{
     Buffer, BufferDescriptor, BufferUsages, CommandEncoder, Device, TextureFormat,
     TextureUsages,
@@ -484,32 +484,11 @@ impl Operation for ShadowDepthOperation {
 
             let camera_bg = &world.resource::<crate::render::CameraBindGroup>().bind_group;
             let gpu = world.resource::<crate::render::GpuBuffers>();
+            let device = &world.resource::<modul_core::DeviceRes>().0;
             let shadow_res = world.resource::<ShadowPassResources>();
 
             // Dummy shadow mask bind group (pipeline layout requires it but fs_normal doesn't use it)
-            let shadow_mask_layout = world.resource::<modul_core::DeviceRes>().0
-                .create_bind_group_layout(crate::render::ShadowMaskBGLayout::LAYOUT);
-            // Use prev_view as dummy for both texture slots — fs_normal doesn't read them,
-            // and the real normal texture is a color target in this pass (can't also be a resource)
-            let dummy_shadow_bg = world.resource::<modul_core::DeviceRes>().0
-                .create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some("Dummy shadow BG"),
-                    layout: &shadow_mask_layout,
-                    entries: &[
-                        wgpu::BindGroupEntry {
-                            binding: 0,
-                            resource: wgpu::BindingResource::TextureView(shadow_res.prev_view()),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 1,
-                            resource: wgpu::BindingResource::Sampler(&shadow_res.shadow_mask_sampler),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 2,
-                            resource: wgpu::BindingResource::TextureView(shadow_res.prev_view()),
-                        },
-                    ],
-                });
+            let dummy_shadow_bg = crate::render::create_shadow_mask_bind_group(device, shadow_res);
 
             let atmo_res = world.resource::<crate::atmosphere::AtmosphereResources>();
             let atmo_bg_ptr = &atmo_res.bind_group as *const wgpu::BindGroup;
@@ -519,16 +498,7 @@ impl Operation for ShadowDepthOperation {
             pass.set_bind_group(2, &dummy_shadow_bg, &[]);
             pass.set_bind_group(3, atmo_bg, &[]);
 
-            let mut current_slab = usize::MAX;
-            for draw in &gpu.draws {
-                if draw.slab_index != current_slab {
-                    current_slab = draw.slab_index;
-                    let slab = &gpu.slabs[current_slab];
-                    pass.set_vertex_buffer(0, slab.face_buffer.slice(..));
-                    pass.set_bind_group(1, &slab.metadata_bind_group, &[]);
-                }
-                pass.multi_draw_indirect(&gpu.indirect_buffer, draw.offset, draw.count);
-            }
+            crate::render::draw_voxel_geometry(&mut pass, gpu);
         });
     }
 }

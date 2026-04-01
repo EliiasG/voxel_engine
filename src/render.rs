@@ -3,9 +3,9 @@ use std::collections::HashMap;
 use bevy_ecs::prelude::*;
 use bytemuck::{Pod, Zeroable};
 use glam::IVec3;
-use modul_asset::{AssetId, AssetWorldExt, Assets};
+use modul_asset::{AssetId, Assets};
 use modul_render::{
-    BindGroupLayoutDef, CachedBindGroupLayout, DirectRenderPipelineResourceProvider, GenericDepthStencilState,
+    BindGroupLayoutDef, DirectRenderPipelineResourceProvider, GenericDepthStencilState,
     GenericFragmentState, GenericMultisampleState, GenericRenderPipelineDescriptor,
     GenericVertexBufferLayout, GenericVertexState, Operation, OperationBuilder,
     RenderPipelineManager, RenderTargetSource,
@@ -767,85 +767,44 @@ impl OperationBuilder for ClearAll {
     fn finish(self, _world: &World, _device: &Device) -> impl Operation + 'static { self }
 }
 
-pub struct VoxelDrawOperation {
-    pub target: RenderTargetSource,
-}
-
-impl Operation for VoxelDrawOperation {
-    fn run(&mut self, world: &mut World, command_encoder: &mut CommandEncoder) {
-        let voxel_pipeline = world.resource::<VoxelPipeline>();
-        let pipeline_id = if world.get_resource::<Wireframe>().is_some_and(|w| w.0) {
-            voxel_pipeline.wireframe
-        } else {
-            voxel_pipeline.fill
-        };
-
-        world.asset_scope(pipeline_id, |world, pipeline_man: &mut RenderPipelineManager| {
-            let Some(pipeline) = pipeline_man.get_compatible(self.target, world) else {
-                return;
-            };
-            let Some(mut rt) = self.target.get_mut(world) else {
-                return;
-            };
-            let Some(mut pass) = rt.begin_ending_pass(command_encoder) else {
-                return;
-            };
-
-            pass.set_pipeline(pipeline);
-
-            let camera_bg = &world.resource::<CameraBindGroup>().bind_group;
-            let gpu = world.resource::<GpuBuffers>();
-            let shadow_res = world.resource::<crate::shadow::pass::ShadowPassResources>();
-
-            // Create shadow mask bind group from current accumulated texture
-            let shadow_mask_layout = world.resource::<modul_core::DeviceRes>().0
-                .create_bind_group_layout(ShadowMaskBGLayout::LAYOUT);
-            let shadow_mask_bg = world.resource::<modul_core::DeviceRes>().0
-                .create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some("Shadow mask BG"),
-                    layout: &shadow_mask_layout,
-                    entries: &[
-                        wgpu::BindGroupEntry {
-                            binding: 0,
-                            resource: wgpu::BindingResource::TextureView(shadow_res.prev_view()),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 1,
-                            resource: wgpu::BindingResource::Sampler(&shadow_res.shadow_mask_sampler),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 2,
-                            resource: wgpu::BindingResource::TextureView(&shadow_res.shadow_normal_view),
-                        },
-                    ],
-                });
-
-            pass.set_bind_group(0, camera_bg, &[]);
-            pass.set_bind_group(2, &shadow_mask_bg, &[]);
-
-            // Draw: iterate slab+LOD groups (already ordered LOD 0 first)
-            let mut current_slab = usize::MAX;
-            for draw in &gpu.draws {
-                if draw.slab_index != current_slab {
-                    current_slab = draw.slab_index;
-                    let slab = &gpu.slabs[current_slab];
-                    pass.set_vertex_buffer(0, slab.face_buffer.slice(..));
-                    pass.set_bind_group(1, &slab.metadata_bind_group, &[]);
-                }
-                pass.multi_draw_indirect(&gpu.indirect_buffer, draw.offset, draw.count);
-            }
-        });
+/// Shared voxel draw loop: iterates slabs, sets vertex buffers and metadata bind groups,
+/// issues multi_draw_indirect calls. The caller must set the pipeline and any other bind
+/// groups (camera, shadow mask, atmosphere) before calling this.
+pub fn draw_voxel_geometry(pass: &mut wgpu::RenderPass, gpu: &GpuBuffers) {
+    let mut current_slab = usize::MAX;
+    for draw in &gpu.draws {
+        if draw.slab_index != current_slab {
+            current_slab = draw.slab_index;
+            let slab = &gpu.slabs[current_slab];
+            pass.set_vertex_buffer(0, slab.face_buffer.slice(..));
+            pass.set_bind_group(1, &slab.metadata_bind_group, &[]);
+        }
+        pass.multi_draw_indirect(&gpu.indirect_buffer, draw.offset, draw.count);
     }
 }
 
-pub struct VoxelDrawOperationBuilder {
-    pub target: RenderTargetSource,
-}
-
-impl OperationBuilder for VoxelDrawOperationBuilder {
-    fn reading(&self) -> Vec<RenderTargetSource> { Vec::new() }
-    fn writing(&self) -> Vec<RenderTargetSource> { vec![self.target] }
-    fn finish(self, _world: &World, _device: &Device) -> impl Operation + 'static {
-        VoxelDrawOperation { target: self.target }
-    }
+/// Create a shadow mask bind group from the current shadow pass state.
+pub fn create_shadow_mask_bind_group(
+    device: &wgpu::Device,
+    shadow_res: &crate::shadow::pass::ShadowPassResources,
+) -> wgpu::BindGroup {
+    let layout = device.create_bind_group_layout(ShadowMaskBGLayout::LAYOUT);
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("Shadow mask BG"),
+        layout: &layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(shadow_res.prev_view()),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::Sampler(&shadow_res.shadow_mask_sampler),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: wgpu::BindingResource::TextureView(&shadow_res.shadow_normal_view),
+            },
+        ],
+    })
 }

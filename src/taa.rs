@@ -319,40 +319,9 @@ impl Operation for TaaVoxelDrawOperation {
 
                 let camera_bg = &world.resource::<render::CameraBindGroup>().bind_group;
                 let gpu = world.resource::<render::GpuBuffers>();
+                let device = &world.resource::<modul_core::DeviceRes>().0;
                 let shadow_res = world.resource::<crate::shadow::pass::ShadowPassResources>();
-
-                // Shadow mask bind group
-                let shadow_mask_layout = world
-                    .resource::<modul_core::DeviceRes>()
-                    .0
-                    .create_bind_group_layout(render::ShadowMaskBGLayout::LAYOUT);
-                let shadow_mask_bg = world
-                    .resource::<modul_core::DeviceRes>()
-                    .0
-                    .create_bind_group(&wgpu::BindGroupDescriptor {
-                        label: Some("Shadow mask BG (TAA voxel)"),
-                        layout: &shadow_mask_layout,
-                        entries: &[
-                            wgpu::BindGroupEntry {
-                                binding: 0,
-                                resource: wgpu::BindingResource::TextureView(
-                                    shadow_res.prev_view(),
-                                ),
-                            },
-                            wgpu::BindGroupEntry {
-                                binding: 1,
-                                resource: wgpu::BindingResource::Sampler(
-                                    &shadow_res.shadow_mask_sampler,
-                                ),
-                            },
-                            wgpu::BindGroupEntry {
-                                binding: 2,
-                                resource: wgpu::BindingResource::TextureView(
-                                    &shadow_res.shadow_normal_view,
-                                ),
-                            },
-                        ],
-                    });
+                let shadow_mask_bg = render::create_shadow_mask_bind_group(device, shadow_res);
 
                 let atmo_res = world.resource::<crate::atmosphere::AtmosphereResources>();
                 let atmo_bg_ptr = &atmo_res.bind_group as *const wgpu::BindGroup;
@@ -362,16 +331,7 @@ impl Operation for TaaVoxelDrawOperation {
                 pass.set_bind_group(2, &shadow_mask_bg, &[]);
                 pass.set_bind_group(3, atmo_bg, &[]);
 
-                let mut current_slab = usize::MAX;
-                for draw in &gpu.draws {
-                    if draw.slab_index != current_slab {
-                        current_slab = draw.slab_index;
-                        let slab = &gpu.slabs[current_slab];
-                        pass.set_vertex_buffer(0, slab.face_buffer.slice(..));
-                        pass.set_bind_group(1, &slab.metadata_bind_group, &[]);
-                    }
-                    pass.multi_draw_indirect(&gpu.indirect_buffer, draw.offset, draw.count);
-                }
+                render::draw_voxel_geometry(&mut pass, gpu);
             },
         );
     }

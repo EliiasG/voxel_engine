@@ -1,7 +1,7 @@
 use bevy_ecs::prelude::*;
 use bytemuck::{Pod, Zeroable};
 use modul_render::{
-    BindGroupLayoutDef, CachedBindGroupLayout, Operation, OperationBuilder, RenderTarget, RenderTargetSource,
+    BindGroupLayoutDef, Operation, OperationBuilder, RenderTarget, RenderTargetSource,
 };
 use wgpu::{
     BufferDescriptor, BufferUsages, CommandEncoder, Device, TextureFormat, TextureUsages,
