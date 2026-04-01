@@ -449,42 +449,58 @@ pub fn init_pipelines(
     shaders: &mut Assets<ShaderModule>,
     layouts: &mut Assets<PipelineLayout>,
 ) -> VoxelPipeline {
-    // Compose shader: bind group libraries + shared snippets + geometry shader
     let camera_wgsl = CameraBGLayout::LIBRARY.replace("#BIND_GROUP", "0");
     let metadata_wgsl = MetadataBGLayout::LIBRARY.replace("#BIND_GROUP", "1");
+    let voxel_vertex_src = include_str!("shaders/voxel_vertex.wgsl");
+
+    // Full shader: bind group libraries + shared lighting + vertex + material/fragment
     let shadow_mask_wgsl = ShadowMaskBGLayout::LIBRARY.replace("#BIND_GROUP", "2");
     let atmosphere_wgsl = atmosphere::AtmosphereBGLayout::LIBRARY.replace("#BIND_GROUP", "3");
     let sky_sample_wgsl = include_str!("shaders/sky_sample.wgsl");
     let lighting_wgsl = include_str!("shaders/lighting.wgsl");
+    let voxel_material_src = include_str!("shaders/voxel.wgsl");
     let full_source = format!(
-        "{camera_wgsl}\n{metadata_wgsl}\n{shadow_mask_wgsl}\n{atmosphere_wgsl}\n{sky_sample_wgsl}\n{lighting_wgsl}\n{}",
-        include_str!("shaders/voxel.wgsl")
+        "{camera_wgsl}\n{metadata_wgsl}\n{shadow_mask_wgsl}\n{atmosphere_wgsl}\n{sky_sample_wgsl}\n{lighting_wgsl}\n{voxel_vertex_src}\n{voxel_material_src}",
     );
-
-    let shader = shaders.add(device.create_shader_module(ShaderModuleDescriptor {
-        label: Some("Voxel shader"),
+    let full_shader = shaders.add(device.create_shader_module(ShaderModuleDescriptor {
+        label: Some("Voxel shader (full)"),
         source: ShaderSource::Wgsl(full_source.into()),
     }));
 
-    // Create pipeline layout from bind group layout providers
+    // Normal-only shader: camera + metadata + vertex + fs_normal
+    let fs_normal_src = include_str!("shaders/fs_normal.wgsl");
+    let normal_source = format!("{camera_wgsl}\n{metadata_wgsl}\n{voxel_vertex_src}\n{fs_normal_src}");
+    let normal_shader = shaders.add(device.create_shader_module(ShaderModuleDescriptor {
+        label: Some("Voxel shader (normal)"),
+        source: ShaderSource::Wgsl(normal_source.into()),
+    }));
+
+    // Full pipeline layout: camera + metadata + shadow mask + atmosphere
     let camera_layout = device.create_bind_group_layout(CameraBGLayout::LAYOUT);
     let metadata_layout = device.create_bind_group_layout(MetadataBGLayout::LAYOUT);
     let shadow_mask_layout = device.create_bind_group_layout(ShadowMaskBGLayout::LAYOUT);
     let atmosphere_layout = device.create_bind_group_layout(atmosphere::AtmosphereBGLayout::LAYOUT);
-    let layout = layouts.add(device.create_pipeline_layout(&PipelineLayoutDescriptor {
-        label: Some("Voxel pipeline layout"),
+    let full_layout = layouts.add(device.create_pipeline_layout(&PipelineLayoutDescriptor {
+        label: Some("Voxel pipeline layout (full)"),
         bind_group_layouts: &[&camera_layout, &metadata_layout, &shadow_mask_layout, &atmosphere_layout],
         push_constant_ranges: &[],
     }));
 
+    // Normal-only pipeline layout: camera + metadata
+    let normal_layout = layouts.add(device.create_pipeline_layout(&PipelineLayoutDescriptor {
+        label: Some("Voxel pipeline layout (normal)"),
+        bind_group_layouts: &[&camera_layout, &metadata_layout],
+        push_constant_ranges: &[],
+    }));
+
     let fill = pipelines.add(RenderPipelineManager::new(create_pipeline_desc(
-        shader, layout, PolygonMode::Fill, "Voxel fill pipeline", "fs_main",
+        full_shader, full_layout, PolygonMode::Fill, "Voxel fill pipeline", "fs_main",
     )));
     let wireframe = pipelines.add(RenderPipelineManager::new(create_pipeline_desc(
-        shader, layout, PolygonMode::Line, "Voxel wireframe pipeline", "fs_main",
+        full_shader, full_layout, PolygonMode::Line, "Voxel wireframe pipeline", "fs_main",
     )));
     let normal_fill = pipelines.add(RenderPipelineManager::new(create_pipeline_desc(
-        shader, layout, PolygonMode::Fill, "Voxel normal pipeline", "fs_normal",
+        normal_shader, normal_layout, PolygonMode::Fill, "Voxel normal pipeline", "fs_normal",
     )));
 
     VoxelPipeline { fill, wireframe, normal_fill }
