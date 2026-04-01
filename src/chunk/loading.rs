@@ -1,72 +1,79 @@
-use std::collections::VecDeque;
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use bevy_ecs::prelude::*;
 use glam::IVec3;
 
+use super::demand::ChunkLoadList;
+use super::generation::{ChunkGenerator, GenPool};
 use super::*;
 
-#[derive(Resource, Clone)]
-pub struct LoadConfig {
-    pub start_radius: u32,
-    pub step: u32,
-    pub end_radius: u32,
-    pub lod_count: u32,
-}
-
-impl Default for LoadConfig {
-    fn default() -> Self {
-        Self {
-            start_radius: 4,
-            step: 2,
-            end_radius: 8,
-            lod_count: 8,
-        }
-    }
-}
-
-struct LoadJob {
-    lod: u32,
-    radius: u32,
-}
-
-struct ActiveJob {
-    pending_entities: Vec<Entity>,
-}
-
+/// Central chunk lifecycle manager.
+///
+/// Tracks all chunk entities, manages refcounting across multiple sources,
+/// and schedules generation via round-robin fairness across sources.
 #[derive(Resource, Default)]
-pub struct Loader {
-    jobs: VecDeque<LoadJob>,
-    current_job: Option<ActiveJob>,
-    last_origin: Option<IVec3>,
+pub struct ChunkLoader {
+    /// All chunks with spawned entities: (pos, lod) → entity.
+    loaded: HashMap<(IVec3, u8), Entity>,
+    /// Chunks submitted to the generator, awaiting results.
+    in_flight: HashSet<(IVec3, u8)>,
+    /// Chunks whose generation completed (have ChunkData).
+    completed: HashSet<(IVec3, u8)>,
+    /// Round-robin index across sources.
+    round_robin_index: usize,
+    /// Last camera chunk seen — drives shadow grid origin rebuilds.
+    last_camera_chunk: Option<IVec3>,
 }
 
-fn build_job_queue(config: &LoadConfig) -> VecDeque<LoadJob> {
-    let mut jobs = VecDeque::new();
-    let mut radius = config.start_radius;
-    while radius <= config.end_radius {
-        for lod in 0..config.lod_count {
-            jobs.push_back(LoadJob { lod, radius });
-        }
-        radius += config.step;
-    }
-    jobs
-}
 
-/// Main loader system: tracks camera, unloads distant chunks, spawns new ones via job queue.
-pub fn update_loader(
-    debug: Res<crate::DebugMode>,
-    config: Res<LoadConfig>,
-    mut loader: ResMut<Loader>,
+/// Main chunk loading system.
+///
+/// Runs every frame: polls generation results, diffs desired vs loaded,
+/// spawns/despawns entities, and round-robin submits to the generator.
+pub fn update_chunk_loading(
+    mut loader: ResMut<ChunkLoader>,
+    generator: Res<GenPool>,
     mut lod_maps: ResMut<LodChunkMaps>,
     mut loaded_index: ResMut<LoadedChunkIndex>,
     mut render_data: ResMut<crate::render::ChunkRenderData>,
     mut gpu: ResMut<crate::render::GpuBuffers>,
     mut shadow_grid: ResMut<crate::render::shadow::grid::ShadowGrid>,
     mut bitmask_pool: ResMut<crate::render::shadow::grid::BitmaskPool>,
+    mut changed: ResMut<ChunkChangedQueue>,
     mut commands: Commands,
-    chunk_data_query: Query<(), With<ChunkData>>,
+    entity_check: Query<()>,
+    load_lists: Query<(Entity, &ChunkLoadList)>,
     cam_query: Query<&crate::camera::Position, With<crate::camera::MainCamera>>,
+    source_query: Query<&super::demand::ChunkSource>,
+    debug: Res<crate::DebugMode>,
 ) {
+    // --- Phase 1: Poll generation results ---
+    let results = generator.poll();
+    for result in results {
+        let key = (result.pos, result.lod);
+        loader.in_flight.remove(&key);
+        loader.completed.insert(key);
+
+        if entity_check.get(result.entity).is_ok() {
+            crate::render::shadow::grid::update_grid_for_chunk(
+                &mut shadow_grid,
+                &mut bitmask_pool,
+                result.pos,
+                result.lod,
+                result.bitmask,
+            );
+            commands
+                .entity(result.entity)
+                .insert(ChunkData(Arc::new(result.storage)));
+            changed.0.push(ChunkChange {
+                pos: result.pos,
+                lod: result.lod,
+            });
+        }
+    }
+
+    // --- Phase 2: Determine camera chunk, rebuild shadow origins if moved ---
     let camera_chunk = if let Some(ref frozen) = debug.frozen {
         frozen.chunk_pos
     } else if let Ok(pos) = cam_query.get_single() {
@@ -75,113 +82,176 @@ pub fn update_loader(
         return;
     };
 
-    // Detect camera chunk change
-    let origin_changed = loader.last_origin != Some(camera_chunk);
-    if origin_changed {
-        loader.last_origin = Some(camera_chunk);
+    if loader.last_camera_chunk != Some(camera_chunk) {
+        loader.last_camera_chunk = Some(camera_chunk);
 
-        // Unload chunks outside end_radius for each LOD
-        for lod in 0..config.lod_count {
-            let lod_cam = lod_chunk_pos(camera_chunk, lod);
-            let max_r = config.end_radius as i32;
-
-            let to_remove: Vec<(IVec3, Entity)> = lod_maps.maps[lod as usize]
-                .iter()
-                .filter(|(pos, _)| {
-                    let d = (**pos - lod_cam).abs();
-                    d.x > max_r || d.y > max_r || d.z > max_r
-                })
-                .map(|(pos, entity)| (*pos, *entity))
-                .collect();
-
-            for (pos, entity) in &to_remove {
-                lod_maps.maps[lod as usize].remove(pos);
-                loaded_index.0.remove(&(*pos, lod as u8));
-                if let Some(entry) = render_data.entries.remove(entity) {
-                    for dir_pages in &entry.directions {
-                        for page in &dir_pages.pages {
-                            crate::render::PageAllocator::deallocate(
-                                &mut gpu, page.slab_index as usize, page.page_index,
-                            );
-                        }
-                    }
-                }
-                crate::render::shadow::grid::remove_chunk_from_grid(
-                    &mut shadow_grid, &mut bitmask_pool, *pos, lod as u8,
-                );
-                commands.entity(*entity).despawn();
-            }
-
-            if !to_remove.is_empty() {
-                println!(
-                    "Unloaded {} LOD {} chunks",
-                    to_remove.len(),
-                    lod
-                );
-            }
+        // Find the largest end_radius from any source for shadow grid
+        if let Some(source) = source_query.iter().next() {
+            shadow_grid.rebuild_origins(camera_chunk, source.end_radius);
         }
-
-        // Update shadow grid origins for new camera position
-        shadow_grid.rebuild_origins(camera_chunk, &config);
-
-        // Rebuild job queue from current position
-        loader.jobs = build_job_queue(&config);
-        loader.current_job = None;
     }
 
-    // Process jobs
-    loop {
-        // Check if current job is done (all entities have ChunkData)
-        if let Some(ref active) = loader.current_job {
-            let all_done = active
-                .pending_entities
-                .iter()
-                .all(|&e| chunk_data_query.get(e).is_ok());
-            if !all_done {
-                return;
+    // --- Phase 3: Build desired set from all ChunkLoadLists ---
+    let mut desired: HashSet<(IVec3, u8)> = HashSet::new();
+    for (_, list) in load_lists.iter() {
+        for segment in &list.segments {
+            for &(pos, lod) in segment {
+                desired.insert((pos, lod));
             }
         }
-        loader.current_job = None;
+    }
 
-        // Pop next job
-        let Some(job) = loader.jobs.pop_front() else {
-            return;
-        };
+    // --- Phase 4: Unload chunks no longer desired ---
+    let to_remove: Vec<(IVec3, u8)> = loader
+        .loaded
+        .keys()
+        .filter(|k| !desired.contains(k))
+        .cloned()
+        .collect();
 
-        let lod = job.lod as u8;
-        let origin = lod_chunk_pos(camera_chunk, job.lod);
-        let radius = job.radius as i32;
-
-        let mut pending = Vec::new();
-
-        for x in -radius..=radius {
-            for y in -radius..=radius {
-                for z in -radius..=radius {
-                    let pos = origin + IVec3::new(x, y, z);
-                    if lod_maps.maps[lod as usize].get(&pos).is_some() {
-                        continue;
+    for key in &to_remove {
+        let (pos, lod) = *key;
+        if let Some(entity) = loader.loaded.remove(key) {
+            // Deallocate GPU pages
+            if let Some(entry) = render_data.entries.remove(&entity) {
+                for dir_pages in &entry.directions {
+                    for page in &dir_pages.pages {
+                        crate::render::PageAllocator::deallocate(
+                            &mut gpu,
+                            page.slab_index as usize,
+                            page.page_index,
+                        );
                     }
-                    let entity = commands
-                        .spawn((ChunkPos(pos), ChunkLod(lod), NeedsGeneration))
-                        .id();
-                    lod_maps.maps[lod as usize].insert(pos, entity);
-                    pending.push(entity);
+                }
+            }
+
+            // Remove from shadow grid
+            crate::render::shadow::grid::remove_chunk_from_grid(
+                &mut shadow_grid,
+                &mut bitmask_pool,
+                pos,
+                lod,
+            );
+
+            // Remove from spatial maps
+            lod_maps.maps[lod as usize].remove(&pos);
+            loaded_index.0.remove(&(pos, lod));
+
+            commands.entity(entity).despawn();
+        }
+        loader.in_flight.remove(key);
+        loader.completed.remove(key);
+    }
+
+    if !to_remove.is_empty() {
+        // Group by LOD for logging
+        let mut counts: HashMap<u8, usize> = HashMap::new();
+        for &(_, lod) in &to_remove {
+            *counts.entry(lod).or_insert(0) += 1;
+        }
+        for (lod, count) in counts {
+            println!("Unloaded {count} LOD {lod} chunks");
+        }
+    }
+
+    // --- Phase 5: Spawn entities for newly desired chunks ---
+    let mut newly_spawned = 0usize;
+    for &(pos, lod) in &desired {
+        if loader.loaded.contains_key(&(pos, lod)) {
+            continue;
+        }
+        let entity = commands.spawn((ChunkPos(pos), ChunkLod(lod))).id();
+        lod_maps.maps[lod as usize].insert(pos, entity);
+        loader.loaded.insert((pos, lod), entity);
+        newly_spawned += 1;
+    }
+
+    if newly_spawned > 0 {
+        println!("Spawned {newly_spawned} new chunk entities");
+    }
+
+    // --- Phase 6: Round-robin generation submission ---
+    let capacity = generator.capacity();
+    if capacity == 0 {
+        return;
+    }
+
+    // Build per-source pending lists (only chunks needing generation).
+    // Each source's segments are filtered to exclude completed and in-flight chunks.
+    let mut active_loaders: Vec<(Entity, Vec<Vec<(IVec3, u8)>>)> = Vec::new();
+    for (source_entity, list) in load_lists.iter() {
+        let mut remaining_segments: Vec<Vec<(IVec3, u8)>> = Vec::new();
+        for segment in &list.segments {
+            let filtered: Vec<(IVec3, u8)> = segment
+                .iter()
+                .filter(|&&(pos, lod)| {
+                    let key = (pos, lod);
+                    loader.loaded.contains_key(&key)
+                        && !loader.in_flight.contains(&key)
+                        && !loader.completed.contains(&key)
+                })
+                .cloned()
+                .collect();
+            if !filtered.is_empty() {
+                remaining_segments.push(filtered);
+            }
+        }
+        if !remaining_segments.is_empty() {
+            active_loaders.push((source_entity, remaining_segments));
+        }
+    }
+
+    if active_loaders.is_empty() {
+        return;
+    }
+
+    // Round-robin: process highest-priority segment from each loader in turn.
+    let mut to_submit: Vec<(Entity, IVec3, u8)> = Vec::new();
+    let mut remaining_capacity = capacity;
+    let mut index = loader.round_robin_index % active_loaders.len().max(1);
+
+    loop {
+        if active_loaders.is_empty() || remaining_capacity == 0 {
+            break;
+        }
+
+        if index >= active_loaders.len() {
+            index = 0;
+        }
+
+        let (_, ref mut segments) = active_loaders[index];
+        // Last segment = highest priority
+        if let Some(segment) = segments.last_mut() {
+            while remaining_capacity > 0 && !segment.is_empty() {
+                let (pos, lod) = segment.pop().unwrap();
+                // Look up the entity we spawned for this chunk
+                if let Some(&entity) = loader.loaded.get(&(pos, lod)) {
+                    to_submit.push((entity, pos, lod));
+                    remaining_capacity -= 1;
+                }
+            }
+            if segment.is_empty() {
+                segments.pop();
+                if segments.is_empty() {
+                    active_loaders.remove(index);
+                    // Don't increment index — next loader slides into this slot
+                    continue;
                 }
             }
         }
 
-        if !pending.is_empty() {
-            println!(
-                "Loading LOD {} radius {}: {} chunks",
-                lod,
-                job.radius,
-                pending.len()
-            );
-            loader.current_job = Some(ActiveJob {
-                pending_entities: pending,
-            });
-            return;
+        index += 1;
+    }
+
+    loader.round_robin_index = index;
+
+    if !to_submit.is_empty() {
+        // Mark as in-flight
+        for &(_, pos, lod) in &to_submit {
+            loader.in_flight.insert((pos, lod));
         }
-        // No-op job (all chunks already loaded), skip to next
+
+        let requests: Vec<(Entity, IVec3, u8)> = to_submit;
+        generator.submit(&requests);
     }
 }

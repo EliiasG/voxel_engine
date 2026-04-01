@@ -1,14 +1,34 @@
-use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use bevy_ecs::prelude::*;
 use crossbeam_channel::{Receiver, Sender};
 use glam::IVec3;
 
 use super::{
-    ChunkChange, ChunkChangedQueue, ChunkData, ChunkLod, ChunkPos, ChunkStorage,
-    NeedsGeneration, AIR, CHUNK_SIZE, CHUNK_SIZE_2, CHUNK_SIZE_3, STONE,
+    ChunkStorage, AIR, CHUNK_SIZE, CHUNK_SIZE_2, CHUNK_SIZE_3, STONE,
 };
 use crate::render::shadow::bitmask::{self, ChunkBitmaskResult};
+
+pub struct GenResult {
+    pub entity: Entity,
+    pub pos: IVec3,
+    pub lod: u8,
+    pub storage: ChunkStorage,
+    pub bitmask: ChunkBitmaskResult,
+}
+
+/// Trait for chunk generation backends.
+/// The loading system calls these methods to submit work and collect results.
+pub trait ChunkGenerator {
+    /// How many more requests can be accepted right now.
+    fn capacity(&self) -> usize;
+
+    /// Submit generation requests. Each tuple is (entity, chunk_pos, lod).
+    fn submit(&self, requests: &[(Entity, IVec3, u8)]);
+
+    /// Drain all completed results available this frame.
+    fn poll(&self) -> Vec<GenResult>;
+}
 
 struct GenRequest {
     entity: Entity,
@@ -16,19 +36,13 @@ struct GenRequest {
     lod: u8,
 }
 
-struct GenResult {
-    entity: Entity,
-    pos: IVec3,
-    lod: u8,
-    storage: ChunkStorage,
-    bitmask: ChunkBitmaskResult,
-}
-
 /// Channel-based worker pool for chunk generation.
 #[derive(Resource)]
 pub struct GenPool {
     tx: Sender<GenRequest>,
     rx: Receiver<GenResult>,
+    in_flight: AtomicUsize,
+    max_in_flight: usize,
 }
 
 impl GenPool {
@@ -61,53 +75,39 @@ impl GenPool {
                 .expect("failed to spawn gen worker");
         }
 
-        println!("Gen pool: {num_threads} threads");
-        Self { tx: req_tx, rx: res_rx }
-    }
-}
-
-/// Sends generation requests for all NeedsGeneration entities.
-pub fn start_generation(
-    mut commands: Commands,
-    query: Query<(Entity, &ChunkPos, &ChunkLod), With<NeedsGeneration>>,
-    pool: Res<GenPool>,
-) {
-    for (entity, pos, lod) in query.iter() {
-        let _ = pool.tx.send(GenRequest {
-            entity,
-            pos: pos.0,
-            lod: lod.0,
-        });
-        commands.entity(entity).remove::<NeedsGeneration>();
-    }
-}
-
-/// Drains completed generation results from the worker pool.
-pub fn poll_generation(
-    mut commands: Commands,
-    pool: Res<GenPool>,
-    mut changed: ResMut<ChunkChangedQueue>,
-    mut shadow_grid: ResMut<crate::render::shadow::grid::ShadowGrid>,
-    mut bitmask_pool: ResMut<crate::render::shadow::grid::BitmaskPool>,
-    entity_check: Query<()>,
-) {
-    while let Ok(result) = pool.rx.try_recv() {
-        if entity_check.get(result.entity).is_ok() {
-            crate::render::shadow::grid::update_grid_for_chunk(
-                &mut shadow_grid,
-                &mut bitmask_pool,
-                result.pos,
-                result.lod,
-                result.bitmask,
-            );
-            commands
-                .entity(result.entity)
-                .insert(ChunkData(Arc::new(result.storage)));
-            changed.0.push(ChunkChange {
-                pos: result.pos,
-                lod: result.lod,
-            });
+        let max_in_flight = num_threads * 4;
+        println!("Gen pool: {num_threads} threads, max in-flight: {max_in_flight}");
+        Self {
+            tx: req_tx,
+            rx: res_rx,
+            in_flight: AtomicUsize::new(0),
+            max_in_flight,
         }
+    }
+}
+
+impl ChunkGenerator for GenPool {
+    fn capacity(&self) -> usize {
+        let current = self.in_flight.load(Ordering::Relaxed);
+        self.max_in_flight.saturating_sub(current)
+    }
+
+    fn submit(&self, requests: &[(Entity, IVec3, u8)]) {
+        for &(entity, pos, lod) in requests {
+            let _ = self.tx.send(GenRequest { entity, pos, lod });
+        }
+        self.in_flight.fetch_add(requests.len(), Ordering::Relaxed);
+    }
+
+    fn poll(&self) -> Vec<GenResult> {
+        let mut results = Vec::new();
+        while let Ok(result) = self.rx.try_recv() {
+            results.push(result);
+        }
+        if !results.is_empty() {
+            self.in_flight.fetch_sub(results.len(), Ordering::Relaxed);
+        }
+        results
     }
 }
 

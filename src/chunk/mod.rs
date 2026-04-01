@@ -1,3 +1,4 @@
+pub mod demand;
 pub mod generation;
 pub mod loading;
 pub mod meshing;
@@ -219,10 +220,6 @@ pub struct ChunkPos(pub IVec3);
 
 #[derive(Component)]
 pub struct ChunkLod(pub u8);
-
-#[derive(Component)]
-#[component(storage = "SparseSet")]
-pub struct NeedsGeneration;
 
 // --- Resources ---
 

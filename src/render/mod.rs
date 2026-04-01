@@ -612,7 +612,7 @@ pub fn synchronize_gpu(
     mut gpu: ResMut<GpuBuffers>,
     device: Res<modul_core::DeviceRes>,
     queue: Res<modul_core::QueueRes>,
-    config: Res<crate::chunk::loading::LoadConfig>,
+    lod_maps: Res<crate::chunk::LodChunkMaps>,
     debug: Res<crate::DebugMode>,
     cam_query: Query<(&crate::camera::Position, &crate::camera::Camera), With<crate::camera::MainCamera>>,
 ) {
@@ -694,7 +694,7 @@ pub fn synchronize_gpu(
 
     // Rebuild indirect buffer: group draw args by (slab, lod)
     {
-        let lod_count = config.lod_count as usize;
+        let lod_count = lod_maps.maps.len();
         let slab_count = gpu.slabs.len();
 
         // Compute frustum planes for culling (frozen in debug mode)

@@ -14,7 +14,7 @@ pub fn init_shadow(
 ) {
     let shadow_gpu = gpu::ShadowGpuBuffers::new(&device.0, &shadow_grid);
     let shadow_pass_res = pass::ShadowPassResources::new(
-        &device.0, &shadow_gpu, 800, 600, 1,
+        &device.0, &shadow_gpu, 1, 1, 1,
     );
 
     commands.insert_resource(shadow_gpu);

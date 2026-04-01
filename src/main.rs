@@ -25,7 +25,8 @@ use winit::event::{DeviceEvent, ElementState, Event, KeyEvent, WindowEvent};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{CursorGrabMode, WindowAttributes};
 
-use camera::{FlyCamera, Position, Rotation, CameraConfig, MainCamera, CullCamera};
+use camera::{FlyCamera, Position, Rotation, CameraConfig, MainCamera};
+use chunk::demand::{ChunkSource, ChunkLoadList};
 
 #[derive(Resource)]
 struct FrameCount(u64);
@@ -50,12 +51,13 @@ impl Default for FpsCounter {
 #[derive(Resource)]
 struct DayCycle {
     angle: f32, // radians, 0 = sunrise east, π/2 = noon overhead
+    paused: bool,
 }
 
 impl Default for DayCycle {
     fn default() -> Self {
         // Start at ~25° above horizon to match old default
-        Self { angle: 0.44 }
+        Self { angle: 0.44, paused: false }
     }
 }
 
@@ -155,8 +157,9 @@ impl GraphicsInitializer for VoxelGraphicsInitializer {
 }
 
 fn main() {
-    let load_config = chunk::loading::LoadConfig::default();
-    let lod_count = load_config.lod_count as usize;
+    let source = ChunkSource::default();
+    let lod_count = source.lod_count as usize;
+    let end_radius = source.end_radius;
 
     run_app(VoxelGraphicsInitializer, |app| {
         app.add_plugins((RenderPlugin, ExitPlugin));
@@ -166,10 +169,9 @@ fn main() {
         app.insert_resource(chunk::ChunkChangedQueue::default());
         app.insert_resource(chunk::LoadedChunkIndex::default());
         app.insert_resource(render::ChunkRenderData::default());
-        app.insert_resource(chunk::loading::Loader::default());
-        app.insert_resource(render::shadow::grid::ShadowGrid::new(&load_config));
+        app.insert_resource(chunk::loading::ChunkLoader::default());
+        app.insert_resource(render::shadow::grid::ShadowGrid::new(end_radius, lod_count as u32));
         app.insert_resource(render::shadow::grid::BitmaskPool::new());
-        app.insert_resource(load_config);
         app.insert_resource(chunk::generation::GenPool::new());
         app.insert_resource(chunk::meshing::MeshPool::new());
         app.insert_resource(InputState::default());
@@ -186,19 +188,17 @@ fn main() {
         ).chain());
 
         // Gameplay systems (before render). process_input runs first so debug
-        // mode and camera state are up-to-date before the loader sees them.
+        // mode and camera state are up-to-date before the demand/loader sees them.
         app.add_systems(
             Redraw,
             (
                 (
                     process_input,
-                    chunk::loading::update_loader,
+                    chunk::demand::update_chunk_demand,
+                    chunk::loading::update_chunk_loading,
                     apply_deferred,
-                    chunk::generation::poll_generation,
-                    chunk::generation::start_generation,
                 ).chain(),
                 (
-                    apply_deferred,
                     chunk::meshing::resolve_changes,
                     apply_deferred,
                     chunk::meshing::poll_meshing,
@@ -289,7 +289,7 @@ fn init_gameplay(mut commands: Commands) {
     };
     let cam = camera::compute_camera(&pos, &rot, &config, 16.0 / 9.0);
 
-    commands.spawn((pos, rot, config, cam, fly, MainCamera));
+    commands.spawn((pos, rot, config, cam, fly, MainCamera, ChunkSource::default(), ChunkLoadList::default()));
 
     commands.insert_resource(FrameCount(0));
     commands.insert_resource(DayCycle::default());
@@ -314,14 +314,14 @@ fn process_input(
     mut wireframe: ResMut<render::Wireframe>,
     mut debug: ResMut<DebugMode>,
     mut taa_enabled: ResMut<render::taa::TaaEnabled>,
+    mut day_cycle: ResMut<DayCycle>,
     render_data: Res<render::ChunkRenderData>,
     gpu: Res<render::GpuBuffers>,
     frame_count: Res<FrameCount>,
     loaded_index: Res<chunk::LoadedChunkIndex>,
     lod_maps: Res<chunk::LodChunkMaps>,
-    config: Res<chunk::loading::LoadConfig>,
+    _loader: Res<chunk::loading::ChunkLoader>,
     chunk_data_q: Query<(), With<chunk::ChunkData>>,
-    needs_gen_q: Query<(), With<chunk::NeedsGeneration>>,
     needs_remesh_q: Query<(), With<chunk::meshing::NeedsRemesh>>,
     window_query: Query<&WindowComponent, With<MainWindow>>,
     mut cam_query: Query<(&mut Position, &mut FlyCamera, &CameraConfig), With<MainCamera>>,
@@ -370,6 +370,10 @@ fn process_input(
                             taa_enabled.0 = !taa_enabled.0;
                             println!("TAA: {}", if taa_enabled.0 { "ON" } else { "OFF" });
                         }
+                        KeyCode::KeyP => {
+                            day_cycle.paused = !day_cycle.paused;
+                            println!("Day/night: {}", if day_cycle.paused { "PAUSED" } else { "RUNNING" });
+                        }
                         KeyCode::Tab => {
                             if debug.frozen.is_some() {
                                 debug.frozen = None;
@@ -396,21 +400,20 @@ fn process_input(
                                 render::PageAllocator::total_used(&gpu),
                                 render::PageAllocator::total_capacity(&gpu),
                                 gpu.slabs.len());
-                            for lod in 0..config.lod_count {
-                                let in_map = lod_maps.maps[lod as usize].iter().count();
+                            for lod in 0..lod_maps.maps.len() {
+                                let in_map = lod_maps.maps[lod].iter().count();
                                 let mut has_data = 0u32;
-                                let mut waiting_gen = 0u32;
                                 let mut waiting_mesh = 0u32;
                                 let in_loaded_idx = loaded_index.0.iter()
                                     .filter(|(_, l)| *l == lod as u8).count();
-                                for (_, &entity) in lod_maps.maps[lod as usize].iter() {
+                                for (_, &entity) in lod_maps.maps[lod].iter() {
                                     if chunk_data_q.get(entity).is_ok() { has_data += 1; }
-                                    if needs_gen_q.get(entity).is_ok() { waiting_gen += 1; }
                                     if needs_remesh_q.get(entity).is_ok() { waiting_mesh += 1; }
                                 }
+                                let gen_pending = in_map - has_data as usize;
                                 println!(
                                     "  LOD {}: {} map, {} data, {} gen-wait, {} mesh-wait, {} uploaded",
-                                    lod, in_map, has_data, waiting_gen, waiting_mesh, in_loaded_idx
+                                    lod, in_map, has_data, gen_pending, waiting_mesh, in_loaded_idx
                                 );
                             }
                             let mut total_faces = 0u32;
@@ -529,6 +532,10 @@ fn update_day_cycle(
     mut cycle: ResMut<DayCycle>,
     mut sun_dir: ResMut<render::shadow::pass::SunDirection>,
 ) {
+    if cycle.paused {
+        sun_dir.0 = render::atmosphere::sun_direction_at_angle(cycle.angle);
+        return;
+    }
     let dt = input.dt.min(0.1);
     let day_length = 300.0; // seconds per full rotation
     cycle.angle += dt * std::f32::consts::TAU / day_length;

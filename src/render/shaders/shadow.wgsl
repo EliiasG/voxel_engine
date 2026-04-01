@@ -167,7 +167,7 @@ fn trace_chunk_bitmask(
     return false;
 }
 
-// 4-sample Halton(2,3) jitter pattern
+// 4-sample Halton(2,3) jitter pattern for temporal super-resolution when static.
 fn jitter_offset(frame: u32) -> vec2<f32> {
     switch frame % 4u {
         case 0u: { return vec2<f32>(0.0, 0.0); }
@@ -191,28 +191,20 @@ fn cs_shadow(@builtin(global_invocation_id) gid: vec3<u32>) {
     // Checkerboard: only trace half the pixels per frame, reuse previous for the other half
     let checker = (pixel.x + pixel.y + shadow.frame_index) % 2u;
 
-    // Jitter UV by sub-pixel offset for temporal anti-aliasing (skip when static — deterministic traces prevent flicker)
-    var jitter = vec2<f32>(0.0);
-    if (shadow.camera_moving != 0u) {
-        jitter = (jitter_offset(shadow.frame_index) - 0.5) / shadow.shadow_tex_size;
-    }
-    let jittered_uv = uv + jitter;
-    let depth = textureSampleLevel(depth_tex, depth_sampler, jittered_uv, 0u);
-
-    // Reconstruct camera-relative position for depth output and early-outs
+    // Depth + world position at the stable pixel center.
+    let depth = textureSampleLevel(depth_tex, depth_sampler, uv, 0u);
     var normal_height = 0.0;
-    var cam_rel_early = vec3<f32>(0.0);
+    var cam_rel_stable = vec3<f32>(0.0);
     if (depth > 0.0) {
-        let ndc_e = vec4<f32>(
-            jittered_uv.x * 2.0 - 1.0,
-            (1.0 - jittered_uv.y) * 2.0 - 1.0,
+        let ndc_s = vec4<f32>(
+            uv.x * 2.0 - 1.0,
+            (1.0 - uv.y) * 2.0 - 1.0,
             depth, 1.0,
         );
-        let clip_e = shadow.inv_view_proj * ndc_e;
-        cam_rel_early = clip_e.xyz / clip_e.w;
-        // Store height along surface normal — distinguishes parallel surfaces at different positions
-        let face_n = textureSampleLevel(normal_tex, depth_sampler, jittered_uv, 0.0).xyz * 2.0 - 1.0;
-        normal_height = dot(cam_rel_early, face_n);
+        let clip_s = shadow.inv_view_proj * ndc_s;
+        cam_rel_stable = clip_s.xyz / clip_s.w;
+        let face_n = textureSampleLevel(normal_tex, depth_sampler, uv, 0.0).xyz * 2.0 - 1.0;
+        normal_height = dot(cam_rel_stable, face_n);
     }
 
     // At night, skip ray tracing entirely — everything is in shadow
@@ -221,12 +213,12 @@ fn cs_shadow(@builtin(global_invocation_id) gid: vec3<u32>) {
         return;
     }
 
-    // Skipped pixels: return previous frame's value directly
+    // Skipped pixels: reproject and return previous frame's value
     if (checker != 0u && depth > 0.0) {
         var prev_uv = uv;
         if (shadow.camera_moving != 0u) {
             let chunk_shift = vec3<f32>((shadow.chunk_offset - shadow.prev_chunk_offset) * CHUNK_SIZE);
-            let prev_clip = shadow.prev_view_proj * vec4<f32>(cam_rel_early + chunk_shift, 1.0);
+            let prev_clip = shadow.prev_view_proj * vec4<f32>(cam_rel_stable + chunk_shift, 1.0);
             let prev_ndc = prev_clip.xyz / prev_clip.w;
             prev_uv = vec2<f32>(prev_ndc.x * 0.5 + 0.5, 1.0 - (prev_ndc.y * 0.5 + 0.5));
             if (any(prev_uv < vec2<f32>(0.0)) || any(prev_uv > vec2<f32>(1.0))) {
@@ -234,13 +226,13 @@ fn cs_shadow(@builtin(global_invocation_id) gid: vec3<u32>) {
             }
         }
         let prev = textureSampleLevel(prev_accum_tex, prev_accum_sampler, prev_uv, 0.0);
-        textureStore(output_tex, pixel, vec4<f32>(prev.r, prev.g, 0.0, 0.0));
+        textureStore(output_tex, pixel, vec4<f32>(prev.r, normal_height, 0.0, 0.0));
         return;
     }
 
     // Back-facing early-out: surfaces facing away from sun are always in shadow
     if (depth > 0.0) {
-        let face_normal_early = textureSampleLevel(normal_tex, depth_sampler, jittered_uv, 0.0).xyz * 2.0 - 1.0;
+        let face_normal_early = textureSampleLevel(normal_tex, depth_sampler, uv, 0.0).xyz * 2.0 - 1.0;
         let ndotl_early = dot(face_normal_early, normalize(shadow.sun_direction));
         if (ndotl_early <= 0.0) {
             textureStore(output_tex, pixel, vec4<f32>(0.0, normal_height, 0.0, 0.0));
@@ -254,11 +246,20 @@ fn cs_shadow(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     // Sky pixels are always lit (reversed-Z: sky = 0.0)
     if (depth > 0.0) {
-        // Reconstruct world position from depth
+        // When static, jitter the trace origin for temporal super-resolution.
+        // When moving, use the stable pixel center (camera motion provides variation,
+        // and jitter at 1/3 resolution crosses voxel edges causing artifacts).
+        var trace_uv = uv;
+        if (shadow.camera_moving == 0u) {
+            trace_uv = uv + (jitter_offset(shadow.frame_index) - 0.5) / shadow.shadow_tex_size;
+        }
+        let trace_depth = textureSampleLevel(depth_tex, depth_sampler, trace_uv, 0u);
+
+        // Reconstruct world position from (possibly jittered) depth
         let ndc = vec4<f32>(
-            jittered_uv.x * 2.0 - 1.0,
-            (1.0 - jittered_uv.y) * 2.0 - 1.0,
-            depth,
+            trace_uv.x * 2.0 - 1.0,
+            (1.0 - trace_uv.y) * 2.0 - 1.0,
+            trace_depth,
             1.0,
         );
         let clip = shadow.inv_view_proj * ndc;
@@ -287,7 +288,7 @@ fn cs_shadow(@builtin(global_invocation_id) gid: vec3<u32>) {
             let t = clamp(dist / 500.0, 0.0, 1.0);
 
             // Sample face normal from geometry pass (encoded as n*0.5+0.5)
-            let face_normal = textureSampleLevel(normal_tex, depth_sampler, jittered_uv, 0.0).xyz * 2.0 - 1.0;
+            let face_normal = textureSampleLevel(normal_tex, depth_sampler, trace_uv, 0.0).xyz * 2.0 - 1.0;
             let ndotl = abs(dot(face_normal, ray_dir));
 
             // Directional bias (along ray), scaled by downscale factor
@@ -296,7 +297,7 @@ fn cs_shadow(@builtin(global_invocation_id) gid: vec3<u32>) {
             // Normal offset: push ray origin out of surface, scales with distance like dir_bias
             let tn = clamp(dist / 200.0, 0.0, 1.0);
             let normal_bias = mix(0.05 * sf, 2 * sf, tn * tn);
-            let normal_push = face_normal * (1.0 - ndotl) * start_voxel_size * normal_bias;
+            let normal_push = face_normal * max(1.0 - ndotl, 0.15) * start_voxel_size * normal_bias;
             var pos = world_pos + normal_push + ray_dir * dir_bias * start_voxel_size;
             var total_dist = 0.0;
             var hit = false;
@@ -375,7 +376,7 @@ fn cs_shadow(@builtin(global_invocation_id) gid: vec3<u32>) {
             let dist = length(cam_rel_pos);
             let t = clamp((dist - 30.0) / 170.0, 0.0, 1.0); // 30..200 range
             // Moving: aggressive blend so near shadows respond fast
-            // Static: gentle blend so jitter converges smoothly without visible flicker
+            // Static: gentle adaptive blend for smooth convergence
             var blend = mix(0.7, 0.5, t);
             if (shadow.camera_moving == 0u) {
                 let diff = abs(trace_result - prev_sample);

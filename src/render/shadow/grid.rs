@@ -4,7 +4,6 @@ use bevy_ecs::prelude::*;
 use bytemuck::{Pod, Zeroable};
 use glam::IVec3;
 
-use crate::chunk::loading::LoadConfig;
 use crate::chunk::lod_chunk_pos;
 
 use super::bitmask::{ChunkBitmask, ChunkBitmaskResult};
@@ -34,10 +33,9 @@ pub struct ShadowGrid {
 }
 
 impl ShadowGrid {
-    pub fn new(config: &LoadConfig) -> Self {
-        let grid_size = config.end_radius * 2 + 1;
+    pub fn new(end_radius: u32, lod_count: u32) -> Self {
+        let grid_size = end_radius * 2 + 1;
         let entries_per_lod = (grid_size * grid_size * grid_size) as usize;
-        let lod_count = config.lod_count;
 
         let lod_infos = (0..lod_count)
             .map(|lod| LodInfo {
@@ -89,8 +87,8 @@ impl ShadowGrid {
 
     /// Recompute grid origins based on camera chunk position.
     /// If any origin changes, rebuild the entire grid from the chunk_values map.
-    pub fn rebuild_origins(&mut self, camera_chunk: IVec3, config: &LoadConfig) {
-        let radius = config.end_radius as i32;
+    pub fn rebuild_origins(&mut self, camera_chunk: IVec3, end_radius: u32) {
+        let radius = end_radius as i32;
         let mut changed = false;
         for lod in 0..self.lod_count {
             let lod_cam = lod_chunk_pos(camera_chunk, lod);
