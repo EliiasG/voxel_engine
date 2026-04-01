@@ -23,7 +23,7 @@ struct ShadowUniform {
     _pad2: i32,
     shadow_tex_size: vec2<f32>,
     scale_factor: f32,
-    _pad3: f32,
+    night_factor: f32,
 };
 
 struct LodInfo {
@@ -215,6 +215,12 @@ fn cs_shadow(@builtin(global_invocation_id) gid: vec3<u32>) {
         normal_height = dot(cam_rel_early, face_n);
     }
 
+    // At night, skip ray tracing entirely — everything is in shadow
+    if (shadow.night_factor >= 1.0) {
+        textureStore(output_tex, pixel, vec4<f32>(0.0, normal_height, 0.0, 0.0));
+        return;
+    }
+
     // Skipped pixels: return previous frame's value directly
     if (checker != 0u && depth > 0.0) {
         var prev_uv = uv;
@@ -372,11 +378,15 @@ fn cs_shadow(@builtin(global_invocation_id) gid: vec3<u32>) {
             // Static: gentle blend so jitter converges smoothly without visible flicker
             var blend = mix(0.7, 0.5, t);
             if (shadow.camera_moving == 0u) {
-                blend = mix(0.06, 0.02, t);
+                let diff = abs(trace_result - prev_sample);
+                blend = mix(0.04, 0.5, smoothstep(0.02, 0.2, diff));
             }
             result = mix(prev_sample, trace_result, blend);
         }
     }
+
+    // Blend toward full shadow during sunset/sunrise transition
+    result = mix(result, 0.0, shadow.night_factor);
 
     textureStore(output_tex, pixel, vec4<f32>(result, normal_height, 0.0, 0.0));
 }

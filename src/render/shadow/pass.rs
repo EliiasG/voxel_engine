@@ -8,6 +8,7 @@ use wgpu::{
 };
 
 use super::gpu::ShadowGpuBuffers;
+use crate::render;
 
 // --- Resources ---
 
@@ -346,7 +347,7 @@ impl ShadowPassResources {
         let shader = unsafe { device.create_shader_module_trusted(
             wgpu::ShaderModuleDescriptor {
                 label: Some("Shadow compute shader"),
-                source: wgpu::ShaderSource::Wgsl(include_str!("../shadow.wgsl").into()),
+                source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/shadow.wgsl").into()),
             },
             wgpu::ShaderRuntimeChecks::unchecked(),
         ) };
@@ -470,7 +471,7 @@ impl Operation for ShadowDepthOperation {
         pass.set_viewport(0.0, 0.0, sw as f32, sh as f32, 0.0, 1.0);
 
         // Use the normal-output pipeline (same vertex shader, fs_normal fragment)
-        let voxel_pipeline = world.resource::<crate::render::VoxelPipeline>();
+        let voxel_pipeline = world.resource::<render::VoxelPipeline>();
         let pipeline_id = voxel_pipeline.normal_fill;
 
         world.asset_scope(pipeline_id, |world, pipeline_man: &mut modul_render::RenderPipelineManager| {
@@ -482,14 +483,14 @@ impl Operation for ShadowDepthOperation {
             let pipeline = pipeline_man.get(world, &params);
             pass.set_pipeline(pipeline);
 
-            let camera_bg = &world.resource::<crate::render::CameraBindGroup>().bind_group;
-            let gpu = world.resource::<crate::render::GpuBuffers>();
+            let camera_bg = &world.resource::<render::CameraBindGroup>().bind_group;
+            let gpu = world.resource::<render::GpuBuffers>();
             let device = &world.resource::<modul_core::DeviceRes>().0;
             let shadow_res = world.resource::<ShadowPassResources>();
 
             // Dummy shadow mask bind group: use prev_view for all texture slots to avoid
             // conflict with shadow_normal which is a color target in this pass
-            let layout = device.create_bind_group_layout(crate::render::ShadowMaskBGLayout::LAYOUT);
+            let layout = device.create_bind_group_layout(render::ShadowMaskBGLayout::LAYOUT);
             let dummy_shadow_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("Dummy shadow BG"),
                 layout: &layout,
@@ -509,7 +510,7 @@ impl Operation for ShadowDepthOperation {
                 ],
             });
 
-            let atmo_res = world.resource::<crate::atmosphere::AtmosphereResources>();
+            let atmo_res = world.resource::<render::atmosphere::AtmosphereResources>();
             let atmo_bg_ptr = &atmo_res.bind_group as *const wgpu::BindGroup;
             let atmo_bg = unsafe { &*atmo_bg_ptr };
 
@@ -517,7 +518,7 @@ impl Operation for ShadowDepthOperation {
             pass.set_bind_group(2, &dummy_shadow_bg, &[]);
             pass.set_bind_group(3, atmo_bg, &[]);
 
-            crate::render::draw_voxel_geometry(&mut pass, gpu);
+            render::draw_voxel_geometry(&mut pass, gpu);
         });
     }
 }
@@ -557,13 +558,13 @@ impl Operation for ShadowTraceOperation {
             let scale = world.resource::<ShadowConfig>().scale_denominator;
             let camera = world.resource::<crate::Camera>();
             let cam_uniform = camera.0.uniform(); // unjittered — for motion detection
-            let taa_res = world.resource::<crate::taa::TaaResources>();
+            let taa_res = world.resource::<render::taa::TaaResources>();
             // The shadow depth pass rendered with the jittered VP (from camera bind group),
             // so we must reconstruct world positions using the same jittered VP's inverse.
             let jittered_vp = taa_res.prev_jittered_view_proj;
             let prev = world.resource::<PreviousFrameData>();
             let sun = world.resource::<SunDirection>();
-            let grid = world.resource::<crate::shadow::grid::ShadowGrid>();
+            let grid = world.resource::<super::grid::ShadowGrid>();
             let fc = world.resource::<crate::FrameCount>().0;
             let shadow_res = world.resource::<ShadowPassResources>();
             let (sw, sh) = shadow_res.current_size;

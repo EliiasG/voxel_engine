@@ -8,7 +8,7 @@ use wgpu::{
 };
 
 use crate::render;
-use crate::shadow::pass::SunDirection;
+use crate::render::shadow::pass::SunDirection;
 
 // --- Atmosphere scattering constants (Earth-like) ---
 
@@ -497,8 +497,8 @@ impl AtmosphereResources {
 
         let camera_wgsl = render::CameraBGLayout::LIBRARY.replace("#BIND_GROUP", "0");
         let atmo_wgsl = AtmosphereBGLayout::LIBRARY.replace("#BIND_GROUP", "1");
-        let sky_sample_wgsl = include_str!("sky_sample.wgsl");
-        let sky_shader_src = include_str!("sky.wgsl");
+        let sky_sample_wgsl = include_str!("shaders/sky_sample.wgsl");
+        let sky_shader_src = include_str!("shaders/sky.wgsl");
         let full_source = format!("{camera_wgsl}\n{atmo_wgsl}\n{sky_sample_wgsl}\n{sky_shader_src}");
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -611,7 +611,7 @@ impl Operation for SkyPassOperation {
         let pipeline_ptr: *const wgpu::RenderPipeline;
         let atmo_bg_ptr: *const wgpu::BindGroup;
         {
-            let taa_res = world.resource::<crate::taa::TaaResources>();
+            let taa_res = world.resource::<crate::render::taa::TaaResources>();
             scene_view_ptr = &taa_res.scene_view as *const _;
         }
         {

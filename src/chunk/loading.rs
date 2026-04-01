@@ -62,8 +62,8 @@ pub fn update_loader(
     mut loaded_index: ResMut<LoadedChunkIndex>,
     mut render_data: ResMut<crate::render::ChunkRenderData>,
     mut gpu: ResMut<crate::render::GpuBuffers>,
-    mut shadow_grid: ResMut<crate::shadow::grid::ShadowGrid>,
-    mut bitmask_pool: ResMut<crate::shadow::grid::BitmaskPool>,
+    mut shadow_grid: ResMut<crate::render::shadow::grid::ShadowGrid>,
+    mut bitmask_pool: ResMut<crate::render::shadow::grid::BitmaskPool>,
     mut commands: Commands,
     chunk_data_query: Query<(), With<ChunkData>>,
 ) {
@@ -104,7 +104,7 @@ pub fn update_loader(
                         }
                     }
                 }
-                crate::shadow::grid::remove_chunk_from_grid(
+                crate::render::shadow::grid::remove_chunk_from_grid(
                     &mut shadow_grid, &mut bitmask_pool, *pos, lod as u8,
                 );
                 commands.entity(*entity).despawn();

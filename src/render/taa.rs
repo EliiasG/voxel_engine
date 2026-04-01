@@ -137,7 +137,7 @@ impl TaaResources {
 @group(1) @binding(2) var history_tex: texture_2d<f32>;
 @group(1) @binding(3) var depth_tex: texture_depth_2d;
 ";
-        let taa_shader_src = include_str!("taa.wgsl");
+        let taa_shader_src = include_str!("shaders/taa.wgsl");
         let full_source = format!("{camera_wgsl}\n{taa_bindings}\n{taa_shader_src}");
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -320,10 +320,10 @@ impl Operation for TaaVoxelDrawOperation {
                 let camera_bg = &world.resource::<render::CameraBindGroup>().bind_group;
                 let gpu = world.resource::<render::GpuBuffers>();
                 let device = &world.resource::<modul_core::DeviceRes>().0;
-                let shadow_res = world.resource::<crate::shadow::pass::ShadowPassResources>();
+                let shadow_res = world.resource::<crate::render::shadow::pass::ShadowPassResources>();
                 let shadow_mask_bg = render::create_shadow_mask_bind_group(device, shadow_res);
 
-                let atmo_res = world.resource::<crate::atmosphere::AtmosphereResources>();
+                let atmo_res = world.resource::<crate::render::atmosphere::AtmosphereResources>();
                 let atmo_bg_ptr = &atmo_res.bind_group as *const wgpu::BindGroup;
                 let atmo_bg = unsafe { &*atmo_bg_ptr };
 

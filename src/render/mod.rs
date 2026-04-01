@@ -1,3 +1,7 @@
+pub mod atmosphere;
+pub mod shadow;
+pub mod taa;
+
 use std::collections::HashMap;
 
 use bevy_ecs::prelude::*;
@@ -449,12 +453,12 @@ pub fn init_pipelines(
     let camera_wgsl = CameraBGLayout::LIBRARY.replace("#BIND_GROUP", "0");
     let metadata_wgsl = MetadataBGLayout::LIBRARY.replace("#BIND_GROUP", "1");
     let shadow_mask_wgsl = ShadowMaskBGLayout::LIBRARY.replace("#BIND_GROUP", "2");
-    let atmosphere_wgsl = crate::atmosphere::AtmosphereBGLayout::LIBRARY.replace("#BIND_GROUP", "3");
-    let sky_sample_wgsl = include_str!("sky_sample.wgsl");
-    let lighting_wgsl = include_str!("lighting.wgsl");
+    let atmosphere_wgsl = atmosphere::AtmosphereBGLayout::LIBRARY.replace("#BIND_GROUP", "3");
+    let sky_sample_wgsl = include_str!("shaders/sky_sample.wgsl");
+    let lighting_wgsl = include_str!("shaders/lighting.wgsl");
     let full_source = format!(
         "{camera_wgsl}\n{metadata_wgsl}\n{shadow_mask_wgsl}\n{atmosphere_wgsl}\n{sky_sample_wgsl}\n{lighting_wgsl}\n{}",
-        include_str!("voxel.wgsl")
+        include_str!("shaders/voxel.wgsl")
     );
 
     let shader = shaders.add(device.create_shader_module(ShaderModuleDescriptor {
@@ -466,7 +470,7 @@ pub fn init_pipelines(
     let camera_layout = device.create_bind_group_layout(CameraBGLayout::LAYOUT);
     let metadata_layout = device.create_bind_group_layout(MetadataBGLayout::LAYOUT);
     let shadow_mask_layout = device.create_bind_group_layout(ShadowMaskBGLayout::LAYOUT);
-    let atmosphere_layout = device.create_bind_group_layout(crate::atmosphere::AtmosphereBGLayout::LAYOUT);
+    let atmosphere_layout = device.create_bind_group_layout(atmosphere::AtmosphereBGLayout::LAYOUT);
     let layout = layouts.add(device.create_pipeline_layout(&PipelineLayoutDescriptor {
         label: Some("Voxel pipeline layout"),
         bind_group_layouts: &[&camera_layout, &metadata_layout, &shadow_mask_layout, &atmosphere_layout],
@@ -786,7 +790,7 @@ pub fn draw_voxel_geometry(pass: &mut wgpu::RenderPass, gpu: &GpuBuffers) {
 /// Create a shadow mask bind group from the current shadow pass state.
 pub fn create_shadow_mask_bind_group(
     device: &wgpu::Device,
-    shadow_res: &crate::shadow::pass::ShadowPassResources,
+    shadow_res: &shadow::pass::ShadowPassResources,
 ) -> wgpu::BindGroup {
     let layout = device.create_bind_group_layout(ShadowMaskBGLayout::LAYOUT);
     device.create_bind_group(&wgpu::BindGroupDescriptor {

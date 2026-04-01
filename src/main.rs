@@ -1,9 +1,6 @@
-mod atmosphere;
 mod camera;
 mod chunk;
 mod render;
-mod shadow;
-mod taa;
 
 use std::collections::HashSet;
 
@@ -173,8 +170,8 @@ fn main() {
         app.insert_resource(chunk::LoadedChunkIndex::default());
         app.insert_resource(render::ChunkRenderData::default());
         app.insert_resource(chunk::loading::Loader::default());
-        app.insert_resource(shadow::grid::ShadowGrid::new(&load_config));
-        app.insert_resource(shadow::grid::BitmaskPool::new());
+        app.insert_resource(render::shadow::grid::ShadowGrid::new(&load_config));
+        app.insert_resource(render::shadow::grid::BitmaskPool::new());
         app.insert_resource(load_config);
         app.insert_resource(chunk::generation::GenPool::new());
         app.insert_resource(chunk::meshing::MeshPool::new());
@@ -209,11 +206,11 @@ fn main() {
             Synchronize,
             (
                 render::synchronize_gpu,
-                shadow::gpu::synchronize_shadow_buffers,
+                render::shadow::gpu::synchronize_shadow_buffers,
                 update_day_cycle,
-                atmosphere::update_atmosphere,
+                render::atmosphere::update_atmosphere,
                 update_camera,
-                shadow::pass::update_previous_frame_data,
+                render::shadow::pass::update_previous_frame_data,
             ),
         );
     });
@@ -228,7 +225,7 @@ fn init(
     mut layouts: ResMut<Assets<wgpu::PipelineLayout>>,
     mut pipelines: ResMut<Assets<RenderPipelineManager>>,
     mut sequences: ResMut<Assets<Sequence>>,
-    shadow_grid: Res<shadow::grid::ShadowGrid>,
+    shadow_grid: Res<render::shadow::grid::ShadowGrid>,
     surface_fmt: Res<modul_core::SurfaceFormat>,
 ) {
     let window_entity = main_window.single();
@@ -260,7 +257,7 @@ fn init(
 
     let gpu_buffers = render::create_gpu_buffers(&device.0);
     let camera_bg = render::create_camera_bind_group(&device.0);
-    let shadow_gpu = shadow::gpu::ShadowGpuBuffers::new(&device.0, &shadow_grid);
+    let shadow_gpu = render::shadow::gpu::ShadowGpuBuffers::new(&device.0, &shadow_grid);
 
     let voxel_pipeline = render::init_pipelines(
         &device.0,
@@ -269,15 +266,15 @@ fn init(
         &mut layouts,
     );
 
-    let shadow_pass_res = shadow::pass::ShadowPassResources::new(
+    let shadow_pass_res = render::shadow::pass::ShadowPassResources::new(
         &device.0, &shadow_gpu, 800, 600, 1, // initial size, full res for debugging
     );
 
-    let taa_res = taa::TaaResources::new(&device.0, surface_fmt.0, 800, 600);
+    let taa_res = render::taa::TaaResources::new(&device.0, surface_fmt.0, 800, 600);
 
-    let sun_dir = shadow::pass::SunDirection::default();
-    let atmo_config = atmosphere::AtmosphereConfig::default();
-    let atmo_res = atmosphere::AtmosphereResources::new(
+    let sun_dir = render::shadow::pass::SunDirection::default();
+    let atmo_config = render::atmosphere::AtmosphereConfig::default();
+    let atmo_res = render::atmosphere::AtmosphereResources::new(
         &device.0, &queue.0, &sun_dir, &atmo_config, surface_fmt.0,
     );
 
@@ -285,14 +282,14 @@ fn init(
     let mut builder = SequenceBuilder::new();
     builder
         .add(render::ClearAll { render_target })
-        .add(shadow::pass::ShadowDepthOperationBuilder)
-        .add(shadow::pass::ShadowTraceOperationBuilder)
-        .add(taa::TaaVoxelDrawOperationBuilder)
-        .add(atmosphere::SkyPassOperationBuilder)
-        .add(taa::TaaResolveOperationBuilder {
+        .add(render::shadow::pass::ShadowDepthOperationBuilder)
+        .add(render::shadow::pass::ShadowTraceOperationBuilder)
+        .add(render::taa::TaaVoxelDrawOperationBuilder)
+        .add(render::atmosphere::SkyPassOperationBuilder)
+        .add(render::taa::TaaResolveOperationBuilder {
             surface_entity: window_entity,
         })
-        .add(shadow::pass::ShadowDebugOverlayBuilder {
+        .add(render::shadow::pass::ShadowDebugOverlayBuilder {
             target: render_target,
         });
     let sequence = builder.finish(&mut sequences);
@@ -309,10 +306,10 @@ fn init(
     commands.insert_resource(camera_bg);
     commands.insert_resource(shadow_gpu);
     commands.insert_resource(shadow_pass_res);
-    commands.insert_resource(shadow::pass::ShadowConfig::default());
+    commands.insert_resource(render::shadow::pass::ShadowConfig::default());
     commands.insert_resource(sun_dir);
     commands.insert_resource(DayCycle::default());
-    commands.insert_resource(shadow::pass::PreviousFrameData::default());
+    commands.insert_resource(render::shadow::pass::PreviousFrameData::default());
     commands.insert_resource(voxel_pipeline);
     commands.insert_resource(render::PageAllocator::new());
     commands.insert_resource(render::Wireframe(false));
@@ -547,21 +544,21 @@ fn process_input(
 fn update_day_cycle(
     input: Res<InputState>,
     mut cycle: ResMut<DayCycle>,
-    mut sun_dir: ResMut<shadow::pass::SunDirection>,
+    mut sun_dir: ResMut<render::shadow::pass::SunDirection>,
 ) {
     let dt = input.dt.min(0.1);
-    let day_length = 30.0; // seconds per full rotation
+    let day_length = 300.0; // seconds per full rotation
     cycle.angle += dt * std::f32::consts::TAU / day_length;
     cycle.angle %= std::f32::consts::TAU;
 
-    sun_dir.0 = atmosphere::sun_direction_at_angle(cycle.angle);
+    sun_dir.0 = render::atmosphere::sun_direction_at_angle(cycle.angle);
 }
 
 fn update_camera(
     mut camera: ResMut<Camera>,
     mut frame_count: ResMut<FrameCount>,
     mut fps: ResMut<FpsCounter>,
-    mut taa_res: ResMut<taa::TaaResources>,
+    mut taa_res: ResMut<render::taa::TaaResources>,
     debug: Res<DebugMode>,
     queue: Res<QueueRes>,
     camera_bg: Res<render::CameraBindGroup>,

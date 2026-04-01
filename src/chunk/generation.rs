@@ -8,7 +8,7 @@ use super::{
     ChunkChange, ChunkChangedQueue, ChunkData, ChunkLod, ChunkPos, ChunkStorage,
     NeedsGeneration, AIR, CHUNK_SIZE, CHUNK_SIZE_2, CHUNK_SIZE_3, STONE,
 };
-use crate::shadow::bitmask::{self, ChunkBitmaskResult};
+use crate::render::shadow::bitmask::{self, ChunkBitmaskResult};
 
 struct GenRequest {
     entity: Entity,
@@ -87,13 +87,13 @@ pub fn poll_generation(
     mut commands: Commands,
     pool: Res<GenPool>,
     mut changed: ResMut<ChunkChangedQueue>,
-    mut shadow_grid: ResMut<crate::shadow::grid::ShadowGrid>,
-    mut bitmask_pool: ResMut<crate::shadow::grid::BitmaskPool>,
+    mut shadow_grid: ResMut<crate::render::shadow::grid::ShadowGrid>,
+    mut bitmask_pool: ResMut<crate::render::shadow::grid::BitmaskPool>,
     entity_check: Query<()>,
 ) {
     while let Ok(result) = pool.rx.try_recv() {
         if entity_check.get(result.entity).is_ok() {
-            crate::shadow::grid::update_grid_for_chunk(
+            crate::render::shadow::grid::update_grid_for_chunk(
                 &mut shadow_grid,
                 &mut bitmask_pool,
                 result.pos,
