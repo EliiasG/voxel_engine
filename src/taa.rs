@@ -1,7 +1,7 @@
 use bevy_ecs::prelude::*;
 use modul_asset::AssetWorldExt;
 use modul_render::{
-    BindGroupLayoutProvider, Operation, OperationBuilder, RenderTarget, RenderTargetSource,
+    BindGroupLayoutDef, Operation, OperationBuilder, RenderTarget, RenderTargetSource,
 };
 use wgpu::{
     CommandEncoder, Device, TextureFormat, TextureUsages,
@@ -120,7 +120,7 @@ impl TaaResources {
             });
 
         let camera_layout =
-            device.create_bind_group_layout(&render::CameraBGLayout.layout());
+            device.create_bind_group_layout(render::CameraBGLayout::LAYOUT);
         let pipeline_layout =
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("TAA resolve pipeline layout"),
@@ -129,7 +129,7 @@ impl TaaResources {
             });
 
         // Compose shader: camera library (group 0) + TAA bindings + TAA shader
-        let camera_wgsl = modul_render::BindGroupLayoutProvider::library(&render::CameraBGLayout)
+        let camera_wgsl = render::CameraBGLayout::LIBRARY
             .replace("#BIND_GROUP", "0");
         let taa_bindings = "\
 @group(1) @binding(0) var scene_color: texture_2d<f32>;
@@ -325,7 +325,7 @@ impl Operation for TaaVoxelDrawOperation {
                 let shadow_mask_layout = world
                     .resource::<modul_core::DeviceRes>()
                     .0
-                    .create_bind_group_layout(&render::ShadowMaskBGLayout.layout());
+                    .create_bind_group_layout(render::ShadowMaskBGLayout::LAYOUT);
                 let shadow_mask_bg = world
                     .resource::<modul_core::DeviceRes>()
                     .0

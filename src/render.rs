@@ -5,7 +5,7 @@ use bytemuck::{Pod, Zeroable};
 use glam::IVec3;
 use modul_asset::{AssetId, AssetWorldExt, Assets};
 use modul_render::{
-    BindGroupLayoutProvider, DirectRenderPipelineResourceProvider, GenericDepthStencilState,
+    BindGroupLayoutDef, CachedBindGroupLayout, DirectRenderPipelineResourceProvider, GenericDepthStencilState,
     GenericFragmentState, GenericMultisampleState, GenericRenderPipelineDescriptor,
     GenericVertexBufferLayout, GenericVertexState, Operation, OperationBuilder,
     RenderPipelineManager, RenderTargetSource,
@@ -48,28 +48,25 @@ pub struct DrawIndirectArgs {
 
 pub struct CameraBGLayout;
 
-impl BindGroupLayoutProvider for CameraBGLayout {
-    fn layout(&self) -> wgpu::BindGroupLayoutDescriptor<'_> {
-        static ENTRIES: [wgpu::BindGroupLayoutEntry; 1] = [wgpu::BindGroupLayoutEntry {
-            binding: 0,
-            visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
-            ty: wgpu::BindingType::Buffer {
-                ty: wgpu::BufferBindingType::Uniform,
-                has_dynamic_offset: false,
-                min_binding_size: std::num::NonZero::new(
-                    std::mem::size_of::<crate::camera::CameraUniform>() as u64,
-                ),
-            },
-            count: None,
-        }];
-        wgpu::BindGroupLayoutDescriptor {
+impl BindGroupLayoutDef for CameraBGLayout {
+    const LAYOUT: &'static wgpu::BindGroupLayoutDescriptor<'static> =
+        &wgpu::BindGroupLayoutDescriptor {
             label: Some("Camera BG Layout"),
-            entries: &ENTRIES,
-        }
-    }
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: std::num::NonZero::new(
+                        std::mem::size_of::<crate::camera::CameraUniform>() as u64,
+                    ),
+                },
+                count: None,
+            }],
+        };
 
-    fn library(&self) -> &str {
-        "\
+    const LIBRARY: &'static str = "\
 struct CameraUniform {
     view_proj: mat4x4<f32>,
     chunk_offset: vec3<i32>,
@@ -86,34 +83,30 @@ struct CameraUniform {
 
 @group(#BIND_GROUP) @binding(0)
 var<uniform> camera: CameraUniform;
-"
-    }
+";
 }
 
 pub struct MetadataBGLayout;
 
-impl BindGroupLayoutProvider for MetadataBGLayout {
-    fn layout(&self) -> wgpu::BindGroupLayoutDescriptor<'_> {
-        static ENTRIES: [wgpu::BindGroupLayoutEntry; 1] = [wgpu::BindGroupLayoutEntry {
-            binding: 0,
-            visibility: wgpu::ShaderStages::VERTEX,
-            ty: wgpu::BindingType::Buffer {
-                ty: wgpu::BufferBindingType::Storage { read_only: true },
-                has_dynamic_offset: false,
-                min_binding_size: std::num::NonZero::new(
-                    std::mem::size_of::<PageMetadata>() as u64,
-                ),
-            },
-            count: None,
-        }];
-        wgpu::BindGroupLayoutDescriptor {
+impl BindGroupLayoutDef for MetadataBGLayout {
+    const LAYOUT: &'static wgpu::BindGroupLayoutDescriptor<'static> =
+        &wgpu::BindGroupLayoutDescriptor {
             label: Some("Metadata BG Layout"),
-            entries: &ENTRIES,
-        }
-    }
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: true },
+                    has_dynamic_offset: false,
+                    min_binding_size: std::num::NonZero::new(
+                        std::mem::size_of::<PageMetadata>() as u64,
+                    ),
+                },
+                count: None,
+            }],
+        };
 
-    fn library(&self) -> &str {
-        "\
+    const LIBRARY: &'static str = "\
 struct PageMetadata {
     chunk_x: i32,
     chunk_y: i32,
@@ -123,58 +116,53 @@ struct PageMetadata {
 
 @group(#BIND_GROUP) @binding(0)
 var<storage, read> metadata: array<PageMetadata>;
-"
-    }
+";
 }
 
 pub struct ShadowMaskBGLayout;
 
-impl BindGroupLayoutProvider for ShadowMaskBGLayout {
-    fn layout(&self) -> wgpu::BindGroupLayoutDescriptor<'_> {
-        static ENTRIES: [wgpu::BindGroupLayoutEntry; 3] = [
-            wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::FRAGMENT,
-                ty: wgpu::BindingType::Texture {
-                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                    view_dimension: wgpu::TextureViewDimension::D2,
-                    multisampled: false,
-                },
-                count: None,
-            },
-            wgpu::BindGroupLayoutEntry {
-                binding: 1,
-                visibility: wgpu::ShaderStages::FRAGMENT,
-                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                count: None,
-            },
-            wgpu::BindGroupLayoutEntry {
-                binding: 2,
-                visibility: wgpu::ShaderStages::FRAGMENT,
-                ty: wgpu::BindingType::Texture {
-                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                    view_dimension: wgpu::TextureViewDimension::D2,
-                    multisampled: false,
-                },
-                count: None,
-            },
-        ];
-        wgpu::BindGroupLayoutDescriptor {
+impl BindGroupLayoutDef for ShadowMaskBGLayout {
+    const LAYOUT: &'static wgpu::BindGroupLayoutDescriptor<'static> =
+        &wgpu::BindGroupLayoutDescriptor {
             label: Some("Shadow Mask BG Layout"),
-            entries: &ENTRIES,
-        }
-    }
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+            ],
+        };
 
-    fn library(&self) -> &str {
-        "\
+    const LIBRARY: &'static str = "\
 @group(#BIND_GROUP) @binding(0)
 var shadow_mask: texture_2d<f32>;
 @group(#BIND_GROUP) @binding(1)
 var shadow_sampler: sampler;
 @group(#BIND_GROUP) @binding(2)
 var shadow_normal: texture_2d<f32>;
-"
-    }
+";
 }
 
 // --- Slab ---
@@ -344,7 +332,7 @@ pub struct Wireframe(pub bool);
 
 pub fn create_gpu_buffers(device: &Device) -> GpuBuffers {
     let metadata_bind_group_layout =
-        device.create_bind_group_layout(&MetadataBGLayout.layout());
+        device.create_bind_group_layout(MetadataBGLayout::LAYOUT);
 
     let indirect_buffer = device.create_buffer(&BufferDescriptor {
         label: Some("Indirect buffer"),
@@ -368,7 +356,7 @@ pub fn create_gpu_buffers(device: &Device) -> GpuBuffers {
 }
 
 pub fn create_camera_bind_group(device: &Device) -> CameraBindGroup {
-    let layout = device.create_bind_group_layout(&CameraBGLayout.layout());
+    let layout = device.create_bind_group_layout(CameraBGLayout::LAYOUT);
 
     let buffer = device.create_buffer(&BufferDescriptor {
         label: Some("Camera uniform"),
@@ -458,10 +446,10 @@ pub fn init_pipelines(
     layouts: &mut Assets<PipelineLayout>,
 ) -> VoxelPipeline {
     // Compose shader from bind group libraries + main shader
-    let camera_wgsl = CameraBGLayout.library().replace("#BIND_GROUP", "0");
-    let metadata_wgsl = MetadataBGLayout.library().replace("#BIND_GROUP", "1");
-    let shadow_mask_wgsl = ShadowMaskBGLayout.library().replace("#BIND_GROUP", "2");
-    let atmosphere_wgsl = crate::atmosphere::AtmosphereBGLayout.library().replace("#BIND_GROUP", "3");
+    let camera_wgsl = CameraBGLayout::LIBRARY.replace("#BIND_GROUP", "0");
+    let metadata_wgsl = MetadataBGLayout::LIBRARY.replace("#BIND_GROUP", "1");
+    let shadow_mask_wgsl = ShadowMaskBGLayout::LIBRARY.replace("#BIND_GROUP", "2");
+    let atmosphere_wgsl = crate::atmosphere::AtmosphereBGLayout::LIBRARY.replace("#BIND_GROUP", "3");
     let full_source = format!(
         "{camera_wgsl}\n{metadata_wgsl}\n{shadow_mask_wgsl}\n{atmosphere_wgsl}\n{}",
         include_str!("voxel.wgsl")
@@ -473,10 +461,10 @@ pub fn init_pipelines(
     }));
 
     // Create pipeline layout from bind group layout providers
-    let camera_layout = device.create_bind_group_layout(&CameraBGLayout.layout());
-    let metadata_layout = device.create_bind_group_layout(&MetadataBGLayout.layout());
-    let shadow_mask_layout = device.create_bind_group_layout(&ShadowMaskBGLayout.layout());
-    let atmosphere_layout = device.create_bind_group_layout(&crate::atmosphere::AtmosphereBGLayout.layout());
+    let camera_layout = device.create_bind_group_layout(CameraBGLayout::LAYOUT);
+    let metadata_layout = device.create_bind_group_layout(MetadataBGLayout::LAYOUT);
+    let shadow_mask_layout = device.create_bind_group_layout(ShadowMaskBGLayout::LAYOUT);
+    let atmosphere_layout = device.create_bind_group_layout(crate::atmosphere::AtmosphereBGLayout::LAYOUT);
     let layout = layouts.add(device.create_pipeline_layout(&PipelineLayoutDescriptor {
         label: Some("Voxel pipeline layout"),
         bind_group_layouts: &[&camera_layout, &metadata_layout, &shadow_mask_layout, &atmosphere_layout],
@@ -809,7 +797,7 @@ impl Operation for VoxelDrawOperation {
 
             // Create shadow mask bind group from current accumulated texture
             let shadow_mask_layout = world.resource::<modul_core::DeviceRes>().0
-                .create_bind_group_layout(&ShadowMaskBGLayout.layout());
+                .create_bind_group_layout(ShadowMaskBGLayout::LAYOUT);
             let shadow_mask_bg = world.resource::<modul_core::DeviceRes>().0
                 .create_bind_group(&wgpu::BindGroupDescriptor {
                     label: Some("Shadow mask BG"),

@@ -1,5 +1,5 @@
 use bevy_ecs::prelude::*;
-use modul_render::BindGroupLayoutProvider;
+use modul_render::BindGroupLayoutDef;
 use wgpu::{Buffer, BufferDescriptor, BufferUsages, Device};
 
 use super::bitmask::ChunkBitmask;
@@ -10,55 +10,50 @@ const BITMASK_SLOT_SIZE: u64 = std::mem::size_of::<ChunkBitmask>() as u64; // 41
 
 pub struct ShadowAccelBGLayout;
 
-impl BindGroupLayoutProvider for ShadowAccelBGLayout {
-    fn layout(&self) -> wgpu::BindGroupLayoutDescriptor<'_> {
-        static ENTRIES: [wgpu::BindGroupLayoutEntry; 3] = [
-            // binding 0: LodInfo uniform array
-            wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::COMPUTE,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: false,
-                    min_binding_size: std::num::NonZero::new(
-                        std::mem::size_of::<LodInfo>() as u64 * 6,
-                    ),
-                },
-                count: None,
-            },
-            // binding 1: grid storage (read-only)
-            wgpu::BindGroupLayoutEntry {
-                binding: 1,
-                visibility: wgpu::ShaderStages::COMPUTE,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Storage { read_only: true },
-                    has_dynamic_offset: false,
-                    min_binding_size: std::num::NonZero::new(4), // at least one u32
-                },
-                count: None,
-            },
-            // binding 2: bitmask storage (read-only)
-            wgpu::BindGroupLayoutEntry {
-                binding: 2,
-                visibility: wgpu::ShaderStages::COMPUTE,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Storage { read_only: true },
-                    has_dynamic_offset: false,
-                    min_binding_size: std::num::NonZero::new(BITMASK_SLOT_SIZE),
-                },
-                count: None,
-            },
-        ];
-        wgpu::BindGroupLayoutDescriptor {
+impl BindGroupLayoutDef for ShadowAccelBGLayout {
+    const LAYOUT: &'static wgpu::BindGroupLayoutDescriptor<'static> =
+        &wgpu::BindGroupLayoutDescriptor {
             label: Some("Shadow Accel BG Layout"),
-            entries: &ENTRIES,
-        }
-    }
+            entries: &[
+                // binding 0: LodInfo uniform array
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: std::num::NonZero::new(
+                            std::mem::size_of::<LodInfo>() as u64 * 6,
+                        ),
+                    },
+                    count: None,
+                },
+                // binding 1: grid storage (read-only)
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: std::num::NonZero::new(4), // at least one u32
+                    },
+                    count: None,
+                },
+                // binding 2: bitmask storage (read-only)
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: std::num::NonZero::new(BITMASK_SLOT_SIZE),
+                    },
+                    count: None,
+                },
+            ],
+        };
 
-    fn library(&self) -> &str {
-        // Not used for shader composition (naga_oil limitation), but provided for completeness
-        ""
-    }
+    const LIBRARY: &'static str = "";
 }
 
 #[derive(Resource)]
@@ -73,7 +68,7 @@ pub struct ShadowGpuBuffers {
 
 impl ShadowGpuBuffers {
     pub fn new(device: &Device, grid: &ShadowGrid) -> Self {
-        let bind_group_layout = device.create_bind_group_layout(&ShadowAccelBGLayout.layout());
+        let bind_group_layout = device.create_bind_group_layout(ShadowAccelBGLayout::LAYOUT);
 
         let lod_info_size = std::mem::size_of::<LodInfo>() as u64 * grid.lod_count as u64;
         let lod_info_buffer = device.create_buffer(&BufferDescriptor {

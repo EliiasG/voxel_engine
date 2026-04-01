@@ -356,27 +356,12 @@ dependencies = [
 
 [[package]]
 name = "bit-set"
-version = "0.5.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0700ddab506f33b20a03b13996eccd309a48e5ff77d0d95926aa0210fb4e95f1"
-dependencies = [
- "bit-vec 0.6.3",
-]
-
-[[package]]
-name = "bit-set"
 version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "08807e080ed7f9d5433fa9b275196cfc35414f66a0c79d864dc51a0d825231a3"
 dependencies = [
- "bit-vec 0.8.0",
+ "bit-vec",
 ]
-
-[[package]]
-name = "bit-vec"
-version = "0.6.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "349f9b6a179ed607305526ca489b34ad0a41aed5f7980fa90eb03160b69598fb"
 
 [[package]]
 name = "bit-vec"
@@ -653,12 +638,6 @@ name = "cursor-icon"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f27ae1dd37df86211c42e150270f82743308803d90a6f6e6651cd730d5e1732f"
-
-[[package]]
-name = "data-encoding"
-version = "2.10.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d7a1e2f27636f116493b8b860f5546edb47c8d8f8ea73e1d2a20be88e28d1fea"
 
 [[package]]
 name = "derive_more"
@@ -1275,7 +1254,7 @@ dependencies = [
 [[package]]
 name = "modul_asset"
 version = "0.0.0"
-source = "git+https://github.com/EliiasG/modul#1adf52bd6bb5d3a5979fd20a886b87ab7d915989"
+source = "git+https://github.com/EliiasG/modul#fd34a17597099f4eb78c36cbf693ac0660148693"
 dependencies = [
  "bevy_app",
  "bevy_ecs",
@@ -1286,7 +1265,7 @@ dependencies = [
 [[package]]
 name = "modul_core"
 version = "0.0.0"
-source = "git+https://github.com/EliiasG/modul#1adf52bd6bb5d3a5979fd20a886b87ab7d915989"
+source = "git+https://github.com/EliiasG/modul#fd34a17597099f4eb78c36cbf693ac0660148693"
 dependencies = [
  "bevy_app",
  "bevy_ecs",
@@ -1300,7 +1279,7 @@ dependencies = [
 [[package]]
 name = "modul_render"
 version = "0.0.0"
-source = "git+https://github.com/EliiasG/modul#1adf52bd6bb5d3a5979fd20a886b87ab7d915989"
+source = "git+https://github.com/EliiasG/modul#fd34a17597099f4eb78c36cbf693ac0660148693"
 dependencies = [
  "bevy_app",
  "bevy_ecs",
@@ -1308,7 +1287,6 @@ dependencies = [
  "modul_asset",
  "modul_core",
  "modul_util",
- "naga_oil",
  "wgpu",
  "winit",
 ]
@@ -1316,7 +1294,7 @@ dependencies = [
 [[package]]
 name = "modul_util"
 version = "0.0.0"
-source = "git+https://github.com/EliiasG/modul#1adf52bd6bb5d3a5979fd20a886b87ab7d915989"
+source = "git+https://github.com/EliiasG/modul#fd34a17597099f4eb78c36cbf693ac0660148693"
 dependencies = [
  "bevy_app",
  "bevy_ecs",
@@ -1332,40 +1310,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e380993072e52eef724eddfcde0ed013b0c023c3f0417336ed041aa9f076994e"
 dependencies = [
  "arrayvec",
- "bit-set 0.8.0",
+ "bit-set",
  "bitflags 2.10.0",
  "cfg_aliases",
  "codespan-reporting",
  "hexf-parse",
  "indexmap",
  "log",
- "pp-rs",
  "rustc-hash",
  "spirv",
  "strum",
  "termcolor",
  "thiserror 2.0.18",
  "unicode-xid",
-]
-
-[[package]]
-name = "naga_oil"
-version = "0.17.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f2464f7395decfd16bb4c33fb0cb3b2c645cc60d051bc7fb652d3720bfb20f18"
-dependencies = [
- "bit-set 0.5.3",
- "codespan-reporting",
- "data-encoding",
- "indexmap",
- "naga",
- "once_cell",
- "regex",
- "regex-syntax",
- "rustc-hash",
- "thiserror 1.0.69",
- "tracing",
- "unicode-ident",
 ]
 
 [[package]]
@@ -1839,15 +1796,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7a9db96d7fa8782dd8c15ce32ffe8680bbd1e978a43bf51a34d39483540495f5"
 dependencies = [
  "portable-atomic",
-]
-
-[[package]]
-name = "pp-rs"
-version = "0.2.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bb458bb7f6e250e6eb79d5026badc10a3ebb8f9a15d1fff0f13d17c71f4d6dee"
-dependencies = [
- "unicode-xid",
 ]
 
 [[package]]
@@ -2340,19 +2288,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "63e71662fa4b2a2c3a26f570f037eb95bb1f85397f3cd8076caed2f026a6d100"
 dependencies = [
  "pin-project-lite",
- "tracing-attributes",
  "tracing-core",
-]
-
-[[package]]
-name = "tracing-attributes"
-version = "0.1.31"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7490cfa5ec963746568740651ac6781f701c9c5ea257c58e057f3ba8cf69e8da"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn",
 ]
 
 [[package]]
@@ -2686,7 +2622,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f0aa306497a238d169b9dc70659105b4a096859a34894544ca81719242e1499"
 dependencies = [
  "arrayvec",
- "bit-vec 0.8.0",
+ "bit-vec",
  "bitflags 2.10.0",
  "cfg_aliases",
  "document-features",
@@ -2713,7 +2649,7 @@ dependencies = [
  "android_system_properties",
  "arrayvec",
  "ash",
- "bit-set 0.8.0",
+ "bit-set",
  "bitflags 2.10.0",
  "block",
  "bytemuck",

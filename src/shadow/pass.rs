@@ -1,7 +1,7 @@
 use bevy_ecs::prelude::*;
 use bytemuck::{Pod, Zeroable};
 use modul_asset::AssetWorldExt;
-use modul_render::{BindGroupLayoutProvider, Operation, OperationBuilder, RenderTargetSource};
+use modul_render::{BindGroupLayoutDef, Operation, OperationBuilder, RenderTargetSource};
 use wgpu::{
     Buffer, BufferDescriptor, BufferUsages, CommandEncoder, Device, TextureFormat,
     TextureUsages,
@@ -83,7 +83,7 @@ pub struct ShadowPassUniform {
     pub _pad2: i32,
     pub shadow_tex_size: [f32; 2],
     pub scale_factor: f32,
-    pub _pad3: f32,
+    pub night_factor: f32,
 }
 
 // --- Shadow Pass Resources ---
@@ -488,7 +488,7 @@ impl Operation for ShadowDepthOperation {
 
             // Dummy shadow mask bind group (pipeline layout requires it but fs_normal doesn't use it)
             let shadow_mask_layout = world.resource::<modul_core::DeviceRes>().0
-                .create_bind_group_layout(&crate::render::ShadowMaskBGLayout.layout());
+                .create_bind_group_layout(crate::render::ShadowMaskBGLayout::LAYOUT);
             // Use prev_view as dummy for both texture slots — fs_normal doesn't read them,
             // and the real normal texture is a color target in this pass (can't also be a resource)
             let dummy_shadow_bg = world.resource::<modul_core::DeviceRes>().0
@@ -599,7 +599,7 @@ impl Operation for ShadowTraceOperation {
                 _pad2: 0,
                 shadow_tex_size: [sw as f32, sh as f32],
                 scale_factor: scale as f32,
-                _pad3: 0.0,
+                night_factor: ((0.1 - sun.0[1]) / 0.2).clamp(0.0, 1.0),
             }
         };
 

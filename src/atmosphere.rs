@@ -1,7 +1,7 @@
 use bevy_ecs::prelude::*;
 use bytemuck::{Pod, Zeroable};
 use modul_render::{
-    BindGroupLayoutProvider, Operation, OperationBuilder, RenderTarget, RenderTargetSource,
+    BindGroupLayoutDef, CachedBindGroupLayout, Operation, OperationBuilder, RenderTarget, RenderTargetSource,
 };
 use wgpu::{
     BufferDescriptor, BufferUsages, CommandEncoder, Device, TextureFormat, TextureUsages,
@@ -22,7 +22,7 @@ const MIE_EXTINCTION: f64 = MIE_COEFF / 0.9;
 const MIE_G: f64 = 0.76;
 const NUM_SCATTER_STEPS: usize = 32;
 const NUM_OPTICAL_DEPTH_STEPS: usize = 8;
-const SUN_IRRADIANCE: f64 = 10.0;
+const SUN_IRRADIANCE: f64 = 15.0;
 const LUT_SLICES: u32 = 64;
 
 // --- Resources ---
@@ -56,7 +56,7 @@ pub struct AtmosphereUniform {
     pub fog_density: f32,
     pub sun_intensity: f32,
     pub lut_w: f32,
-    pub _pad: f32,
+    pub night_factor: f32,
 }
 
 #[derive(Resource)]
@@ -75,63 +75,60 @@ pub struct AtmosphereResources {
 
 pub struct AtmosphereBGLayout;
 
-impl BindGroupLayoutProvider for AtmosphereBGLayout {
-    fn layout(&self) -> wgpu::BindGroupLayoutDescriptor<'_> {
-        static ENTRIES: [wgpu::BindGroupLayoutEntry; 4] = [
-            wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: false,
-                    min_binding_size: std::num::NonZero::new(
-                        std::mem::size_of::<AtmosphereUniform>() as u64,
-                    ),
-                },
-                count: None,
-            },
-            wgpu::BindGroupLayoutEntry {
-                binding: 1,
-                visibility: wgpu::ShaderStages::FRAGMENT,
-                ty: wgpu::BindingType::Texture {
-                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                    view_dimension: wgpu::TextureViewDimension::D3,
-                    multisampled: false,
-                },
-                count: None,
-            },
-            wgpu::BindGroupLayoutEntry {
-                binding: 2,
-                visibility: wgpu::ShaderStages::FRAGMENT,
-                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                count: None,
-            },
-            wgpu::BindGroupLayoutEntry {
-                binding: 3,
-                visibility: wgpu::ShaderStages::FRAGMENT,
-                ty: wgpu::BindingType::Texture {
-                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                    view_dimension: wgpu::TextureViewDimension::D3,
-                    multisampled: false,
-                },
-                count: None,
-            },
-        ];
-        wgpu::BindGroupLayoutDescriptor {
+impl BindGroupLayoutDef for AtmosphereBGLayout {
+    const LAYOUT: &'static wgpu::BindGroupLayoutDescriptor<'static> =
+        &wgpu::BindGroupLayoutDescriptor {
             label: Some("Atmosphere BG Layout"),
-            entries: &ENTRIES,
-        }
-    }
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: std::num::NonZero::new(
+                            std::mem::size_of::<AtmosphereUniform>() as u64,
+                        ),
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D3,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D3,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+            ],
+        };
 
-    fn library(&self) -> &str {
-        "\
+    const LIBRARY: &'static str = "\
 struct AtmosphereUniform {
     sun_direction: vec3<f32>,
     sun_angular_radius: f32,
     fog_density: f32,
     sun_intensity: f32,
     lut_w: f32,
-    _pad: f32,
+    night_factor: f32,
 };
 
 @group(#BIND_GROUP) @binding(0)
@@ -142,8 +139,7 @@ var sky_lut: texture_3d<f32>;
 var sky_sampler: sampler;
 @group(#BIND_GROUP) @binding(3)
 var fog_lut: texture_3d<f32>;
-"
-    }
+";
 }
 
 // --- Sun orbit ---
@@ -467,7 +463,7 @@ impl AtmosphereResources {
             mapped_at_creation: false,
         });
 
-        let bg_layout = device.create_bind_group_layout(&AtmosphereBGLayout.layout());
+        let bg_layout = device.create_bind_group_layout(AtmosphereBGLayout::LAYOUT);
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("Atmosphere BG"),
             layout: &bg_layout,
@@ -492,15 +488,15 @@ impl AtmosphereResources {
         });
 
         // Sky pipeline
-        let camera_layout = device.create_bind_group_layout(&render::CameraBGLayout.layout());
+        let camera_layout = device.create_bind_group_layout(render::CameraBGLayout::LAYOUT);
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("Sky pipeline layout"),
             bind_group_layouts: &[&camera_layout, &bg_layout],
             push_constant_ranges: &[],
         });
 
-        let camera_wgsl = render::CameraBGLayout.library().replace("#BIND_GROUP", "0");
-        let atmo_wgsl = AtmosphereBGLayout.library().replace("#BIND_GROUP", "1");
+        let camera_wgsl = render::CameraBGLayout::LIBRARY.replace("#BIND_GROUP", "0");
+        let atmo_wgsl = AtmosphereBGLayout::LIBRARY.replace("#BIND_GROUP", "1");
         let sky_shader_src = include_str!("sky.wgsl");
         let full_source = format!("{camera_wgsl}\n{atmo_wgsl}\n{sky_shader_src}");
 
@@ -547,13 +543,14 @@ impl AtmosphereResources {
         // Upload initial uniform
         let lut_w = sun_dir.0[1].atan2(sun_dir.0[0]).rem_euclid(std::f32::consts::TAU)
             / std::f32::consts::TAU;
+        let night_factor = ((0.1 - sun_dir.0[1]) / 0.2).clamp(0.0, 1.0);
         let uniform = AtmosphereUniform {
             sun_direction: sun_dir.0,
             sun_angular_radius: config.sun_angular_radius,
             fog_density: config.fog_density,
             sun_intensity: config.sun_intensity,
             lut_w,
-            _pad: 0.0,
+            night_factor,
         };
         queue.write_buffer(&uniform_buffer, 0, bytemuck::bytes_of(&uniform));
 
@@ -577,13 +574,14 @@ impl AtmosphereResources {
     ) {
         let lut_w = sun_dir.0[1].atan2(sun_dir.0[0]).rem_euclid(std::f32::consts::TAU)
             / std::f32::consts::TAU;
+        let night_factor = ((0.1 - sun_dir.0[1]) / 0.2).clamp(0.0, 1.0);
         let uniform = AtmosphereUniform {
             sun_direction: sun_dir.0,
             sun_angular_radius: config.sun_angular_radius,
             fog_density: config.fog_density,
             sun_intensity: config.sun_intensity,
             lut_w,
-            _pad: 0.0,
+            night_factor,
         };
         queue.write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&uniform));
     }
