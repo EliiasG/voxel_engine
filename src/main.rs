@@ -573,17 +573,17 @@ fn update_camera(
 
     uniform.frame_index = (frame_count.0 % 16) as u32;
 
-    if taa_enabled.0 {
-        // Fill prev fields from TaaResources (stored last frame)
-        if taa_res.prev_valid {
-            uniform.prev_jittered_view_proj = taa_res.prev_jittered_view_proj;
-            uniform.prev_chunk_offset = taa_res.prev_chunk_offset;
-        } else {
-            uniform.prev_jittered_view_proj = uniform.view_proj;
-            uniform.prev_chunk_offset = uniform.chunk_offset;
-        }
+    // Previous frame data — needed by both TAA resolve and shadow temporal reprojection
+    if taa_res.prev_valid {
+        uniform.prev_jittered_view_proj = taa_res.prev_jittered_view_proj;
+        uniform.prev_chunk_offset = taa_res.prev_chunk_offset;
+    } else {
+        uniform.prev_jittered_view_proj = uniform.view_proj;
+        uniform.prev_chunk_offset = uniform.chunk_offset;
+    }
 
-        // Apply sub-pixel jitter
+    // Sub-pixel jitter (TAA only)
+    if taa_enabled.0 {
         let (jx, jy) = camera::taa_jitter(uniform.frame_index);
         uniform.jitter_offset = [jx, -jy];
         camera::apply_jitter(
@@ -593,12 +593,12 @@ fn update_camera(
             uniform.screen_size[0],
             uniform.screen_size[1],
         );
-
-        // Store this frame's jittered data for next frame's reprojection
-        taa_res.prev_jittered_view_proj = uniform.view_proj;
-        taa_res.prev_chunk_offset = uniform.chunk_offset;
-        taa_res.prev_valid = true;
     }
+
+    // Store this frame's data for next frame's reprojection
+    taa_res.prev_jittered_view_proj = uniform.view_proj;
+    taa_res.prev_chunk_offset = uniform.chunk_offset;
+    taa_res.prev_valid = true;
 
     // Inverse of (possibly jittered) VP for depth reconstruction
     uniform.inv_view_proj = camera::invert_mat4(&uniform.view_proj);
