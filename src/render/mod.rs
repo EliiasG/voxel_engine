@@ -613,8 +613,8 @@ pub fn synchronize_gpu(
     device: Res<modul_core::DeviceRes>,
     queue: Res<modul_core::QueueRes>,
     config: Res<crate::chunk::loading::LoadConfig>,
-    camera: Res<crate::Camera>,
     debug: Res<crate::DebugMode>,
+    cam_query: Query<(&crate::camera::Position, &crate::camera::FlyCamera, &crate::camera::CameraConfig), With<crate::camera::MainCamera>>,
 ) {
     for (entity, pos, lod, faces) in query.iter() {
         // Deallocate old pages
@@ -698,15 +698,17 @@ pub fn synchronize_gpu(
         let slab_count = gpu.slabs.len();
 
         // Compute frustum planes for culling (frozen in debug mode)
-        let (frustum_planes, frustum_chunk_offset) = match debug.frozen {
-            Some(ref f) => (f.planes, f.chunk_pos),
-            None => {
-                let u = camera.0.uniform();
-                (
-                    crate::camera::extract_frustum_planes(&u.view_proj),
-                    IVec3::from_array(u.chunk_offset),
-                )
-            }
+        let (frustum_planes, frustum_chunk_offset, cam_world) = if let Some(ref f) = debug.frozen {
+            (f.planes, f.chunk_pos, f.camera_world)
+        } else if let Ok((pos, fly, config)) = cam_query.get_single() {
+            let cam = crate::camera::compute_camera(pos, &crate::camera::Rotation(fly.rotation()), config, 16.0 / 9.0);
+            (
+                crate::camera::extract_frustum_planes(&cam.view_proj),
+                IVec3::from_array(cam.chunk_offset),
+                pos.0,
+            )
+        } else {
+            return;
         };
 
         // args_per_slab_lod[slab][lod] = Vec<DrawIndirectArgs>
@@ -715,10 +717,6 @@ pub fn synchronize_gpu(
             .collect();
 
         let mut frustum_culled = 0u32;
-        let cam_world = match debug.frozen {
-            Some(ref f) => f.camera_world,
-            None => camera.0.position,
-        };
 
         for entry in render_data.entries.values() {
             if entry.lod > 0

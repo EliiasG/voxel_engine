@@ -54,7 +54,6 @@ fn build_job_queue(config: &LoadConfig) -> VecDeque<LoadJob> {
 
 /// Main loader system: tracks camera, unloads distant chunks, spawns new ones via job queue.
 pub fn update_loader(
-    camera: Res<crate::Camera>,
     debug: Res<crate::DebugMode>,
     config: Res<LoadConfig>,
     mut loader: ResMut<Loader>,
@@ -66,11 +65,14 @@ pub fn update_loader(
     mut bitmask_pool: ResMut<crate::render::shadow::grid::BitmaskPool>,
     mut commands: Commands,
     chunk_data_query: Query<(), With<ChunkData>>,
+    cam_query: Query<&crate::camera::Position, With<crate::camera::MainCamera>>,
 ) {
     let camera_chunk = if let Some(ref frozen) = debug.frozen {
         frozen.chunk_pos
+    } else if let Ok(pos) = cam_query.get_single() {
+        crate::camera::chunk_pos(pos)
     } else {
-        camera.0.chunk_pos()
+        return;
     };
 
     // Detect camera chunk change

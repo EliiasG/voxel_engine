@@ -25,10 +25,7 @@ use winit::event::{DeviceEvent, ElementState, Event, KeyEvent, WindowEvent};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{CursorGrabMode, WindowAttributes};
 
-use camera::FlyCamera;
-
-#[derive(Resource)]
-struct Camera(FlyCamera);
+use camera::{FlyCamera, Position, Rotation, CameraConfig, MainCamera, CullCamera};
 
 #[derive(Resource)]
 struct FrameCount(u64);
@@ -279,12 +276,22 @@ fn init_window(
 }
 
 fn init_gameplay(mut commands: Commands) {
-    let mut cam = FlyCamera::new([0.0, 300.0, 200.0]);
-    cam.pitch = -0.3;
-    cam.speed = 100.0;
-    cam.far = 50000.0;
+    let mut fly = FlyCamera::default();
+    fly.pitch = -0.3;
+    fly.speed = 100.0;
 
-    commands.insert_resource(Camera(cam));
+    commands.spawn((
+        Position([0.0, 300.0, 200.0]),
+        Rotation(fly.rotation()),
+        CameraConfig {
+            fov_y: 70.0f32.to_radians(),
+            near: 0.1,
+            far: 50000.0,
+        },
+        fly,
+        MainCamera,
+    ));
+
     commands.insert_resource(FrameCount(0));
     commands.insert_resource(DayCycle::default());
     commands.insert_resource(DebugMode::default());
@@ -307,7 +314,6 @@ fn process_input(
     mut input: ResMut<InputState>,
     mut wireframe: ResMut<render::Wireframe>,
     mut debug: ResMut<DebugMode>,
-    mut camera: ResMut<Camera>,
     mut taa_enabled: ResMut<render::taa::TaaEnabled>,
     render_data: Res<render::ChunkRenderData>,
     gpu: Res<render::GpuBuffers>,
@@ -319,12 +325,15 @@ fn process_input(
     needs_gen_q: Query<(), With<chunk::NeedsGeneration>>,
     needs_remesh_q: Query<(), With<chunk::meshing::NeedsRemesh>>,
     window_query: Query<&WindowComponent, With<MainWindow>>,
+    mut cam_query: Query<(&mut Position, &mut FlyCamera, &CameraConfig), With<MainCamera>>,
 ) {
     let now = std::time::Instant::now();
     input.dt = now.duration_since(input.last_instant).as_secs_f32();
     input.last_instant = now;
     input.mouse_dx = 0.0;
     input.mouse_dy = 0.0;
+
+    let Ok((mut cam_pos, mut fly_cam, cam_config)) = cam_query.get_single_mut() else { return };
 
     for event in events.events() {
         match event {
@@ -367,18 +376,20 @@ fn process_input(
                                 debug.frozen = None;
                                 println!("Debug mode OFF");
                             } else {
-                                let u = camera.0.uniform();
+                                let cp = camera::chunk_pos(&cam_pos);
+                                // We need view_proj for frustum planes — compute it temporarily
+                                let cam = camera::compute_camera(&cam_pos, &Rotation(fly_cam.rotation()), cam_config, 16.0/9.0);
                                 debug.frozen = Some(FrozenCulling {
-                                    chunk_pos: glam::IVec3::from_array(u.chunk_offset),
-                                    planes: camera::extract_frustum_planes(&u.view_proj),
-                                    camera_world: camera.0.position,
+                                    chunk_pos: cp,
+                                    planes: camera::extract_frustum_planes(&cam.view_proj),
+                                    camera_world: cam_pos.0,
                                 });
                                 println!("Debug mode ON - frustum & loading frozen, fly freely to inspect");
                             }
                         }
                         KeyCode::F12 => {
-                            let pos = camera.0.position;
-                            let cp = camera.0.chunk_pos();
+                            let pos = cam_pos.0;
+                            let cp = camera::chunk_pos(&cam_pos);
                             println!("=== DEBUG (frame {}) ===", frame_count.0);
                             println!("  Pos: ({:.1}, {:.1}, {:.1})", pos[0], pos[1], pos[2]);
                             println!("  Chunk: ({}, {}, {})", cp.x, cp.y, cp.z);
@@ -479,7 +490,7 @@ fn process_input(
                     winit::event::MouseScrollDelta::PixelDelta(pos) => pos.y / 30.0,
                 };
                 let factor = 1.15f32.powf(y as f32);
-                camera.0.speed = (camera.0.speed * factor).clamp(1.0, 1000.0);
+                fly_cam.speed = (fly_cam.speed * factor).clamp(1.0, 1000.0);
             }
 
             _ => {}
@@ -487,7 +498,7 @@ fn process_input(
     }
 
     if input.mouse_dx != 0.0 || input.mouse_dy != 0.0 {
-        camera.0.rotate(input.mouse_dx, input.mouse_dy);
+        fly_cam.rotate(input.mouse_dx, input.mouse_dy);
     }
 
     let dt = input.dt.min(0.1);
@@ -510,7 +521,7 @@ fn process_input(
     }
 
     if forward != 0.0 || right != 0.0 || up != 0.0 {
-        camera.0.move_dir(forward, right, up, dt);
+        fly_cam.move_dir(&mut cam_pos, forward, right, up, dt);
     }
 }
 
@@ -528,7 +539,6 @@ fn update_day_cycle(
 }
 
 fn update_camera(
-    mut camera: ResMut<Camera>,
     mut frame_count: ResMut<FrameCount>,
     mut fps: ResMut<FpsCounter>,
     mut taa_res: ResMut<render::taa::TaaResources>,
@@ -538,6 +548,7 @@ fn update_camera(
     camera_bg: Res<render::CameraBindGroup>,
     rt_query: Query<&modul_render::SurfaceRenderTarget, With<MainWindow>>,
     window_query: Query<&WindowComponent, With<MainWindow>>,
+    cam_query: Query<(&Position, &FlyCamera, &CameraConfig), With<MainCamera>>,
 ) {
     frame_count.0 += 1;
     fps.frame_count += 1;
@@ -558,14 +569,18 @@ fn update_camera(
         }
     }
 
+    let Ok((cam_pos, fly_cam, cam_config)) = cam_query.get_single() else { return };
+
+    let mut aspect = 16.0 / 9.0;
     if let Ok(rt) = rt_query.get_single() {
         let (w, h) = modul_render::RenderTarget::size(rt);
         if w > 0 && h > 0 {
-            camera.0.aspect = w as f32 / h as f32;
+            aspect = w as f32 / h as f32;
         }
     }
 
-    let mut uniform = camera.0.uniform();
+    let cam = camera::compute_camera(cam_pos, &Rotation(fly_cam.rotation()), cam_config, aspect);
+    let mut uniform = camera::CameraUniform::from_camera(&cam);
     if let Ok(rt) = rt_query.get_single() {
         let (w, h) = modul_render::RenderTarget::size(rt);
         uniform.screen_size = [w as f32, h as f32];

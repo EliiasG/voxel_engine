@@ -415,8 +415,8 @@ impl ShadowPassResources {
 // --- Systems ---
 
 pub fn update_previous_frame_data(
-    camera: Res<crate::Camera>,
     mut prev: ResMut<PreviousFrameData>,
+    cam_query: Query<(&crate::camera::Position, &crate::camera::FlyCamera, &crate::camera::CameraConfig), With<crate::camera::MainCamera>>,
 ) {
     // Promote staging → active (now matches the depth buffer from last frame)
     prev.inv_view_proj = prev.next_inv_view_proj;
@@ -425,11 +425,13 @@ pub fn update_previous_frame_data(
     prev.valid = prev.next_valid;
 
     // Store current frame's data in staging (will be used next frame)
-    let uniform = camera.0.uniform();
-    prev.next_view_proj = uniform.view_proj;
-    prev.next_inv_view_proj = crate::camera::invert_mat4(&uniform.view_proj);
-    prev.next_chunk_offset = uniform.chunk_offset;
-    prev.next_valid = true;
+    if let Ok((pos, fly, config)) = cam_query.get_single() {
+        let cam = crate::camera::compute_camera(pos, &crate::camera::Rotation(fly.rotation()), config, 16.0 / 9.0);
+        prev.next_view_proj = cam.view_proj;
+        prev.next_inv_view_proj = crate::camera::invert_mat4(&cam.view_proj);
+        prev.next_chunk_offset = cam.chunk_offset;
+        prev.next_valid = true;
+    }
 }
 
 // --- Operations ---
@@ -527,8 +529,12 @@ impl Operation for ShadowTraceOperation {
         // Build uniform from CURRENT frame's camera (no one-frame delay)
         let uniform = {
             let scale = world.resource::<ShadowConfig>().scale_denominator;
-            let camera = world.resource::<crate::Camera>();
-            let cam_uniform = camera.0.uniform(); // unjittered — for motion detection
+            // Query camera entity for unjittered VP (for motion detection)
+            let cam_data = {
+                let mut q = world.query_filtered::<(&crate::camera::Position, &crate::camera::FlyCamera, &crate::camera::CameraConfig), bevy_ecs::prelude::With<crate::camera::MainCamera>>();
+                let (pos, fly, config) = q.single(world);
+                crate::camera::compute_camera(pos, &crate::camera::Rotation(fly.rotation()), config, 16.0 / 9.0)
+            };
             let taa_res = world.resource::<render::taa::TaaResources>();
             // The shadow depth pass rendered with the jittered VP (from camera bind group),
             // so we must reconstruct world positions using the same jittered VP's inverse.
@@ -541,13 +547,13 @@ impl Operation for ShadowTraceOperation {
             let (sw, sh) = shadow_res.current_size;
             // Detect camera motion using unjittered VP (jitter changes every frame)
             let moving = if prev.valid {
-                cam_uniform.view_proj != prev.view_proj || cam_uniform.chunk_offset != prev.chunk_offset
+                cam_data.view_proj != prev.view_proj || cam_data.chunk_offset != prev.chunk_offset
             } else {
                 false
             };
             ShadowPassUniform {
                 inv_view_proj: crate::camera::invert_mat4(&jittered_vp),
-                chunk_offset: cam_uniform.chunk_offset,
+                chunk_offset: cam_data.chunk_offset,
                 _pad0: 0,
                 sun_direction: sun.0,
                 max_ray_distance: 512.0,
@@ -555,8 +561,8 @@ impl Operation for ShadowTraceOperation {
                 grid_size: grid.grid_size,
                 frame_index: (fc % 4) as u32,
                 camera_moving: if moving { 1 } else { 0 },
-                prev_view_proj: if prev.valid { prev.view_proj } else { cam_uniform.view_proj },
-                prev_chunk_offset: if prev.valid { prev.chunk_offset } else { cam_uniform.chunk_offset },
+                prev_view_proj: if prev.valid { prev.view_proj } else { cam_data.view_proj },
+                prev_chunk_offset: if prev.valid { prev.chunk_offset } else { cam_data.chunk_offset },
                 _pad2: 0,
                 shadow_tex_size: [sw as f32, sh as f32],
                 scale_factor: scale as f32,
