@@ -497,8 +497,9 @@ impl AtmosphereResources {
 
         let camera_wgsl = render::CameraBGLayout::LIBRARY.replace("#BIND_GROUP", "0");
         let atmo_wgsl = AtmosphereBGLayout::LIBRARY.replace("#BIND_GROUP", "1");
+        let sky_sample_wgsl = include_str!("sky_sample.wgsl");
         let sky_shader_src = include_str!("sky.wgsl");
-        let full_source = format!("{camera_wgsl}\n{atmo_wgsl}\n{sky_shader_src}");
+        let full_source = format!("{camera_wgsl}\n{atmo_wgsl}\n{sky_sample_wgsl}\n{sky_shader_src}");
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Sky shader"),

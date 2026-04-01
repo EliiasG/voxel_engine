@@ -140,90 +140,22 @@ fn vs_main(
     return out;
 }
 
-@fragment
-fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
+fn evaluate_material(in: VertexOutput) -> Surface {
     let abs_y = in.world_pos.y + f32(camera.chunk_offset.y * CHUNK_SIZE);
-    let height_color = clamp(abs_y / 96.0, 0.0, 1.0);
+    let height_color = clamp(abs_y / 500.0, 0.0, 1.0);
     let base_color = vec3<f32>(
         0.3 + 0.4 * (1.0 - height_color),
         0.4 + 0.5 * height_color,
         0.2 + 0.2 * height_color,
     );
 
-    let light_dir = atmosphere.sun_direction;
-    let raw_ndotl = dot(in.normal, light_dir);
-    let ndotl = max(raw_ndotl, 0.0);
+    return Surface(base_color, in.normal, in.world_pos, in.clip_position, in.ao);
+}
 
-    // Edge-aware shadow upscale: 3x3 neighborhood with hard accept/reject
-    let shadow_uv = in.clip_position.xy / camera.screen_size;
-    let shadow_dims = vec2<f32>(textureDimensions(shadow_mask));
-    let frag_height = dot(in.world_pos, in.normal);
-
-    // Find the nearest texel and search a 3x3 neighborhood around it
-    let center_texel = shadow_uv * shadow_dims - 0.5;
-    let center_i = vec2<i32>(round(center_texel));
-    let dims_i = vec2<i32>(shadow_dims);
-
-    var total_shadow = 0.0;
-    var total_weight = 0.0;
-    var best_shadow = 0.0;
-    var best_dist = 999.0;
-    for (var dy = -1; dy <= 1; dy++) {
-        for (var dx = -1; dx <= 1; dx++) {
-            let tc = clamp(center_i + vec2<i32>(dx, dy), vec2<i32>(0), dims_i - 1);
-            let ss = textureLoad(shadow_mask, tc, 0);
-            let n = textureLoad(shadow_normal, tc, 0).xyz * 2.0 - 1.0;
-            let height_diff = abs(ss.g - frag_height);
-            if (dot(n, in.normal) > 0.9 && height_diff < 0.3) {
-                // Weight by distance from fragment's sub-texel position
-                let d = vec2<f32>(tc) + 0.5 - (center_texel + 0.5);
-                let w = 1.0 / (1.0 + dot(d, d)); // inverse distance weight
-                total_shadow += ss.r * w;
-                total_weight += w;
-            }
-            // Track closest texel as fallback
-            let spatial_d = length(vec2<f32>(tc) - center_texel);
-            if (spatial_d < best_dist) {
-                best_dist = spatial_d;
-                best_shadow = ss.r;
-            }
-        }
-    }
-
-    var shadow_val: f32;
-    if (total_weight > 0.001) {
-        shadow_val = total_shadow / total_weight;
-    } else {
-        shadow_val = best_shadow;
-    }
-
-    // Faces pointing away from sun are always in shadow regardless of mask
-    let shadow = select(shadow_val, 0.0, raw_ndotl <= 0.0);
-
-    // Indirect sky light — surfaces facing up are brighter even in shadow
-    let sky_light = max(in.normal.y * 0.5 + 0.5, 0.0) * 0.15;
-
-    // Shadow doesn't fully kill diffuse — scattered light remains
-    let effective_shadow = mix(0.0, 1.0, shadow);
-    let ambient = 0.25;
-    let diffuse = 0.7 * ndotl * effective_shadow;
-    let ao = mix(0.4, 1.0, in.ao);
-    let lit_color = base_color * (ambient * ao + sky_light * ao + diffuse);
-
-    // Exponential distance fog — blend toward sky horizon color
-    let view_dir = normalize(in.world_pos - camera.camera_local_pos);
-    let sun_yaw = atan2(atmosphere.sun_direction.x, atmosphere.sun_direction.z);
-    let fog_yaw = atan2(view_dir.x, view_dir.z);
-    let fog_rel_yaw = fog_yaw - sun_yaw;
-    let fog_u = fog_rel_yaw / (2.0 * 3.14159265359) + 0.5;
-    let fog_elevation = asin(clamp(view_dir.y, 0.15, 1.0)*0.8); // clamp to at/above horizon
-    let fog_v = (fog_elevation) / 3.14159265359 + 0.5;
-    let fog_color = textureSample(fog_lut, sky_sampler, vec3<f32>(fog_u, fog_v, atmosphere.lut_w)).rgb;
-    let dist = length(in.world_pos);
-    let fog_factor = 1.0 - exp(-dist * atmosphere.fog_density);
-    let final_color = mix(lit_color, fog_color, fog_factor);
-
-    return vec4<f32>(final_color, 1.0);
+@fragment
+fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
+    let surface = evaluate_material(in);
+    return apply_lighting(surface);
 }
 
 @fragment

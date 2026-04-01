@@ -445,13 +445,15 @@ pub fn init_pipelines(
     shaders: &mut Assets<ShaderModule>,
     layouts: &mut Assets<PipelineLayout>,
 ) -> VoxelPipeline {
-    // Compose shader from bind group libraries + main shader
+    // Compose shader: bind group libraries + shared snippets + geometry shader
     let camera_wgsl = CameraBGLayout::LIBRARY.replace("#BIND_GROUP", "0");
     let metadata_wgsl = MetadataBGLayout::LIBRARY.replace("#BIND_GROUP", "1");
     let shadow_mask_wgsl = ShadowMaskBGLayout::LIBRARY.replace("#BIND_GROUP", "2");
     let atmosphere_wgsl = crate::atmosphere::AtmosphereBGLayout::LIBRARY.replace("#BIND_GROUP", "3");
+    let sky_sample_wgsl = include_str!("sky_sample.wgsl");
+    let lighting_wgsl = include_str!("lighting.wgsl");
     let full_source = format!(
-        "{camera_wgsl}\n{metadata_wgsl}\n{shadow_mask_wgsl}\n{atmosphere_wgsl}\n{}",
+        "{camera_wgsl}\n{metadata_wgsl}\n{shadow_mask_wgsl}\n{atmosphere_wgsl}\n{sky_sample_wgsl}\n{lighting_wgsl}\n{}",
         include_str!("voxel.wgsl")
     );
 

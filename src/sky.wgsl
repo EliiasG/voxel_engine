@@ -1,4 +1,4 @@
-const PI: f32 = 3.14159265359;
+// sky_sample.wgsl is concatenated before this file, providing PI and night_sky_gradient().
 
 struct SkyVaryings {
     @builtin(position) position: vec4<f32>,
@@ -35,21 +35,37 @@ fn fs_sky(in: SkyVaryings) -> @location(0) vec4<f32> {
 
     let lut_u = rel_yaw / (2.0 * PI) + 0.5; // [-π, π] → [0, 1], wraps via Repeat sampler
 
-    var final_color: vec3<f32>;
-    if elevation < 0.0 {
-        // Below horizon: use fog LUT (no glow) at fixed elevation — matches fog color
-        final_color = textureSample(fog_lut, sky_sampler, vec3<f32>(lut_u, 0.56, atmosphere.lut_w)).rgb;
-    } else {
-        // Above horizon: full sky with Mie glow + sun disk
-        let lut_v = elevation / PI + 0.5;
-        let sky_color = textureSample(sky_lut, sky_sampler, vec3<f32>(lut_u, lut_v, atmosphere.lut_w)).rgb;
+    // Above-horizon sky (clamp LUT elevation just above horizon to avoid ground-hit dark band)
+    let sky_elev = max(elevation, 0.02);
+    let lut_v = sky_elev / PI + 0.5;
+    let sky_color = textureSample(sky_lut, sky_sampler, vec3<f32>(lut_u, lut_v, atmosphere.lut_w)).rgb;
+    let night_grad = night_sky_gradient(sky_elev) * atmosphere.night_factor;
+    let sky_with_night = max(sky_color, night_grad);
 
-        let cos_sun_angle = dot(view_dir, atmosphere.sun_direction);
-        let sun_edge = cos(atmosphere.sun_angular_radius);
-        let sun_disk = smoothstep(sun_edge - 0.0005, sun_edge, cos_sun_angle) * atmosphere.sun_intensity;
+    // Sun disk at true 3D position
+    let cos_sun_angle = dot(view_dir, atmosphere.sun_direction);
+    let sun_edge = cos(atmosphere.sun_angular_radius);
+    let sun_disk = smoothstep(sun_edge - 0.0005, sun_edge, cos_sun_angle) * atmosphere.sun_intensity;
 
-        final_color = sky_color + vec3<f32>(sun_disk);
-    }
+    // Moon disk (opposite the sun)
+    let moon_dir = -atmosphere.sun_direction;
+    let cos_moon = dot(view_dir, moon_dir);
+    let moon_edge = cos(atmosphere.sun_angular_radius * 2.0);
+    let moon_disk = smoothstep(moon_edge - 0.001, moon_edge, cos_moon)
+        * 0.3 * atmosphere.night_factor;
+    let moon_color = vec3<f32>(0.7, 0.8, 1.0) * moon_disk;
+
+    let above_color = sky_with_night + vec3<f32>(sun_disk) + moon_color;
+
+    // Below-horizon: fog LUT + subtle night horizon glow
+    let fog_color = textureSample(fog_lut, sky_sampler, vec3<f32>(lut_u, 0.56, atmosphere.lut_w)).rgb;
+    let below_t = clamp(-elevation / (PI * 0.15), 0.0, 1.0);
+    let night_below = mix(vec3<f32>(0.004, 0.006, 0.018), vec3<f32>(0.001, 0.001, 0.004), below_t);
+    let below_color = max(fog_color, night_below * atmosphere.night_factor);
+
+    // Smooth horizon blend instead of hard if/else
+    let horizon_blend = smoothstep(-0.05, 0.05, elevation);
+    var final_color = mix(below_color, above_color, horizon_blend);
 
     return vec4<f32>(final_color, 1.0);
 }
