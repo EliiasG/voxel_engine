@@ -605,19 +605,25 @@ pub struct SkyPassOperation;
 
 impl Operation for SkyPassOperation {
     fn run(&mut self, world: &mut World, command_encoder: &mut CommandEncoder) {
-        // Get scene texture view and depth view from TaaResources and surface
-        let scene_view_ptr: *const wgpu::TextureView;
+        // Color target: scene texture (TAA on) or surface (TAA off)
+        let taa_enabled = world.resource::<crate::render::taa::TaaEnabled>().0;
+        let color_view_ptr: *const wgpu::TextureView;
         let depth_view_ptr: *const wgpu::TextureView;
         let pipeline_ptr: *const wgpu::RenderPipeline;
         let atmo_bg_ptr: *const wgpu::BindGroup;
-        {
+        let main_window = world
+            .query_filtered::<bevy_ecs::prelude::Entity, bevy_ecs::prelude::With<modul_core::MainWindow>>()
+            .single(world);
+        if taa_enabled {
             let taa_res = world.resource::<crate::render::taa::TaaResources>();
-            scene_view_ptr = &taa_res.scene_view as *const _;
+            color_view_ptr = &taa_res.scene_view as *const _;
+        } else {
+            let surface_rt = world
+                .get::<modul_render::SurfaceRenderTarget>(main_window)
+                .unwrap();
+            color_view_ptr = modul_render::RenderTarget::texture_view(surface_rt).unwrap() as *const _;
         }
         {
-            let main_window = world
-                .query_filtered::<bevy_ecs::prelude::Entity, bevy_ecs::prelude::With<modul_core::MainWindow>>()
-                .single(world);
             let surface_rt = world
                 .get::<modul_render::SurfaceRenderTarget>(main_window)
                 .unwrap();
@@ -630,7 +636,7 @@ impl Operation for SkyPassOperation {
         }
 
         // SAFETY: All views/resources live in World storage, stable during run().
-        let scene_view = unsafe { &*scene_view_ptr };
+        let scene_view = unsafe { &*color_view_ptr };
         let depth_view = unsafe { &*depth_view_ptr };
         let sky_pipeline = unsafe { &*pipeline_ptr };
         let atmo_bg = unsafe { &*atmo_bg_ptr };

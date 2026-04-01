@@ -193,16 +193,20 @@ fn main() {
         app.add_systems(
             Redraw,
             (
-                process_input,
-                chunk::loading::update_loader,
-                apply_deferred,
-                chunk::generation::poll_generation,
-                chunk::generation::start_generation,
-                apply_deferred,
-                chunk::meshing::resolve_changes,
-                apply_deferred,
-                chunk::meshing::poll_meshing,
-                chunk::meshing::start_meshing,
+                (
+                    process_input,
+                    chunk::loading::update_loader,
+                    apply_deferred,
+                    chunk::generation::poll_generation,
+                    chunk::generation::start_generation,
+                ).chain(),
+                (
+                    apply_deferred,
+                    chunk::meshing::resolve_changes,
+                    apply_deferred,
+                    chunk::meshing::poll_meshing,
+                    chunk::meshing::start_meshing,
+                ).chain(),
             )
                 .chain()
                 .before(RenderSystemSet),
@@ -304,6 +308,7 @@ fn process_input(
     mut wireframe: ResMut<render::Wireframe>,
     mut debug: ResMut<DebugMode>,
     mut camera: ResMut<Camera>,
+    mut taa_enabled: ResMut<render::taa::TaaEnabled>,
     render_data: Res<render::ChunkRenderData>,
     gpu: Res<render::GpuBuffers>,
     frame_count: Res<FrameCount>,
@@ -313,7 +318,6 @@ fn process_input(
     chunk_data_q: Query<(), With<chunk::ChunkData>>,
     needs_gen_q: Query<(), With<chunk::NeedsGeneration>>,
     needs_remesh_q: Query<(), With<chunk::meshing::NeedsRemesh>>,
-    has_faces_q: Query<(), With<chunk::meshing::ChunkFaces>>,
     window_query: Query<&WindowComponent, With<MainWindow>>,
 ) {
     let now = std::time::Instant::now();
@@ -354,6 +358,10 @@ fn process_input(
                             wireframe.0 = !wireframe.0;
                             println!("Wireframe: {}", wireframe.0);
                         }
+                        KeyCode::KeyT => {
+                            taa_enabled.0 = !taa_enabled.0;
+                            println!("TAA: {}", if taa_enabled.0 { "ON" } else { "OFF" });
+                        }
                         KeyCode::Tab => {
                             if debug.frozen.is_some() {
                                 debug.frozen = None;
@@ -383,18 +391,16 @@ fn process_input(
                                 let mut has_data = 0u32;
                                 let mut waiting_gen = 0u32;
                                 let mut waiting_mesh = 0u32;
-                                let mut has_faces = 0u32;
                                 let in_loaded_idx = loaded_index.0.iter()
                                     .filter(|(_, l)| *l == lod as u8).count();
                                 for (_, &entity) in lod_maps.maps[lod as usize].iter() {
                                     if chunk_data_q.get(entity).is_ok() { has_data += 1; }
                                     if needs_gen_q.get(entity).is_ok() { waiting_gen += 1; }
                                     if needs_remesh_q.get(entity).is_ok() { waiting_mesh += 1; }
-                                    if has_faces_q.get(entity).is_ok() { has_faces += 1; }
                                 }
                                 println!(
-                                    "  LOD {}: {} map, {} data, {} gen-wait, {} mesh-wait, {} faces, {} uploaded",
-                                    lod, in_map, has_data, waiting_gen, waiting_mesh, has_faces, in_loaded_idx
+                                    "  LOD {}: {} map, {} data, {} gen-wait, {} mesh-wait, {} uploaded",
+                                    lod, in_map, has_data, waiting_gen, waiting_mesh, in_loaded_idx
                                 );
                             }
                             let mut total_faces = 0u32;
@@ -526,6 +532,7 @@ fn update_camera(
     mut frame_count: ResMut<FrameCount>,
     mut fps: ResMut<FpsCounter>,
     mut taa_res: ResMut<render::taa::TaaResources>,
+    taa_enabled: Res<render::taa::TaaEnabled>,
     debug: Res<DebugMode>,
     queue: Res<QueueRes>,
     camera_bg: Res<render::CameraBindGroup>,
@@ -564,34 +571,37 @@ fn update_camera(
         uniform.screen_size = [w as f32, h as f32];
     }
 
-    // Fill prev fields from TaaResources (stored last frame)
     uniform.frame_index = (frame_count.0 % 16) as u32;
-    if taa_res.prev_valid {
-        uniform.prev_jittered_view_proj = taa_res.prev_jittered_view_proj;
-        uniform.prev_chunk_offset = taa_res.prev_chunk_offset;
-    } else {
-        uniform.prev_jittered_view_proj = uniform.view_proj;
-        uniform.prev_chunk_offset = uniform.chunk_offset;
+
+    if taa_enabled.0 {
+        // Fill prev fields from TaaResources (stored last frame)
+        if taa_res.prev_valid {
+            uniform.prev_jittered_view_proj = taa_res.prev_jittered_view_proj;
+            uniform.prev_chunk_offset = taa_res.prev_chunk_offset;
+        } else {
+            uniform.prev_jittered_view_proj = uniform.view_proj;
+            uniform.prev_chunk_offset = uniform.chunk_offset;
+        }
+
+        // Apply sub-pixel jitter
+        let (jx, jy) = camera::taa_jitter(uniform.frame_index);
+        uniform.jitter_offset = [jx, -jy];
+        camera::apply_jitter(
+            &mut uniform.view_proj,
+            jx,
+            jy,
+            uniform.screen_size[0],
+            uniform.screen_size[1],
+        );
+
+        // Store this frame's jittered data for next frame's reprojection
+        taa_res.prev_jittered_view_proj = uniform.view_proj;
+        taa_res.prev_chunk_offset = uniform.chunk_offset;
+        taa_res.prev_valid = true;
     }
 
-    // Apply sub-pixel jitter
-    let (jx, jy) = camera::taa_jitter(uniform.frame_index);
-    uniform.jitter_offset = [jx, -jy]; // y negated for UV-space (UV.y is flipped vs NDC.y)
-    camera::apply_jitter(
-        &mut uniform.view_proj,
-        jx,
-        jy,
-        uniform.screen_size[0],
-        uniform.screen_size[1],
-    );
-
-    // Inverse of jittered VP (for depth reconstruction in TAA resolve)
+    // Inverse of (possibly jittered) VP for depth reconstruction
     uniform.inv_view_proj = camera::invert_mat4(&uniform.view_proj);
-
-    // Store this frame's jittered data for next frame's reprojection
-    taa_res.prev_jittered_view_proj = uniform.view_proj;
-    taa_res.prev_chunk_offset = uniform.chunk_offset;
-    taa_res.prev_valid = true;
 
     queue
         .0

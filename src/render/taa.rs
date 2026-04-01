@@ -12,6 +12,9 @@ use crate::render;
 // --- Resources ---
 
 #[derive(Resource)]
+pub struct TaaEnabled(pub bool);
+
+#[derive(Resource)]
 pub struct TaaResources {
     /// Scene color texture — voxels render here instead of the surface
     pub scene_texture: wgpu::Texture,
@@ -236,11 +239,14 @@ pub struct TaaVoxelDrawOperation;
 
 impl Operation for TaaVoxelDrawOperation {
     fn run(&mut self, world: &mut World, command_encoder: &mut CommandEncoder) {
-        // Resize scene + history if window size changed
-        {
-            let main_window_entity = world
-                .query_filtered::<Entity, With<modul_core::MainWindow>>()
-                .single(world);
+        let taa_enabled = world.resource::<TaaEnabled>().0;
+
+        let main_window_entity = world
+            .query_filtered::<Entity, With<modul_core::MainWindow>>()
+            .single(world);
+
+        // Resize scene + history if TAA is on
+        if taa_enabled {
             let surface_rt = world
                 .get::<modul_render::SurfaceRenderTarget>(main_window_entity)
                 .unwrap();
@@ -251,33 +257,36 @@ impl Operation for TaaVoxelDrawOperation {
             });
         }
 
-        // Extract pointers we need before the render pass (avoids borrow conflicts)
+        // Color target: scene texture (TAA on) or surface (TAA off)
+        let color_view_ptr: *const wgpu::TextureView;
         let surface_format;
-        let scene_view_ptr: *const wgpu::TextureView;
-        let depth_view_ptr: *const wgpu::TextureView;
-        {
+        if taa_enabled {
             let taa_res = world.resource::<TaaResources>();
             surface_format = taa_res.surface_format;
-            scene_view_ptr = &taa_res.scene_view as *const _;
+            color_view_ptr = &taa_res.scene_view as *const _;
+        } else {
+            let surface_rt = world
+                .get::<modul_render::SurfaceRenderTarget>(main_window_entity)
+                .unwrap();
+            surface_format = surface_rt.texture().unwrap().format();
+            color_view_ptr = RenderTarget::texture_view(surface_rt).unwrap() as *const _;
         }
+
+        let depth_view_ptr: *const wgpu::TextureView;
         {
-            let main_window_entity = world
-                .query_filtered::<Entity, With<modul_core::MainWindow>>()
-                .single(world);
             let surface_rt = world
                 .get::<modul_render::SurfaceRenderTarget>(main_window_entity)
                 .unwrap();
             depth_view_ptr = surface_rt.depth_stencil_view().unwrap() as *const _;
         }
         // SAFETY: The views live in World resources/components, which are stable during run().
-        let scene_view = unsafe { &*scene_view_ptr };
+        let color_view = unsafe { &*color_view_ptr };
         let depth_view = unsafe { &*depth_view_ptr };
 
-        // Create render pass targeting scene_color + surface depth
         let mut pass = command_encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("TAA voxel draw pass"),
+            label: Some("Voxel draw pass"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: scene_view,
+                view: color_view,
                 resolve_target: None,
                 ops: wgpu::Operations {
                     load: wgpu::LoadOp::Clear(wgpu::Color {
@@ -289,7 +298,7 @@ impl Operation for TaaVoxelDrawOperation {
             depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                 view: depth_view,
                 depth_ops: Some(wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(0.0), // Reversed-Z: 0.0 = far/infinity
+                    load: wgpu::LoadOp::Clear(0.0),
                     store: wgpu::StoreOp::Store,
                 }),
                 stencil_ops: None,
@@ -356,6 +365,9 @@ pub struct TaaResolveOperation {
 
 impl Operation for TaaResolveOperation {
     fn run(&mut self, world: &mut World, command_encoder: &mut CommandEncoder) {
+        if !world.resource::<TaaEnabled>().0 {
+            return;
+        }
         // Handle resize
         {
             let surface_rt = world
@@ -495,4 +507,5 @@ pub fn init_taa(
 ) {
     let taa_res = TaaResources::new(&device.0, surface_fmt.0, 800, 600);
     commands.insert_resource(taa_res);
+    commands.insert_resource(TaaEnabled(true));
 }
