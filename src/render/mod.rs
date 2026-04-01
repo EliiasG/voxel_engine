@@ -614,7 +614,7 @@ pub fn synchronize_gpu(
     queue: Res<modul_core::QueueRes>,
     config: Res<crate::chunk::loading::LoadConfig>,
     debug: Res<crate::DebugMode>,
-    cam_query: Query<(&crate::camera::Position, &crate::camera::FlyCamera, &crate::camera::CameraConfig), With<crate::camera::MainCamera>>,
+    cam_query: Query<(&crate::camera::Position, &crate::camera::Camera), With<crate::camera::MainCamera>>,
 ) {
     for (entity, pos, lod, faces) in query.iter() {
         // Deallocate old pages
@@ -700,8 +700,7 @@ pub fn synchronize_gpu(
         // Compute frustum planes for culling (frozen in debug mode)
         let (frustum_planes, frustum_chunk_offset, cam_world) = if let Some(ref f) = debug.frozen {
             (f.planes, f.chunk_pos, f.camera_world)
-        } else if let Ok((pos, fly, config)) = cam_query.get_single() {
-            let cam = crate::camera::compute_camera(pos, &crate::camera::Rotation(fly.rotation()), config, 16.0 / 9.0);
+        } else if let Ok((pos, cam)) = cam_query.get_single() {
             (
                 crate::camera::extract_frustum_planes(&cam.view_proj),
                 IVec3::from_array(cam.chunk_offset),

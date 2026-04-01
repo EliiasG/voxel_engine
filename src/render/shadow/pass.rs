@@ -416,7 +416,7 @@ impl ShadowPassResources {
 
 pub fn update_previous_frame_data(
     mut prev: ResMut<PreviousFrameData>,
-    cam_query: Query<(&crate::camera::Position, &crate::camera::FlyCamera, &crate::camera::CameraConfig), With<crate::camera::MainCamera>>,
+    cam_query: Query<&crate::camera::Camera, With<crate::camera::MainCamera>>,
 ) {
     // Promote staging → active (now matches the depth buffer from last frame)
     prev.inv_view_proj = prev.next_inv_view_proj;
@@ -425,8 +425,7 @@ pub fn update_previous_frame_data(
     prev.valid = prev.next_valid;
 
     // Store current frame's data in staging (will be used next frame)
-    if let Ok((pos, fly, config)) = cam_query.get_single() {
-        let cam = crate::camera::compute_camera(pos, &crate::camera::Rotation(fly.rotation()), config, 16.0 / 9.0);
+    if let Ok(cam) = cam_query.get_single() {
         prev.next_view_proj = cam.view_proj;
         prev.next_inv_view_proj = crate::camera::invert_mat4(&cam.view_proj);
         prev.next_chunk_offset = cam.chunk_offset;
@@ -529,11 +528,10 @@ impl Operation for ShadowTraceOperation {
         // Build uniform from CURRENT frame's camera (no one-frame delay)
         let uniform = {
             let scale = world.resource::<ShadowConfig>().scale_denominator;
-            // Query camera entity for unjittered VP (for motion detection)
+            // Read the precomputed Camera component (unjittered VP for motion detection)
             let cam_data = {
-                let mut q = world.query_filtered::<(&crate::camera::Position, &crate::camera::FlyCamera, &crate::camera::CameraConfig), bevy_ecs::prelude::With<crate::camera::MainCamera>>();
-                let (pos, fly, config) = q.single(world);
-                crate::camera::compute_camera(pos, &crate::camera::Rotation(fly.rotation()), config, 16.0 / 9.0)
+                let mut q = world.query_filtered::<&crate::camera::Camera, bevy_ecs::prelude::With<crate::camera::MainCamera>>();
+                q.single(world).clone()
             };
             let taa_res = world.resource::<render::taa::TaaResources>();
             // The shadow depth pass rendered with the jittered VP (from camera bind group),

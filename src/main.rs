@@ -280,17 +280,16 @@ fn init_gameplay(mut commands: Commands) {
     fly.pitch = -0.3;
     fly.speed = 100.0;
 
-    commands.spawn((
-        Position([0.0, 300.0, 200.0]),
-        Rotation(fly.rotation()),
-        CameraConfig {
-            fov_y: 70.0f32.to_radians(),
-            near: 0.1,
-            far: 50000.0,
-        },
-        fly,
-        MainCamera,
-    ));
+    let pos = Position([0.0, 300.0, 200.0]);
+    let rot = Rotation(fly.rotation());
+    let config = CameraConfig {
+        fov_y: 70.0f32.to_radians(),
+        near: 0.1,
+        far: 50000.0,
+    };
+    let cam = camera::compute_camera(&pos, &rot, &config, 16.0 / 9.0);
+
+    commands.spawn((pos, rot, config, cam, fly, MainCamera));
 
     commands.insert_resource(FrameCount(0));
     commands.insert_resource(DayCycle::default());
@@ -548,7 +547,7 @@ fn update_camera(
     camera_bg: Res<render::CameraBindGroup>,
     rt_query: Query<&modul_render::SurfaceRenderTarget, With<MainWindow>>,
     window_query: Query<&WindowComponent, With<MainWindow>>,
-    cam_query: Query<(&Position, &FlyCamera, &CameraConfig), With<MainCamera>>,
+    mut cam_query: Query<(&Position, &FlyCamera, &CameraConfig, &mut camera::Camera), With<MainCamera>>,
 ) {
     frame_count.0 += 1;
     fps.frame_count += 1;
@@ -569,7 +568,7 @@ fn update_camera(
         }
     }
 
-    let Ok((cam_pos, fly_cam, cam_config)) = cam_query.get_single() else { return };
+    let Ok((cam_pos, fly_cam, cam_config, mut cam_component)) = cam_query.get_single_mut() else { return };
 
     let mut aspect = 16.0 / 9.0;
     if let Ok(rt) = rt_query.get_single() {
@@ -579,8 +578,9 @@ fn update_camera(
         }
     }
 
-    let cam = camera::compute_camera(cam_pos, &Rotation(fly_cam.rotation()), cam_config, aspect);
-    let mut uniform = camera::CameraUniform::from_camera(&cam);
+    // Compute and store Camera component so other systems can read it
+    *cam_component = camera::compute_camera(cam_pos, &Rotation(fly_cam.rotation()), cam_config, aspect);
+    let mut uniform = camera::CameraUniform::from_camera(&cam_component);
     if let Ok(rt) = rt_query.get_single() {
         let (w, h) = modul_render::RenderTarget::size(rt);
         uniform.screen_size = [w as f32, h as f32];
