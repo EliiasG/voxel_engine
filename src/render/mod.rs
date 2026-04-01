@@ -323,14 +323,184 @@ pub struct CameraBindGroup {
 }
 
 #[derive(Resource)]
-pub struct VoxelPipeline {
+pub struct Wireframe(pub bool);
+
+// --- Geometry Pipeline ---
+
+/// Pipeline set for a geometry type: full (lit), wireframe, and normal-only variants.
+pub struct GeometryPipeline {
     pub fill: AssetId<RenderPipelineManager>,
     pub wireframe: AssetId<RenderPipelineManager>,
-    pub normal_fill: AssetId<RenderPipelineManager>,
+    pub normal: AssetId<RenderPipelineManager>,
 }
 
+/// Builder for creating a [`GeometryPipeline`] from geometry-specific shaders and bind groups.
+/// Automatically appends shadow mask + atmosphere bind groups and shared lighting snippets
+/// for the full pipeline, and fs_normal for the normal-only pipeline.
+pub struct GeometryPipelineBuilder<'a> {
+    label: &'a str,
+    vertex_source: &'a str,
+    material_source: &'a str,
+    bind_group_libraries: Vec<String>,
+    bind_group_layouts: Vec<wgpu::BindGroupLayout>,
+    vertex_buffers: Vec<GenericVertexBufferLayout>,
+}
+
+impl<'a> GeometryPipelineBuilder<'a> {
+    pub fn new(label: &'a str) -> Self {
+        Self {
+            label,
+            vertex_source: "",
+            material_source: "",
+            bind_group_libraries: Vec::new(),
+            bind_group_layouts: Vec::new(),
+            vertex_buffers: Vec::new(),
+        }
+    }
+
+    /// Set the vertex shader source (shared between full and normal variants).
+    pub fn vertex_shader(mut self, source: &'a str) -> Self {
+        self.vertex_source = source;
+        self
+    }
+
+    /// Set the material evaluation + fs_main source (full pipeline only).
+    pub fn material_shader(mut self, source: &'a str) -> Self {
+        self.material_source = source;
+        self
+    }
+
+    /// Add a bind group (layout + WGSL library). Groups are numbered starting at 0 in the
+    /// order they are added. Shadow mask and atmosphere are appended automatically for the
+    /// full pipeline.
+    pub fn add_bind_group(mut self, device: &Device, def_layout: &wgpu::BindGroupLayoutDescriptor, library: &str) -> Self {
+        let group_index = self.bind_group_libraries.len();
+        self.bind_group_libraries.push(library.replace("#BIND_GROUP", &group_index.to_string()));
+        self.bind_group_layouts.push(device.create_bind_group_layout(def_layout));
+        self
+    }
+
+    /// Add a vertex buffer layout.
+    pub fn vertex_buffer(mut self, layout: GenericVertexBufferLayout) -> Self {
+        self.vertex_buffers.push(layout);
+        self
+    }
+
+    /// Build the geometry pipeline set (fill, wireframe, normal).
+    pub fn build(
+        self,
+        device: &Device,
+        pipelines: &mut Assets<RenderPipelineManager>,
+        shaders: &mut Assets<ShaderModule>,
+        layouts: &mut Assets<PipelineLayout>,
+    ) -> GeometryPipeline {
+        let geometry_bg_count = self.bind_group_libraries.len();
+        let geometry_bg_wgsl: String = self.bind_group_libraries.join("\n");
+
+        // Full shader: geometry BGs + shadow mask BG + atmosphere BG + shared snippets + vertex + material
+        let shadow_mask_index = geometry_bg_count;
+        let atmosphere_index = geometry_bg_count + 1;
+        let shadow_mask_wgsl = ShadowMaskBGLayout::LIBRARY.replace("#BIND_GROUP", &shadow_mask_index.to_string());
+        let atmosphere_wgsl = atmosphere::AtmosphereBGLayout::LIBRARY.replace("#BIND_GROUP", &atmosphere_index.to_string());
+        let sky_sample_wgsl = include_str!("shaders/sky_sample.wgsl");
+        let lighting_wgsl = include_str!("shaders/lighting.wgsl");
+        let full_source = format!(
+            "{geometry_bg_wgsl}\n{shadow_mask_wgsl}\n{atmosphere_wgsl}\n{sky_sample_wgsl}\n{lighting_wgsl}\n{}\n{}",
+            self.vertex_source, self.material_source,
+        );
+        let full_shader = shaders.add(device.create_shader_module(ShaderModuleDescriptor {
+            label: Some(&format!("{} shader (full)", self.label)),
+            source: ShaderSource::Wgsl(full_source.into()),
+        }));
+
+        // Normal shader: geometry BGs + vertex + fs_normal
+        let fs_normal_src = include_str!("shaders/fs_normal.wgsl");
+        let normal_source = format!("{geometry_bg_wgsl}\n{}\n{fs_normal_src}", self.vertex_source);
+        let normal_shader = shaders.add(device.create_shader_module(ShaderModuleDescriptor {
+            label: Some(&format!("{} shader (normal)", self.label)),
+            source: ShaderSource::Wgsl(normal_source.into()),
+        }));
+
+        // Full layout: geometry BGs + shadow mask + atmosphere
+        let shadow_mask_layout = device.create_bind_group_layout(ShadowMaskBGLayout::LAYOUT);
+        let atmosphere_layout = device.create_bind_group_layout(atmosphere::AtmosphereBGLayout::LAYOUT);
+        let mut full_layouts: Vec<&wgpu::BindGroupLayout> = self.bind_group_layouts.iter().collect();
+        full_layouts.push(&shadow_mask_layout);
+        full_layouts.push(&atmosphere_layout);
+        let full_layout = layouts.add(device.create_pipeline_layout(&PipelineLayoutDescriptor {
+            label: Some(&format!("{} pipeline layout (full)", self.label)),
+            bind_group_layouts: &full_layouts,
+            push_constant_ranges: &[],
+        }));
+
+        // Normal layout: geometry BGs only
+        let normal_bg_layouts: Vec<&wgpu::BindGroupLayout> = self.bind_group_layouts.iter().collect();
+        let normal_layout = layouts.add(device.create_pipeline_layout(&PipelineLayoutDescriptor {
+            label: Some(&format!("{} pipeline layout (normal)", self.label)),
+            bind_group_layouts: &normal_bg_layouts,
+            push_constant_ranges: &[],
+        }));
+
+        let make_desc = |shader, layout, polygon_mode, label: &str, frag_entry: &str| {
+            GenericRenderPipelineDescriptor {
+                resource_provider: Box::new(DirectRenderPipelineResourceProvider {
+                    layout,
+                    vertex_shader_module: shader,
+                    fragment_shader_module: shader,
+                }),
+                label: Some(label.into()),
+                vertex_state: GenericVertexState {
+                    entry_point: "vs_main".into(),
+                    buffers: self.vertex_buffers.clone(),
+                },
+                primitive: PrimitiveState {
+                    topology: PrimitiveTopology::TriangleList,
+                    strip_index_format: None,
+                    front_face: FrontFace::Ccw,
+                    cull_mode: Some(wgpu::Face::Back),
+                    unclipped_depth: false,
+                    polygon_mode,
+                    conservative: false,
+                },
+                depth_stencil: Some(GenericDepthStencilState {
+                    depth_write_enable: true,
+                    depth_compare: CompareFunction::GreaterEqual,
+                    stencil: StencilState::default(),
+                    bias: DepthBiasState::default(),
+                }),
+                multisample: GenericMultisampleState {
+                    mask: !0,
+                    alpha_to_coverage_enabled: false,
+                },
+                fragment: Some(GenericFragmentState {
+                    entry_point: frag_entry.into(),
+                    target_blend: Some(BlendState::REPLACE),
+                    target_color_writes: ColorWrites::ALL,
+                }),
+            }
+        };
+
+        let fill = pipelines.add(RenderPipelineManager::new(make_desc(
+            full_shader, full_layout, PolygonMode::Fill,
+            &format!("{} fill pipeline", self.label), "fs_main",
+        )));
+        let wireframe = pipelines.add(RenderPipelineManager::new(make_desc(
+            full_shader, full_layout, PolygonMode::Line,
+            &format!("{} wireframe pipeline", self.label), "fs_main",
+        )));
+        let normal = pipelines.add(RenderPipelineManager::new(make_desc(
+            normal_shader, normal_layout, PolygonMode::Fill,
+            &format!("{} normal pipeline", self.label), "fs_normal",
+        )));
+
+        GeometryPipeline { fill, wireframe, normal }
+    }
+}
+
+// --- Voxel Pipeline (uses GeometryPipeline) ---
+
 #[derive(Resource)]
-pub struct Wireframe(pub bool);
+pub struct VoxelPipeline(pub GeometryPipeline);
 
 // --- Initialization ---
 
@@ -381,129 +551,36 @@ pub fn create_camera_bind_group(device: &Device) -> CameraBindGroup {
     CameraBindGroup { buffer, bind_group }
 }
 
-// --- Pipeline ---
-
-fn create_pipeline_desc(
-    shader: AssetId<ShaderModule>,
-    layout: AssetId<PipelineLayout>,
-    polygon_mode: PolygonMode,
-    label: &str,
-    frag_entry: &str,
-) -> GenericRenderPipelineDescriptor {
-    GenericRenderPipelineDescriptor {
-        resource_provider: Box::new(DirectRenderPipelineResourceProvider {
-            layout,
-            vertex_shader_module: shader,
-            fragment_shader_module: shader,
-        }),
-        label: Some(label.into()),
-        vertex_state: GenericVertexState {
-            entry_point: "vs_main".into(),
-            buffers: vec![GenericVertexBufferLayout {
-                array_stride: std::mem::size_of::<FaceData>() as u64,
-                step_mode: VertexStepMode::Instance,
-                attributes: vec![
-                    wgpu::VertexAttribute {
-                        format: VertexFormat::Uint8x4,
-                        offset: 0,
-                        shader_location: 0,
-                    },
-                    wgpu::VertexAttribute {
-                        format: VertexFormat::Uint8x4,
-                        offset: 4,
-                        shader_location: 1,
-                    },
-                ],
-            }],
-        },
-        primitive: PrimitiveState {
-            topology: PrimitiveTopology::TriangleList,
-            strip_index_format: None,
-            front_face: FrontFace::Ccw,
-            cull_mode: Some(wgpu::Face::Back),
-            unclipped_depth: false,
-            polygon_mode,
-            conservative: false,
-        },
-        depth_stencil: Some(GenericDepthStencilState {
-            depth_write_enable: true,
-            depth_compare: CompareFunction::GreaterEqual,
-            stencil: StencilState::default(),
-            bias: DepthBiasState::default(),
-        }),
-        multisample: GenericMultisampleState {
-            mask: !0,
-            alpha_to_coverage_enabled: false,
-        },
-        fragment: Some(GenericFragmentState {
-            entry_point: frag_entry.into(),
-            target_blend: Some(BlendState::REPLACE),
-            target_color_writes: ColorWrites::ALL,
-        }),
-    }
-}
-
-pub fn init_pipelines(
+pub fn init_voxel_pipeline(
     device: &Device,
     pipelines: &mut Assets<RenderPipelineManager>,
     shaders: &mut Assets<ShaderModule>,
     layouts: &mut Assets<PipelineLayout>,
 ) -> VoxelPipeline {
-    let camera_wgsl = CameraBGLayout::LIBRARY.replace("#BIND_GROUP", "0");
-    let metadata_wgsl = MetadataBGLayout::LIBRARY.replace("#BIND_GROUP", "1");
-    let voxel_vertex_src = include_str!("shaders/voxel_vertex.wgsl");
+    let pipeline = GeometryPipelineBuilder::new("Voxel")
+        .vertex_shader(include_str!("shaders/voxel_vertex.wgsl"))
+        .material_shader(include_str!("shaders/voxel.wgsl"))
+        .add_bind_group(device, CameraBGLayout::LAYOUT, CameraBGLayout::LIBRARY)
+        .add_bind_group(device, MetadataBGLayout::LAYOUT, MetadataBGLayout::LIBRARY)
+        .vertex_buffer(GenericVertexBufferLayout {
+            array_stride: std::mem::size_of::<FaceData>() as u64,
+            step_mode: VertexStepMode::Instance,
+            attributes: vec![
+                wgpu::VertexAttribute {
+                    format: VertexFormat::Uint8x4,
+                    offset: 0,
+                    shader_location: 0,
+                },
+                wgpu::VertexAttribute {
+                    format: VertexFormat::Uint8x4,
+                    offset: 4,
+                    shader_location: 1,
+                },
+            ],
+        })
+        .build(device, pipelines, shaders, layouts);
 
-    // Full shader: bind group libraries + shared lighting + vertex + material/fragment
-    let shadow_mask_wgsl = ShadowMaskBGLayout::LIBRARY.replace("#BIND_GROUP", "2");
-    let atmosphere_wgsl = atmosphere::AtmosphereBGLayout::LIBRARY.replace("#BIND_GROUP", "3");
-    let sky_sample_wgsl = include_str!("shaders/sky_sample.wgsl");
-    let lighting_wgsl = include_str!("shaders/lighting.wgsl");
-    let voxel_material_src = include_str!("shaders/voxel.wgsl");
-    let full_source = format!(
-        "{camera_wgsl}\n{metadata_wgsl}\n{shadow_mask_wgsl}\n{atmosphere_wgsl}\n{sky_sample_wgsl}\n{lighting_wgsl}\n{voxel_vertex_src}\n{voxel_material_src}",
-    );
-    let full_shader = shaders.add(device.create_shader_module(ShaderModuleDescriptor {
-        label: Some("Voxel shader (full)"),
-        source: ShaderSource::Wgsl(full_source.into()),
-    }));
-
-    // Normal-only shader: camera + metadata + vertex + fs_normal
-    let fs_normal_src = include_str!("shaders/fs_normal.wgsl");
-    let normal_source = format!("{camera_wgsl}\n{metadata_wgsl}\n{voxel_vertex_src}\n{fs_normal_src}");
-    let normal_shader = shaders.add(device.create_shader_module(ShaderModuleDescriptor {
-        label: Some("Voxel shader (normal)"),
-        source: ShaderSource::Wgsl(normal_source.into()),
-    }));
-
-    // Full pipeline layout: camera + metadata + shadow mask + atmosphere
-    let camera_layout = device.create_bind_group_layout(CameraBGLayout::LAYOUT);
-    let metadata_layout = device.create_bind_group_layout(MetadataBGLayout::LAYOUT);
-    let shadow_mask_layout = device.create_bind_group_layout(ShadowMaskBGLayout::LAYOUT);
-    let atmosphere_layout = device.create_bind_group_layout(atmosphere::AtmosphereBGLayout::LAYOUT);
-    let full_layout = layouts.add(device.create_pipeline_layout(&PipelineLayoutDescriptor {
-        label: Some("Voxel pipeline layout (full)"),
-        bind_group_layouts: &[&camera_layout, &metadata_layout, &shadow_mask_layout, &atmosphere_layout],
-        push_constant_ranges: &[],
-    }));
-
-    // Normal-only pipeline layout: camera + metadata
-    let normal_layout = layouts.add(device.create_pipeline_layout(&PipelineLayoutDescriptor {
-        label: Some("Voxel pipeline layout (normal)"),
-        bind_group_layouts: &[&camera_layout, &metadata_layout],
-        push_constant_ranges: &[],
-    }));
-
-    let fill = pipelines.add(RenderPipelineManager::new(create_pipeline_desc(
-        full_shader, full_layout, PolygonMode::Fill, "Voxel fill pipeline", "fs_main",
-    )));
-    let wireframe = pipelines.add(RenderPipelineManager::new(create_pipeline_desc(
-        full_shader, full_layout, PolygonMode::Line, "Voxel wireframe pipeline", "fs_main",
-    )));
-    let normal_fill = pipelines.add(RenderPipelineManager::new(create_pipeline_desc(
-        normal_shader, normal_layout, PolygonMode::Fill, "Voxel normal pipeline", "fs_normal",
-    )));
-
-    VoxelPipeline { fill, wireframe, normal_fill }
+    VoxelPipeline(pipeline)
 }
 
 // --- Synchronize System ---
@@ -815,7 +892,7 @@ pub fn init_render(
 ) {
     let gpu_buffers = create_gpu_buffers(&device.0);
     let camera_bg = create_camera_bind_group(&device.0);
-    let voxel_pipeline = init_pipelines(&device.0, &mut pipelines, &mut shaders, &mut layouts);
+    let voxel_pipeline = init_voxel_pipeline(&device.0, &mut pipelines, &mut shaders, &mut layouts);
 
     commands.insert_resource(gpu_buffers);
     commands.insert_resource(camera_bg);

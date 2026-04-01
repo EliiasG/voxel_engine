@@ -471,8 +471,8 @@ impl Operation for ShadowDepthOperation {
         pass.set_viewport(0.0, 0.0, sw as f32, sh as f32, 0.0, 1.0);
 
         // Use the normal-output pipeline (same vertex shader, fs_normal fragment)
-        let voxel_pipeline = world.resource::<render::VoxelPipeline>();
-        let pipeline_id = voxel_pipeline.normal_fill;
+        let voxel_pipeline = &world.resource::<render::VoxelPipeline>().0;
+        let pipeline_id = voxel_pipeline.normal;
 
         world.asset_scope(pipeline_id, |world, pipeline_man: &mut modul_render::RenderPipelineManager| {
             let params = modul_render::PipelineParameters {

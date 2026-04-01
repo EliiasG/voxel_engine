@@ -1254,7 +1254,7 @@ dependencies = [
 [[package]]
 name = "modul_asset"
 version = "0.0.0"
-source = "git+https://github.com/EliiasG/modul#fd34a17597099f4eb78c36cbf693ac0660148693"
+source = "git+https://github.com/EliiasG/modul#fcba5bbb33ea5d29b9e23ea82baa253724b1534f"
 dependencies = [
  "bevy_app",
  "bevy_ecs",
@@ -1265,7 +1265,7 @@ dependencies = [
 [[package]]
 name = "modul_core"
 version = "0.0.0"
-source = "git+https://github.com/EliiasG/modul#fd34a17597099f4eb78c36cbf693ac0660148693"
+source = "git+https://github.com/EliiasG/modul#fcba5bbb33ea5d29b9e23ea82baa253724b1534f"
 dependencies = [
  "bevy_app",
  "bevy_ecs",
@@ -1279,7 +1279,7 @@ dependencies = [
 [[package]]
 name = "modul_render"
 version = "0.0.0"
-source = "git+https://github.com/EliiasG/modul#fd34a17597099f4eb78c36cbf693ac0660148693"
+source = "git+https://github.com/EliiasG/modul#fcba5bbb33ea5d29b9e23ea82baa253724b1534f"
 dependencies = [
  "bevy_app",
  "bevy_ecs",
@@ -1294,7 +1294,7 @@ dependencies = [
 [[package]]
 name = "modul_util"
 version = "0.0.0"
-source = "git+https://github.com/EliiasG/modul#fd34a17597099f4eb78c36cbf693ac0660148693"
+source = "git+https://github.com/EliiasG/modul#fcba5bbb33ea5d29b9e23ea82baa253724b1534f"
 dependencies = [
  "bevy_app",
  "bevy_ecs",

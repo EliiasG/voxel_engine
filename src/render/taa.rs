@@ -299,7 +299,7 @@ impl Operation for TaaVoxelDrawOperation {
         });
 
         // Get compatible voxel pipeline for the scene format
-        let voxel_pipeline = world.resource::<render::VoxelPipeline>();
+        let voxel_pipeline = &world.resource::<render::VoxelPipeline>().0;
         let pipeline_id = if world.get_resource::<render::Wireframe>().is_some_and(|w| w.0) {
             voxel_pipeline.wireframe
         } else {
