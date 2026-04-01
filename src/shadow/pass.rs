@@ -1,7 +1,7 @@
 use bevy_ecs::prelude::*;
 use bytemuck::{Pod, Zeroable};
 use modul_asset::AssetWorldExt;
-use modul_render::{Operation, OperationBuilder, RenderTargetSource};
+use modul_render::{BindGroupLayoutDef, Operation, OperationBuilder, RenderTargetSource};
 use wgpu::{
     Buffer, BufferDescriptor, BufferUsages, CommandEncoder, Device, TextureFormat,
     TextureUsages,
@@ -487,8 +487,27 @@ impl Operation for ShadowDepthOperation {
             let device = &world.resource::<modul_core::DeviceRes>().0;
             let shadow_res = world.resource::<ShadowPassResources>();
 
-            // Dummy shadow mask bind group (pipeline layout requires it but fs_normal doesn't use it)
-            let dummy_shadow_bg = crate::render::create_shadow_mask_bind_group(device, shadow_res);
+            // Dummy shadow mask bind group: use prev_view for all texture slots to avoid
+            // conflict with shadow_normal which is a color target in this pass
+            let layout = device.create_bind_group_layout(crate::render::ShadowMaskBGLayout::LAYOUT);
+            let dummy_shadow_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("Dummy shadow BG"),
+                layout: &layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(shadow_res.prev_view()),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::Sampler(&shadow_res.shadow_mask_sampler),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::TextureView(shadow_res.prev_view()),
+                    },
+                ],
+            });
 
             let atmo_res = world.resource::<crate::atmosphere::AtmosphereResources>();
             let atmo_bg_ptr = &atmo_res.bind_group as *const wgpu::BindGroup;
