@@ -678,3 +678,21 @@ impl OperationBuilder for SkyPassOperationBuilder {
         SkyPassOperation
     }
 }
+
+// --- Init system ---
+
+/// Initializes atmosphere resources (LUT baking, sky pipeline, config).
+pub fn init_atmosphere(
+    mut commands: Commands,
+    device: Res<modul_core::DeviceRes>,
+    queue: Res<modul_core::QueueRes>,
+    sun_dir: Res<crate::render::shadow::pass::SunDirection>,
+    surface_fmt: Res<modul_core::SurfaceFormat>,
+) {
+    let atmo_config = AtmosphereConfig::default();
+    let atmo_res = AtmosphereResources::new(
+        &device.0, &queue.0, &sun_dir, &atmo_config, surface_fmt.0,
+    );
+    commands.insert_resource(atmo_config);
+    commands.insert_resource(atmo_res);
+}

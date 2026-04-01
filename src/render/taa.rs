@@ -484,3 +484,15 @@ impl OperationBuilder for TaaResolveOperationBuilder {
         TaaResolveOperation { surface_entity: self.surface_entity }
     }
 }
+
+// --- Init system ---
+
+/// Initializes TAA resources.
+pub fn init_taa(
+    mut commands: Commands,
+    device: Res<modul_core::DeviceRes>,
+    surface_fmt: Res<modul_core::SurfaceFormat>,
+) {
+    let taa_res = TaaResources::new(&device.0, surface_fmt.0, 800, 600);
+    commands.insert_resource(taa_res);
+}

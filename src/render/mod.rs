@@ -803,6 +803,27 @@ pub fn draw_voxel_geometry(pass: &mut wgpu::RenderPass, gpu: &GpuBuffers) {
     }
 }
 
+// --- Init system ---
+
+/// Initializes core render resources: GPU buffers, camera bind group, voxel pipelines.
+pub fn init_render(
+    mut commands: Commands,
+    device: Res<modul_core::DeviceRes>,
+    mut shaders: ResMut<Assets<ShaderModule>>,
+    mut layouts: ResMut<Assets<PipelineLayout>>,
+    mut pipelines: ResMut<Assets<RenderPipelineManager>>,
+) {
+    let gpu_buffers = create_gpu_buffers(&device.0);
+    let camera_bg = create_camera_bind_group(&device.0);
+    let voxel_pipeline = init_pipelines(&device.0, &mut pipelines, &mut shaders, &mut layouts);
+
+    commands.insert_resource(gpu_buffers);
+    commands.insert_resource(camera_bg);
+    commands.insert_resource(voxel_pipeline);
+    commands.insert_resource(PageAllocator::new());
+    commands.insert_resource(Wireframe(false));
+}
+
 /// Create a shadow mask bind group from the current shadow pass state.
 pub fn create_shadow_mask_bind_group(
     device: &wgpu::Device,

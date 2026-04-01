@@ -7,11 +7,11 @@ use std::collections::HashSet;
 use bevy_ecs::prelude::*;
 use modul_asset::Assets;
 use modul_core::{
-    run_app, DeviceRes, EventBuffer, GraphicsInitializer, GraphicsInitializerResult, Init,
+    run_app, EventBuffer, GraphicsInitializer, GraphicsInitializerResult, Init,
     MainWindow, QueueRes, Redraw, WindowComponent,
 };
 use modul_render::{
-    InitialSurfaceConfig, RenderPipelineManager, RenderPlugin, RenderTargetColorConfig,
+    InitialSurfaceConfig, RenderPlugin, RenderTargetColorConfig,
     RenderTargetSource, RunningSequenceQueue, Sequence, SequenceBuilder, SequenceQueue,
     SurfaceRenderTargetConfig, RenderTargetDepthStencilConfig, RenderSystemSet, Synchronize,
 };
@@ -178,8 +178,15 @@ fn main() {
         app.insert_resource(InputState::default());
         app.insert_resource(FpsCounter::default());
 
-        // Init
-        app.add_systems(Init, init);
+        // Init: subsystem init systems run in dependency order
+        app.add_systems(Init, (
+            init_window,
+            init_gameplay,
+            render::init_render,
+            render::shadow::init_shadow,
+            render::taa::init_taa,
+            render::atmosphere::init_atmosphere,
+        ).chain());
 
         // Gameplay systems (before render). process_input runs first so debug
         // mode and camera state are up-to-date before the loader sees them.
@@ -216,17 +223,10 @@ fn main() {
     });
 }
 
-fn init(
+fn init_window(
     mut commands: Commands,
-    device: Res<DeviceRes>,
-    queue: Res<QueueRes>,
     main_window: Query<Entity, With<MainWindow>>,
-    mut shaders: ResMut<Assets<wgpu::ShaderModule>>,
-    mut layouts: ResMut<Assets<wgpu::PipelineLayout>>,
-    mut pipelines: ResMut<Assets<RenderPipelineManager>>,
     mut sequences: ResMut<Assets<Sequence>>,
-    shadow_grid: Res<render::shadow::grid::ShadowGrid>,
-    surface_fmt: Res<modul_core::SurfaceFormat>,
 ) {
     let window_entity = main_window.single();
 
@@ -255,29 +255,7 @@ fn init(
             backup_present_mode: None,
         }));
 
-    let gpu_buffers = render::create_gpu_buffers(&device.0);
-    let camera_bg = render::create_camera_bind_group(&device.0);
-    let shadow_gpu = render::shadow::gpu::ShadowGpuBuffers::new(&device.0, &shadow_grid);
-
-    let voxel_pipeline = render::init_pipelines(
-        &device.0,
-        &mut pipelines,
-        &mut shaders,
-        &mut layouts,
-    );
-
-    let shadow_pass_res = render::shadow::pass::ShadowPassResources::new(
-        &device.0, &shadow_gpu, 800, 600, 1, // initial size, full res for debugging
-    );
-
-    let taa_res = render::taa::TaaResources::new(&device.0, surface_fmt.0, 800, 600);
-
-    let sun_dir = render::shadow::pass::SunDirection::default();
-    let atmo_config = render::atmosphere::AtmosphereConfig::default();
-    let atmo_res = render::atmosphere::AtmosphereResources::new(
-        &device.0, &queue.0, &sun_dir, &atmo_config, surface_fmt.0,
-    );
-
+    // Render sequence
     let render_target = RenderTargetSource::Surface(window_entity);
     let mut builder = SequenceBuilder::new();
     builder
@@ -293,7 +271,10 @@ fn init(
             target: render_target,
         });
     let sequence = builder.finish(&mut sequences);
+    commands.insert_resource(RunningSequenceQueue(SequenceQueue(vec![sequence])));
+}
 
+fn init_gameplay(mut commands: Commands) {
     let mut cam = FlyCamera::new([0.0, 300.0, 200.0]);
     cam.pitch = -0.3;
     cam.speed = 100.0;
@@ -301,22 +282,8 @@ fn init(
 
     commands.insert_resource(Camera(cam));
     commands.insert_resource(FrameCount(0));
-    commands.insert_resource(taa_res);
-    commands.insert_resource(gpu_buffers);
-    commands.insert_resource(camera_bg);
-    commands.insert_resource(shadow_gpu);
-    commands.insert_resource(shadow_pass_res);
-    commands.insert_resource(render::shadow::pass::ShadowConfig::default());
-    commands.insert_resource(sun_dir);
     commands.insert_resource(DayCycle::default());
-    commands.insert_resource(render::shadow::pass::PreviousFrameData::default());
-    commands.insert_resource(voxel_pipeline);
-    commands.insert_resource(render::PageAllocator::new());
-    commands.insert_resource(render::Wireframe(false));
     commands.insert_resource(DebugMode::default());
-    commands.insert_resource(atmo_config);
-    commands.insert_resource(atmo_res);
-    commands.insert_resource(RunningSequenceQueue(SequenceQueue(vec![sequence])));
 }
 
 fn set_cursor_captured(window: &winit::window::Window, captured: bool) {
