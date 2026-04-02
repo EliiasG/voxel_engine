@@ -919,18 +919,63 @@ pub fn draw_voxel_geometry(pass: &mut wgpu::RenderPass, gpu: &GpuBuffers) {
 
 // --- Init system ---
 
+fn downsample_half(src: &modul_texture::Image) -> modul_texture::Image {
+    let dst_w = (src.width / 2).max(1);
+    let dst_h = (src.height / 2).max(1);
+    let mut dst_data = Vec::with_capacity((dst_w * dst_h * 4) as usize);
+    let stride = (src.width * 4) as usize;
+
+    for y in 0..dst_h {
+        for x in 0..dst_w {
+            let sx = (x * 2) as usize;
+            let sy = (y * 2) as usize;
+            for c in 0..4usize {
+                let i00 = sy * stride + sx * 4 + c;
+                let i10 = sy * stride + (sx + 1) * 4 + c;
+                let i01 = (sy + 1) * stride + sx * 4 + c;
+                let i11 = (sy + 1) * stride + (sx + 1) * 4 + c;
+                let avg = (src.data[i00] as u16
+                    + src.data[i10] as u16
+                    + src.data[i01] as u16
+                    + src.data[i11] as u16
+                    + 2) / 4;
+                dst_data.push(avg as u8);
+            }
+        }
+    }
+
+    modul_texture::Image { data: dst_data, width: dst_w, height: dst_h }
+}
+
+fn generate_mip_chain(base: modul_texture::Image) -> modul_texture::MipMapImage {
+    let level_count = (base.width.max(base.height).ilog2() + 1) as usize;
+    let mut levels = Vec::with_capacity(level_count);
+    levels.push(base);
+    for _ in 1..level_count {
+        let prev = levels.last().unwrap();
+        if prev.width <= 1 && prev.height <= 1 {
+            break;
+        }
+        levels.push(downsample_half(prev));
+    }
+    modul_texture::MipMapImage::with_images(levels)
+}
+
 fn create_texture_atlas_bind_group(device: &Device, queue: &wgpu::Queue) -> TextureAtlasBindGroup {
     let image = modul_texture::Image::load_from_path("assets/textures/my_tiles1.png")
         .expect("failed to load atlas texture");
 
+    let mipmap = generate_mip_chain(image);
+    let base = &mipmap.levels()[0];
+
     let texture = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("Atlas texture"),
         size: wgpu::Extent3d {
-            width: image.width,
-            height: image.height,
+            width: base.width,
+            height: base.height,
             depth_or_array_layers: 1,
         },
-        mip_level_count: 1,
+        mip_level_count: mipmap.level_count() as u32,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
         format: wgpu::TextureFormat::Rgba8UnormSrgb,
@@ -938,7 +983,6 @@ fn create_texture_atlas_bind_group(device: &Device, queue: &wgpu::Queue) -> Text
         view_formats: &[],
     });
 
-    let mipmap: modul_texture::MipMapImage = image.into();
     mipmap.write_to_texture(queue, wgpu::Origin3d::ZERO, &texture);
 
     let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
@@ -946,7 +990,7 @@ fn create_texture_atlas_bind_group(device: &Device, queue: &wgpu::Queue) -> Text
         label: Some("Atlas sampler"),
         mag_filter: wgpu::FilterMode::Nearest,
         min_filter: wgpu::FilterMode::Nearest,
-        mipmap_filter: wgpu::FilterMode::Nearest,
+        mipmap_filter: wgpu::FilterMode::Linear,
         ..Default::default()
     });
 

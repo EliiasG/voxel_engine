@@ -48,15 +48,18 @@ fn evaluate_material(in: VertexOutput) -> Surface {
 
     // Tile size: texture repeats every tile_size blocks
     let tile_size = 64.0;
-    var uv = proj / tile_size;
-    // Wrap to [0,1) — fract handles negatives correctly in WGSL
-    uv = fract(uv);
+    let uv = proj / tile_size;
 
-    // Scale into atlas quadrant (each is 0.5 x 0.5) and offset
+    // Compute screen-space derivatives BEFORE fract() — these are smooth everywhere
+    let uv_ddx = dpdx(uv) * 0.5;
+    let uv_ddy = dpdy(uv) * 0.5;
+
+    // Wrap to [0,1) then scale into atlas quadrant
     let atlas_offset = get_atlas_offset(in.material_id, in.direction);
-    let final_uv = uv * 0.5 + atlas_offset;
+    let final_uv = fract(uv) * 0.5 + atlas_offset;
 
-    let base_color = textureSample(atlas_texture, atlas_sampler, final_uv).rgb;
+    // Use explicit gradients so the GPU picks the correct mip level
+    let base_color = textureSampleGrad(atlas_texture, atlas_sampler, final_uv, uv_ddx, uv_ddy).rgb;
 
     return Surface(base_color, in.normal, in.world_pos, in.clip_position, in.ao);
 }
