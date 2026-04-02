@@ -5,7 +5,7 @@ use crossbeam_channel::{Receiver, Sender};
 use glam::IVec3;
 
 use super::{
-    ChunkStorage, AIR, CHUNK_SIZE, CHUNK_SIZE_2, CHUNK_SIZE_3, STONE,
+    ChunkStorage, AIR, CHUNK_SIZE, CHUNK_SIZE_2, CHUNK_SIZE_3, DIRT, GRASS, STONE,
 };
 use crate::render::shadow::bitmask::{self, ChunkBitmaskResult};
 
@@ -39,10 +39,11 @@ struct GenRequest {
 /// Channel-based worker pool for chunk generation.
 #[derive(Resource)]
 pub struct GenPool {
-    tx: Sender<GenRequest>,
+    tx: Option<Sender<GenRequest>>,
     rx: Receiver<GenResult>,
     in_flight: AtomicUsize,
     max_in_flight: usize,
+    workers: Vec<std::thread::JoinHandle<()>>,
 }
 
 impl GenPool {
@@ -54,10 +55,11 @@ impl GenPool {
             .map(|n| (n.get() / 2).max(1))
             .unwrap_or(2);
 
+        let mut workers = Vec::with_capacity(num_threads);
         for i in 0..num_threads {
             let req_rx = req_rx.clone();
             let res_tx = res_tx.clone();
-            std::thread::Builder::new()
+            let handle = std::thread::Builder::new()
                 .name(format!("gen-worker-{i}"))
                 .spawn(move || {
                     while let Ok(req) = req_rx.recv() {
@@ -73,15 +75,27 @@ impl GenPool {
                     }
                 })
                 .expect("failed to spawn gen worker");
+            workers.push(handle);
         }
 
         let max_in_flight = num_threads * 4;
         println!("Gen pool: {num_threads} threads, max in-flight: {max_in_flight}");
         Self {
-            tx: req_tx,
+            tx: Some(req_tx),
             rx: res_rx,
             in_flight: AtomicUsize::new(0),
             max_in_flight,
+            workers,
+        }
+    }
+}
+
+impl Drop for GenPool {
+    fn drop(&mut self) {
+        // Drop the sender so workers' recv() returns Err and they exit.
+        self.tx.take();
+        for handle in self.workers.drain(..) {
+            let _ = handle.join();
         }
     }
 }
@@ -93,8 +107,9 @@ impl ChunkGenerator for GenPool {
     }
 
     fn submit(&self, requests: &[(Entity, IVec3, u8)]) {
+        let Some(tx) = &self.tx else { return };
         for &(entity, pos, lod) in requests {
-            let _ = self.tx.send(GenRequest { entity, pos, lod });
+            let _ = tx.send(GenRequest { entity, pos, lod });
         }
         self.in_flight.fetch_add(requests.len(), Ordering::Relaxed);
     }
@@ -146,10 +161,15 @@ fn generate_terrain(chunk_pos: IVec3, lod: u8) -> ChunkStorage {
 
     let mut blocks = vec![AIR; CHUNK_SIZE_3];
     let mut all_same = true;
-    let first_block = if wy0 <= height_at(wx0 as f32, wz0 as f32) {
-        STONE
-    } else {
+    let h0 = height_at(wx0 as f32, wz0 as f32);
+    let first_block = if wy0 > h0 {
         AIR
+    } else if wy0 >= h0 {
+        GRASS
+    } else if wy0 >= h0 - 3 {
+        DIRT
+    } else {
+        STONE
     };
 
     for z in 0..CHUNK_SIZE {
@@ -160,7 +180,15 @@ fn generate_terrain(chunk_pos: IVec3, lod: u8) -> ChunkStorage {
 
             for y in 0..CHUNK_SIZE {
                 let wy = wy0 + y as i32 * lod_scale;
-                let block = if wy <= height { STONE } else { AIR };
+                let block = if wy > height {
+                    AIR
+                } else if wy >= height - 0 {
+                    GRASS
+                } else if wy >= height - 3 {
+                    DIRT
+                } else {
+                    STONE
+                };
                 if block != first_block {
                     all_same = false;
                 }

@@ -16,6 +16,8 @@ pub const CHUNK_SIZE_3: usize = CHUNK_SIZE * CHUNK_SIZE * CHUNK_SIZE;
 pub type BlockId = u32;
 pub const AIR: BlockId = 0;
 pub const STONE: BlockId = 1;
+pub const DIRT: BlockId = 2;
+pub const GRASS: BlockId = 3;
 
 pub const NUM_DIRECTIONS: usize = 6;
 pub const DIR_POS_X: usize = 0;

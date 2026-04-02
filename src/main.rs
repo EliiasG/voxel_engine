@@ -129,6 +129,10 @@ impl GraphicsInitializer for VoxelGraphicsInitializer {
             &DeviceDescriptor {
                 label: None,
                 required_features: Features::POLYGON_MODE_LINE | Features::MULTI_DRAW_INDIRECT,
+                required_limits: wgpu::Limits {
+                    max_bind_groups: 5,
+                    ..wgpu::Limits::default()
+                },
                 ..Default::default()
             },
             None,

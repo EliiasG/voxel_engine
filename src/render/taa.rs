@@ -327,6 +327,7 @@ impl Operation for TaaVoxelDrawOperation {
                 pass.set_pipeline(pipeline);
 
                 let camera_bg = &world.resource::<render::CameraBindGroup>().bind_group;
+                let atlas_bg = &world.resource::<render::TextureAtlasBindGroup>().bind_group;
                 let gpu = world.resource::<render::GpuBuffers>();
                 let device = &world.resource::<modul_core::DeviceRes>().0;
                 let shadow_res = world.resource::<crate::render::shadow::pass::ShadowPassResources>();
@@ -337,8 +338,9 @@ impl Operation for TaaVoxelDrawOperation {
                 let atmo_bg = unsafe { &*atmo_bg_ptr };
 
                 pass.set_bind_group(0, camera_bg, &[]);
-                pass.set_bind_group(2, &shadow_mask_bg, &[]);
-                pass.set_bind_group(3, atmo_bg, &[]);
+                pass.set_bind_group(2, atlas_bg, &[]);
+                pass.set_bind_group(3, &shadow_mask_bg, &[]);
+                pass.set_bind_group(4, atmo_bg, &[]);
 
                 render::draw_voxel_geometry(&mut pass, gpu);
             },

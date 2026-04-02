@@ -59,10 +59,10 @@ fn apply_lighting(surface: Surface) -> vec4<f32> {
 
     // Modulate lighting by time of day
     let day = 1.0 - atmosphere.night_factor;
-    let sky_light = max(surface.normal.y * 0.5 + 0.5, 0.0) * 0.15 * day;
+    let sky_light = max(surface.normal.y * 0.5 + 0.5, 0.0) * mix(0.04, 0.15, day);
 
     let effective_shadow = mix(0.0, 1.0, shadow);
-    let ambient = mix(0.04, 0.25, day);
+    let ambient = mix(0.08, 0.25, day);
     let diffuse = 0.7 * ndotl * effective_shadow * day;
     let ao = mix(0.4, 1.0, surface.ao);
     let lit_color = surface.base_color * (ambient * ao + sky_light * ao + diffuse);

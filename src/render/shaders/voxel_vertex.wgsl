@@ -14,6 +14,8 @@ struct VertexOutput {
     @location(0) world_pos: vec3<f32>,
     @location(1) normal: vec3<f32>,
     @location(2) ao: f32,
+    @location(3) @interpolate(flat) material_id: u32,
+    @location(4) @interpolate(flat) direction: u32,
 };
 
 fn get_normal(dir: u32) -> vec3<f32> {
@@ -139,6 +141,8 @@ fn vs_main(
     out.world_pos = rel_pos;
     out.normal = get_normal(direction);
     out.ao = mix(mix(ao_00, ao_10, u_factor), mix(ao_01, ao_11, u_factor), v_factor);
+    out.material_id = face.data1.z;
+    out.direction = direction;
 
     return out;
 }

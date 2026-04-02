@@ -3,8 +3,8 @@
 const PI: f32 = 3.14159265359;
 
 fn night_sky_gradient(elevation: f32) -> vec3<f32> {
-    let zenith = vec3<f32>(0.001, 0.002, 0.008);
-    let horizon = vec3<f32>(0.005, 0.008, 0.025);
+    let zenith = vec3<f32>(0.003, 0.005, 0.018);
+    let horizon = vec3<f32>(0.010, 0.015, 0.045);
     let t = clamp(elevation / (PI * 0.5), 0.0, 1.0);
     return mix(horizon, zenith, t);
 }

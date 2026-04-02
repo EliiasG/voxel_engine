@@ -34,8 +34,9 @@ struct MeshResult {
 /// Channel-based worker pool for chunk meshing.
 #[derive(Resource)]
 pub struct MeshPool {
-    tx: Sender<MeshRequest>,
+    tx: Option<Sender<MeshRequest>>,
     rx: Receiver<MeshResult>,
+    workers: Vec<std::thread::JoinHandle<()>>,
 }
 
 impl MeshPool {
@@ -47,10 +48,11 @@ impl MeshPool {
             .map(|n| (n.get() / 2).max(1))
             .unwrap_or(2);
 
+        let mut workers = Vec::with_capacity(num_threads);
         for i in 0..num_threads {
             let req_rx = req_rx.clone();
             let res_tx = res_tx.clone();
-            std::thread::Builder::new()
+            let handle = std::thread::Builder::new()
                 .name(format!("mesh-worker-{i}"))
                 .spawn(move || {
                     while let Ok(req) = req_rx.recv() {
@@ -70,10 +72,20 @@ impl MeshPool {
                     }
                 })
                 .expect("failed to spawn mesh worker");
+            workers.push(handle);
         }
 
         println!("Mesh pool: {num_threads} threads");
-        Self { tx: req_tx, rx: res_rx }
+        Self { tx: Some(req_tx), rx: res_rx, workers }
+    }
+}
+
+impl Drop for MeshPool {
+    fn drop(&mut self) {
+        self.tx.take();
+        for handle in self.workers.drain(..) {
+            let _ = handle.join();
+        }
     }
 }
 
@@ -128,7 +140,8 @@ pub fn start_meshing(
                 .map(|cd| cd.0.clone())
         });
 
-        let _ = pool.tx.send(MeshRequest {
+        let Some(tx) = &pool.tx else { continue };
+        let _ = tx.send(MeshRequest {
             entity,
             storage: data.0.clone(),
             neighbors,
@@ -492,7 +505,7 @@ fn greedy_mesh_buffer(
                     z: z as u8,
                     w: hu as u8,
                     h: hv as u8,
-                    material: [ao, 0, 0],
+                    material: [ao, block as u8, 0],
                 });
             }
         }

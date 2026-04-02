@@ -123,6 +123,40 @@ var<storage, read> metadata: array<PageMetadata>;
 ";
 }
 
+pub struct TextureAtlasBGLayout;
+
+impl BindGroupLayoutDef for TextureAtlasBGLayout {
+    const LAYOUT: &'static wgpu::BindGroupLayoutDescriptor<'static> =
+        &wgpu::BindGroupLayoutDescriptor {
+            label: Some("Texture Atlas BG Layout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        };
+
+    const LIBRARY: &'static str = "\
+@group(#BIND_GROUP) @binding(0)
+var atlas_texture: texture_2d<f32>;
+@group(#BIND_GROUP) @binding(1)
+var atlas_sampler: sampler;
+";
+}
+
 pub struct ShadowMaskBGLayout;
 
 impl BindGroupLayoutDef for ShadowMaskBGLayout {
@@ -319,6 +353,11 @@ pub struct ChunkRenderData {
 #[derive(Resource)]
 pub struct CameraBindGroup {
     pub buffer: Buffer,
+    pub bind_group: wgpu::BindGroup,
+}
+
+#[derive(Resource)]
+pub struct TextureAtlasBindGroup {
     pub bind_group: wgpu::BindGroup,
 }
 
@@ -562,6 +601,7 @@ pub fn init_voxel_pipeline(
         .material_shader(include_str!("shaders/voxel.wgsl"))
         .add_bind_group(device, CameraBGLayout::LAYOUT, CameraBGLayout::LIBRARY)
         .add_bind_group(device, MetadataBGLayout::LAYOUT, MetadataBGLayout::LIBRARY)
+        .add_bind_group(device, TextureAtlasBGLayout::LAYOUT, TextureAtlasBGLayout::LIBRARY)
         .vertex_buffer(GenericVertexBufferLayout {
             array_stride: std::mem::size_of::<FaceData>() as u64,
             step_mode: VertexStepMode::Instance,
@@ -879,20 +919,73 @@ pub fn draw_voxel_geometry(pass: &mut wgpu::RenderPass, gpu: &GpuBuffers) {
 
 // --- Init system ---
 
+fn create_texture_atlas_bind_group(device: &Device, queue: &wgpu::Queue) -> TextureAtlasBindGroup {
+    let image = modul_texture::Image::load_from_path("assets/textures/my_tiles1.png")
+        .expect("failed to load atlas texture");
+
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("Atlas texture"),
+        size: wgpu::Extent3d {
+            width: image.width,
+            height: image.height,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8UnormSrgb,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+
+    let mipmap: modul_texture::MipMapImage = image.into();
+    mipmap.write_to_texture(queue, wgpu::Origin3d::ZERO, &texture);
+
+    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+    let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+        label: Some("Atlas sampler"),
+        mag_filter: wgpu::FilterMode::Nearest,
+        min_filter: wgpu::FilterMode::Nearest,
+        mipmap_filter: wgpu::FilterMode::Nearest,
+        ..Default::default()
+    });
+
+    let layout = device.create_bind_group_layout(TextureAtlasBGLayout::LAYOUT);
+    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("Atlas BG"),
+        layout: &layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(&view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::Sampler(&sampler),
+            },
+        ],
+    });
+
+    TextureAtlasBindGroup { bind_group }
+}
+
 /// Initializes core render resources: GPU buffers, camera bind group, voxel pipelines.
 pub fn init_render(
     mut commands: Commands,
     device: Res<modul_core::DeviceRes>,
+    queue: Res<modul_core::QueueRes>,
     mut shaders: ResMut<Assets<ShaderModule>>,
     mut layouts: ResMut<Assets<PipelineLayout>>,
     mut pipelines: ResMut<Assets<RenderPipelineManager>>,
 ) {
     let gpu_buffers = create_gpu_buffers(&device.0);
     let camera_bg = create_camera_bind_group(&device.0);
+    let atlas_bg = create_texture_atlas_bind_group(&device.0, &queue.0);
     let voxel_pipeline = init_voxel_pipeline(&device.0, &mut pipelines, &mut shaders, &mut layouts);
 
     commands.insert_resource(gpu_buffers);
     commands.insert_resource(camera_bg);
+    commands.insert_resource(atlas_bg);
     commands.insert_resource(voxel_pipeline);
     commands.insert_resource(PageAllocator::new());
     commands.insert_resource(Wireframe(false));

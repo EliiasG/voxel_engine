@@ -485,10 +485,11 @@ impl Operation for ShadowDepthOperation {
             pass.set_pipeline(pipeline);
 
             let camera_bg = &world.resource::<render::CameraBindGroup>().bind_group;
+            let atlas_bg = &world.resource::<render::TextureAtlasBindGroup>().bind_group;
             let gpu = world.resource::<render::GpuBuffers>();
 
-            // Normal-only pipeline: only camera (group 0) + metadata (group 1)
             pass.set_bind_group(0, camera_bg, &[]);
+            pass.set_bind_group(2, atlas_bg, &[]);
 
             render::draw_voxel_geometry(&mut pass, gpu);
         });
