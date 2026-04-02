@@ -31,6 +31,31 @@ use chunk::demand::{ChunkSource, ChunkLoadList};
 #[derive(Resource)]
 struct FrameCount(u64);
 
+use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
+
+pub static TIMING_DEMAND_US: AtomicU32 = AtomicU32::new(0);
+pub static TIMING_LOADING_US: AtomicU32 = AtomicU32::new(0);
+pub static TIMING_SYNC_UPLOAD_US: AtomicU32 = AtomicU32::new(0);
+pub static TIMING_SYNC_DRAWS_US: AtomicU32 = AtomicU32::new(0);
+
+/// Drop guard that writes elapsed microseconds to an atomic target on drop.
+pub struct SysTimer {
+    start: std::time::Instant,
+    target: &'static AtomicU32,
+}
+
+impl SysTimer {
+    pub fn new(target: &'static AtomicU32) -> Self {
+        Self { start: std::time::Instant::now(), target }
+    }
+}
+
+impl Drop for SysTimer {
+    fn drop(&mut self) {
+        self.target.store(self.start.elapsed().as_micros() as u32, Relaxed);
+    }
+}
+
 #[derive(Resource)]
 struct FpsCounter {
     last_instant: std::time::Instant,
@@ -312,6 +337,7 @@ fn set_cursor_captured(window: &winit::window::Window, captured: bool) {
     }
 }
 
+
 fn process_input(
     events: Res<EventBuffer>,
     mut input: ResMut<InputState>,
@@ -570,11 +596,15 @@ fn update_camera(
         fps.last_instant = std::time::Instant::now();
 
         if let Ok(wc) = window_query.get_single() {
-            let title = if debug.frozen.is_some() {
-                format!("Voxel Engine \u{2014} {:.0} FPS [DEBUG]", fps.fps)
-            } else {
-                format!("Voxel Engine \u{2014} {:.0} FPS", fps.fps)
-            };
+            let title = format!(
+                "Voxel Engine \u{2014} {:.0} FPS | demand {}us load {}us sync_up {}us sync_draw {}us{}",
+                fps.fps,
+                TIMING_DEMAND_US.load(Relaxed),
+                TIMING_LOADING_US.load(Relaxed),
+                TIMING_SYNC_UPLOAD_US.load(Relaxed),
+                TIMING_SYNC_DRAWS_US.load(Relaxed),
+                if debug.frozen.is_some() { " [DEBUG]" } else { "" },
+            );
             wc.window.set_title(&title);
         }
     }

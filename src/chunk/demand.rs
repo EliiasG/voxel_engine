@@ -51,6 +51,7 @@ pub fn update_chunk_demand(
         &mut ChunkLoadList,
     )>,
 ) {
+    let _timer = crate::SysTimer::new(&crate::TIMING_DEMAND_US);
     for (pos, mut source, mut load_list) in query.iter_mut() {
         let camera_chunk = if let Some(ref frozen) = debug.frozen {
             frozen.chunk_pos

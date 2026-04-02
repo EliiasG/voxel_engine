@@ -656,6 +656,7 @@ pub fn synchronize_gpu(
     debug: Res<crate::DebugMode>,
     cam_query: Query<(&crate::camera::Position, &crate::camera::Camera), With<crate::camera::MainCamera>>,
 ) {
+    let _t_upload = std::time::Instant::now();
     for (entity, pos, lod, faces) in query.iter() {
         // Deallocate old pages
         if let Some(old) = render_data.entries.remove(&entity) {
@@ -731,6 +732,9 @@ pub fn synchronize_gpu(
         );
         commands.entity(entity).remove::<ChunkFaces>();
     }
+
+    crate::TIMING_SYNC_UPLOAD_US.store(_t_upload.elapsed().as_micros() as u32, std::sync::atomic::Ordering::Relaxed);
+    let _t_draws = std::time::Instant::now();
 
     // Rebuild indirect buffer: group draw args by (slab, lod)
     {
@@ -878,6 +882,8 @@ pub fn synchronize_gpu(
         gpu.draws = draws;
         gpu.frustum_culled = frustum_culled;
     }
+
+    crate::TIMING_SYNC_DRAWS_US.store(_t_draws.elapsed().as_micros() as u32, std::sync::atomic::Ordering::Relaxed);
 }
 
 // --- Operations ---

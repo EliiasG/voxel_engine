@@ -22,8 +22,9 @@ pub struct ChunkLoader {
     completed: HashSet<(IVec3, u8)>,
     /// Cached desired set — only rebuilt when a ChunkLoadList changes.
     desired: HashSet<(IVec3, u8)>,
-    /// Round-robin index across sources.
-    round_robin_index: usize,
+    /// Priority-ordered queue of chunks awaiting generation submission.
+    /// Highest priority at the end (pop from back).
+    pending_generation: Vec<(Entity, IVec3, u8)>,
     /// Last camera chunk seen — drives shadow grid origin rebuilds.
     last_camera_chunk: Option<IVec3>,
 }
@@ -51,8 +52,10 @@ pub fn update_chunk_loading(
     source_query: Query<&super::demand::ChunkSource>,
     debug: Res<crate::DebugMode>,
 ) {
+    let _timer = crate::SysTimer::new(&crate::TIMING_LOADING_US);
     // --- Phase 1: Poll generation results ---
     let results = generator.poll();
+    let had_results = !results.is_empty();
     for result in results {
         let key = (result.pos, result.lod);
         loader.in_flight.remove(&key);
@@ -108,12 +111,16 @@ pub fn update_chunk_loading(
     }
 
     // --- Phase 4: Unload chunks no longer desired ---
-    let to_remove: Vec<(IVec3, u8)> = loader
-        .loaded
-        .keys()
-        .filter(|k| !loader.desired.contains(k))
-        .cloned()
-        .collect();
+    let to_remove: Vec<(IVec3, u8)> = if lists_changed {
+        loader
+            .loaded
+            .keys()
+            .filter(|k| !loader.desired.contains(k))
+            .cloned()
+            .collect()
+    } else {
+        Vec::new()
+    };
 
     for key in &to_remove {
         let (pos, lod) = *key;
@@ -178,90 +185,37 @@ pub fn update_chunk_loading(
         if !to_spawn.is_empty() {
             println!("Spawned {} new chunk entities", to_spawn.len());
         }
-    }
 
-    // --- Phase 6: Round-robin generation submission ---
-    let capacity = generator.capacity();
-    if capacity == 0 {
-        return;
-    }
-
-    // Build per-source pending lists (only chunks needing generation).
-    // Each source's segments are filtered to exclude completed and in-flight chunks.
-    let mut active_loaders: Vec<(Entity, Vec<Vec<(IVec3, u8)>>)> = Vec::new();
-    for (source_entity, list) in all_load_lists.iter() {
-        let mut remaining_segments: Vec<Vec<(IVec3, u8)>> = Vec::new();
-        for segment in &list.segments {
-            let filtered: Vec<(IVec3, u8)> = segment
-                .iter()
-                .filter(|&&(pos, lod)| {
+        // Rebuild pending generation queue from segments (priority order).
+        // Segments are ordered outer→inner (low→high priority).
+        // We iterate in order so highest priority ends up at the back (popped first).
+        loader.pending_generation.clear();
+        for (_, list) in all_load_lists.iter() {
+            for segment in &list.segments {
+                for &(pos, lod) in segment {
                     let key = (pos, lod);
-                    loader.loaded.contains_key(&key)
-                        && !loader.in_flight.contains(&key)
-                        && !loader.completed.contains(&key)
-                })
-                .cloned()
-                .collect();
-            if !filtered.is_empty() {
-                remaining_segments.push(filtered);
+                    if let Some(&entity) = loader.loaded.get(&key) {
+                        if !loader.in_flight.contains(&key) && !loader.completed.contains(&key) {
+                            loader.pending_generation.push((entity, pos, lod));
+                        }
+                    }
+                }
             }
-        }
-        if !remaining_segments.is_empty() {
-            active_loaders.push((source_entity, remaining_segments));
         }
     }
 
-    if active_loaders.is_empty() {
+    // --- Phase 6: Submit from pending queue ---
+    let capacity = generator.capacity();
+    if capacity == 0 || loader.pending_generation.is_empty() {
         return;
     }
 
-    // Round-robin: process highest-priority segment from each loader in turn.
-    let mut to_submit: Vec<(Entity, IVec3, u8)> = Vec::new();
-    let mut remaining_capacity = capacity;
-    let mut index = loader.round_robin_index % active_loaders.len().max(1);
+    let count = capacity.min(loader.pending_generation.len());
+    let start = loader.pending_generation.len() - count;
+    let to_submit: Vec<(Entity, IVec3, u8)> = loader.pending_generation.drain(start..).collect();
 
-    loop {
-        if active_loaders.is_empty() || remaining_capacity == 0 {
-            break;
-        }
-
-        if index >= active_loaders.len() {
-            index = 0;
-        }
-
-        let (_, ref mut segments) = active_loaders[index];
-        // Last segment = highest priority
-        if let Some(segment) = segments.last_mut() {
-            while remaining_capacity > 0 && !segment.is_empty() {
-                let (pos, lod) = segment.pop().unwrap();
-                // Look up the entity we spawned for this chunk
-                if let Some(&entity) = loader.loaded.get(&(pos, lod)) {
-                    to_submit.push((entity, pos, lod));
-                    remaining_capacity -= 1;
-                }
-            }
-            if segment.is_empty() {
-                segments.pop();
-                if segments.is_empty() {
-                    active_loaders.remove(index);
-                    // Don't increment index — next loader slides into this slot
-                    continue;
-                }
-            }
-        }
-
-        index += 1;
+    for &(_, pos, lod) in &to_submit {
+        loader.in_flight.insert((pos, lod));
     }
-
-    loader.round_robin_index = index;
-
-    if !to_submit.is_empty() {
-        // Mark as in-flight
-        for &(_, pos, lod) in &to_submit {
-            loader.in_flight.insert((pos, lod));
-        }
-
-        let requests: Vec<(Entity, IVec3, u8)> = to_submit;
-        generator.submit(&requests);
-    }
+    generator.submit(&to_submit);
 }
