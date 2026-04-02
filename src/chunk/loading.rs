@@ -20,6 +20,8 @@ pub struct ChunkLoader {
     in_flight: HashSet<(IVec3, u8)>,
     /// Chunks whose generation completed (have ChunkData).
     completed: HashSet<(IVec3, u8)>,
+    /// Cached desired set — only rebuilt when a ChunkLoadList changes.
+    desired: HashSet<(IVec3, u8)>,
     /// Round-robin index across sources.
     round_robin_index: usize,
     /// Last camera chunk seen — drives shadow grid origin rebuilds.
@@ -43,7 +45,8 @@ pub fn update_chunk_loading(
     mut changed: ResMut<ChunkChangedQueue>,
     mut commands: Commands,
     entity_check: Query<()>,
-    load_lists: Query<(Entity, &ChunkLoadList)>,
+    load_lists: Query<(Entity, &ChunkLoadList), Changed<ChunkLoadList>>,
+    all_load_lists: Query<(Entity, &ChunkLoadList)>,
     cam_query: Query<&crate::camera::Position, With<crate::camera::MainCamera>>,
     source_query: Query<&super::demand::ChunkSource>,
     debug: Res<crate::DebugMode>,
@@ -91,12 +94,15 @@ pub fn update_chunk_loading(
         }
     }
 
-    // --- Phase 3: Build desired set from all ChunkLoadLists ---
-    let mut desired: HashSet<(IVec3, u8)> = HashSet::new();
-    for (_, list) in load_lists.iter() {
-        for segment in &list.segments {
-            for &(pos, lod) in segment {
-                desired.insert((pos, lod));
+    // --- Phase 3: Rebuild desired set only when a ChunkLoadList changed ---
+    let lists_changed = load_lists.iter().count() > 0;
+    if lists_changed {
+        loader.desired.clear();
+        for (_, list) in all_load_lists.iter() {
+            for segment in &list.segments {
+                for &(pos, lod) in segment {
+                    loader.desired.insert((pos, lod));
+                }
             }
         }
     }
@@ -105,7 +111,7 @@ pub fn update_chunk_loading(
     let to_remove: Vec<(IVec3, u8)> = loader
         .loaded
         .keys()
-        .filter(|k| !desired.contains(k))
+        .filter(|k| !loader.desired.contains(k))
         .cloned()
         .collect();
 
@@ -155,19 +161,23 @@ pub fn update_chunk_loading(
     }
 
     // --- Phase 5: Spawn entities for newly desired chunks ---
-    let mut newly_spawned = 0usize;
-    for &(pos, lod) in &desired {
-        if loader.loaded.contains_key(&(pos, lod)) {
-            continue;
-        }
-        let entity = commands.spawn((ChunkPos(pos), ChunkLod(lod))).id();
-        lod_maps.maps[lod as usize].insert(pos, entity);
-        loader.loaded.insert((pos, lod), entity);
-        newly_spawned += 1;
-    }
+    if lists_changed {
+        let to_spawn: Vec<(IVec3, u8)> = loader
+            .desired
+            .iter()
+            .filter(|k| !loader.loaded.contains_key(k))
+            .cloned()
+            .collect();
 
-    if newly_spawned > 0 {
-        println!("Spawned {newly_spawned} new chunk entities");
+        for (pos, lod) in &to_spawn {
+            let entity = commands.spawn((ChunkPos(*pos), ChunkLod(*lod))).id();
+            lod_maps.maps[*lod as usize].insert(*pos, entity);
+            loader.loaded.insert((*pos, *lod), entity);
+        }
+
+        if !to_spawn.is_empty() {
+            println!("Spawned {} new chunk entities", to_spawn.len());
+        }
     }
 
     // --- Phase 6: Round-robin generation submission ---
@@ -179,7 +189,7 @@ pub fn update_chunk_loading(
     // Build per-source pending lists (only chunks needing generation).
     // Each source's segments are filtered to exclude completed and in-flight chunks.
     let mut active_loaders: Vec<(Entity, Vec<Vec<(IVec3, u8)>>)> = Vec::new();
-    for (source_entity, list) in load_lists.iter() {
+    for (source_entity, list) in all_load_lists.iter() {
         let mut remaining_segments: Vec<Vec<(IVec3, u8)>> = Vec::new();
         for segment in &list.segments {
             let filtered: Vec<(IVec3, u8)> = segment

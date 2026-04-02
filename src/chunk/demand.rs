@@ -15,6 +15,8 @@ pub struct ChunkSource {
     pub end_radius: u32,
     /// Number of LOD levels to load.
     pub lod_count: u32,
+    /// Camera chunk when demand was last rebuilt — skip if unchanged.
+    last_camera_chunk: Option<IVec3>,
 }
 
 impl Default for ChunkSource {
@@ -24,6 +26,7 @@ impl Default for ChunkSource {
             step: 2,
             end_radius: 8,
             lod_count: 8,
+            last_camera_chunk: None,
         }
     }
 }
@@ -44,16 +47,21 @@ pub fn update_chunk_demand(
     debug: Res<crate::DebugMode>,
     mut query: Query<(
         &crate::camera::Position,
-        &ChunkSource,
+        &mut ChunkSource,
         &mut ChunkLoadList,
     )>,
 ) {
-    for (pos, source, mut load_list) in query.iter_mut() {
+    for (pos, mut source, mut load_list) in query.iter_mut() {
         let camera_chunk = if let Some(ref frozen) = debug.frozen {
             frozen.chunk_pos
         } else {
             crate::camera::chunk_pos(pos)
         };
+
+        if source.last_camera_chunk == Some(camera_chunk) {
+            continue;
+        }
+        source.last_camera_chunk = Some(camera_chunk);
 
         // Build segments from outermost (low priority) to innermost (high priority).
         // Shells: [end_radius..end_radius-step+1], [end_radius-step..end_radius-2*step+1], ..., [start_radius..0]
