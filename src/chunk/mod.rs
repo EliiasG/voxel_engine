@@ -19,6 +19,37 @@ pub const STONE: BlockId = 1;
 pub const DIRT: BlockId = 2;
 pub const GRASS: BlockId = 3;
 pub const GLASS: BlockId = 4;
+pub const WATER: BlockId = 5;
+
+/// Per-block-type properties for rendering.
+pub struct BlockProperties {
+    /// Block is transparent (rays/light pass through, rendered with WBOIT).
+    pub is_transparent: bool,
+    /// Index into the absorption coefficient table (0-253). Only meaningful when is_transparent.
+    pub color_index: u8,
+}
+
+/// Look up properties for a block type.
+#[inline]
+pub fn block_props(block: BlockId) -> BlockProperties {
+    match block {
+        GLASS => BlockProperties { is_transparent: true, color_index: 0 },
+        WATER => BlockProperties { is_transparent: true, color_index: 1 },
+        _ => BlockProperties { is_transparent: false, color_index: 0 },
+    }
+}
+
+/// Returns true if the block is opaque (not air, not transparent).
+#[inline]
+pub fn is_opaque(block: BlockId) -> bool {
+    block != AIR && !block_props(block).is_transparent
+}
+
+/// Returns true if the block is transparent (not air, but light passes through).
+#[inline]
+pub fn is_transparent(block: BlockId) -> bool {
+    block != AIR && block_props(block).is_transparent
+}
 
 pub const NUM_DIRECTIONS: usize = 6;
 pub const DIR_POS_X: usize = 0;
@@ -320,41 +351,58 @@ pub enum ChunkBitmaskResult {
 }
 
 /// Build a bitmask from chunk storage.
+///
+/// Fine mask: only opaque blocks set a bit (transparent = air for ray traversal).
+/// Coarse mask: set for regions containing opaque OR transparent blocks.
 pub fn build_bitmask(storage: &ChunkStorage) -> ChunkBitmaskResult {
     match storage {
         ChunkStorage::Filled(block) => {
             if *block == AIR {
                 ChunkBitmaskResult::AllAir
-            } else {
+            } else if is_opaque(*block) {
                 ChunkBitmaskResult::AllSolid
+            } else {
+                // Filled with transparent block: coarse all set, fine all clear
+                let coarse = !0u64; // all 64 bits set
+                let fine = [0u64; 512];
+                ChunkBitmaskResult::Partial(ChunkBitmask { coarse, fine })
             }
         }
         ChunkStorage::Paletted { .. } => {
             let mut fine = [0u64; 512];
             let mut coarse = 0u64;
-            let mut solid_count = 0u32;
+            let mut opaque_count = 0u32;
+            let mut non_air_count = 0u32;
 
             for z in 0..CHUNK_SIZE {
                 for y in 0..CHUNK_SIZE {
                     for x in 0..CHUNK_SIZE {
-                        if storage.get(x, y, z) != AIR {
-                            solid_count += 1;
+                        let block = storage.get(x, y, z);
+                        if block == AIR {
+                            continue;
+                        }
+                        non_air_count += 1;
+
+                        // Coarse bit: set for any non-air block (opaque or transparent)
+                        let rx = x / 8;
+                        let ry = y / 8;
+                        let rz = z / 8;
+                        let coarse_idx = rx + ry * 4 + rz * 16;
+                        coarse |= 1u64 << coarse_idx;
+
+                        // Fine bit: only set for opaque blocks
+                        if is_opaque(block) {
+                            opaque_count += 1;
                             let fine_idx = x + y * CHUNK_SIZE + z * CHUNK_SIZE * CHUNK_SIZE;
                             fine[fine_idx / 64] |= 1u64 << (fine_idx % 64);
-
-                            let rx = x / 8;
-                            let ry = y / 8;
-                            let rz = z / 8;
-                            let coarse_idx = rx + ry * 4 + rz * 16;
-                            coarse |= 1u64 << coarse_idx;
                         }
                     }
                 }
             }
 
-            if solid_count == 0 {
+            if non_air_count == 0 {
                 ChunkBitmaskResult::AllAir
-            } else if solid_count == CHUNK_SIZE_3 as u32 {
+            } else if opaque_count == CHUNK_SIZE_3 as u32 {
                 ChunkBitmaskResult::AllSolid
             } else {
                 ChunkBitmaskResult::Partial(ChunkBitmask { coarse, fine })

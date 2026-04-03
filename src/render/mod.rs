@@ -1,6 +1,7 @@
 pub mod atmosphere;
 pub mod shadow;
 pub mod taa;
+pub mod wboit;
 
 use std::collections::HashMap;
 
@@ -21,7 +22,7 @@ use wgpu::{
     ShaderSource, StencilState, VertexFormat, VertexStepMode,
 };
 
-use crate::chunk::meshing::ChunkFaces;
+use crate::chunk::meshing::{ChunkFaces, TransparentChunkFaces};
 use crate::chunk::{ChunkLod, ChunkPos, FaceData, LoadedChunkIndex, NUM_DIRECTIONS, DIR_OFFSETS};
 
 pub const PAGE_SIZE: usize = 96;
@@ -277,6 +278,7 @@ pub struct GpuBuffers {
     pub metadata_bind_group_layout: wgpu::BindGroupLayout,
     pub indirect_buffer: Buffer,
     pub draws: Vec<SlabLodDraw>,
+    pub transparent_draws: Vec<SlabLodDraw>,
     pub frustum_culled: u32,
 }
 
@@ -343,6 +345,7 @@ pub struct ChunkRenderEntry {
     pub chunk_pos: IVec3,
     pub lod: u8,
     pub directions: [DirectionPages; NUM_DIRECTIONS],
+    pub transparent_directions: [DirectionPages; NUM_DIRECTIONS],
 }
 
 /// Pre-built draw args for one (chunk, direction) pair that passed backface
@@ -374,6 +377,10 @@ pub struct DrawCache {
     /// Generation when cache was last built.
     pub cached_generation: u64,
 }
+
+/// Draw cache for transparent geometry. Same pattern as opaque DrawCache.
+#[derive(Resource, Default)]
+pub struct TransparentDrawCache(pub DrawCache);
 
 #[derive(Resource, Default)]
 pub struct ChunkRenderData {
@@ -590,6 +597,7 @@ pub fn create_gpu_buffers(device: &Device) -> GpuBuffers {
         metadata_bind_group_layout,
         indirect_buffer,
         draws: Vec::new(),
+        transparent_draws: Vec::new(),
         frustum_culled: 0,
     };
 
@@ -674,6 +682,67 @@ fn is_fully_covered(chunk_pos: IVec3, lod: u8, index: &LoadedChunkIndex) -> bool
     true
 }
 
+/// Upload one set of direction faces to GPU pages. Returns DirectionPages per direction.
+fn upload_direction_faces(
+    dir_faces_array: &[crate::chunk::meshing::DirFaces; NUM_DIRECTIONS],
+    meta_base: &PageMetadata,
+    lod: u8,
+    gpu: &mut GpuBuffers,
+    device: &Device,
+    queue: &wgpu::Queue,
+) -> [DirectionPages; NUM_DIRECTIONS] {
+    std::array::from_fn(|dir| {
+        let dir_faces = &dir_faces_array[dir];
+        let standard_count = dir_faces.standard.len() as u32;
+        let total_count = standard_count + dir_faces.border.len() as u32;
+
+        let combined: Vec<FaceData> = dir_faces
+            .standard
+            .iter()
+            .chain(dir_faces.border.iter())
+            .copied()
+            .collect();
+
+        let mut pages = Vec::new();
+        for face_chunk in combined.chunks(PAGE_SIZE) {
+            let (slab_idx, page_idx) = PageAllocator::allocate(gpu, device);
+
+            let slab = &gpu.slabs[slab_idx];
+            let face_offset =
+                page_idx as u64 * PAGE_SIZE as u64 * std::mem::size_of::<FaceData>() as u64;
+            queue.write_buffer(&slab.face_buffer, face_offset, bytemuck::cast_slice(face_chunk));
+
+            let dir_meta = PageMetadata {
+                direction_and_lod: (dir as u32) | ((lod as u32) << 8),
+                ..*meta_base
+            };
+            let meta_offset = page_idx as u64 * std::mem::size_of::<PageMetadata>() as u64;
+            queue.write_buffer(&slab.metadata_buffer, meta_offset, bytemuck::bytes_of(&dir_meta));
+
+            pages.push(AllocatedPage {
+                slab_index: slab_idx as u16,
+                page_index: page_idx,
+                face_count: face_chunk.len() as u32,
+            });
+        }
+
+        DirectionPages {
+            pages,
+            standard_faces: standard_count,
+            total_faces: total_count,
+        }
+    })
+}
+
+/// Deallocate all pages in a set of DirectionPages.
+fn deallocate_direction_pages(directions: &[DirectionPages; NUM_DIRECTIONS], gpu: &mut GpuBuffers) {
+    for dir_pages in directions {
+        for page in &dir_pages.pages {
+            PageAllocator::deallocate(gpu, page.slab_index as usize, page.page_index);
+        }
+    }
+}
+
 /// Drains ChunkUnloadQueue, deallocates GPU pages and removes shadow grid entries.
 /// Runs before synchronize_gpu in the Synchronize stage.
 pub fn cleanup_unloaded_chunks(
@@ -686,15 +755,8 @@ pub fn cleanup_unloaded_chunks(
     for unload in unload_queue.0.drain(..) {
         if let Some(entry) = render_data.entries.remove(&unload.entity) {
             render_data.dirty = true;
-            for dir_pages in &entry.directions {
-                for page in &dir_pages.pages {
-                    PageAllocator::deallocate(
-                        &mut gpu,
-                        page.slab_index as usize,
-                        page.page_index,
-                    );
-                }
-            }
+            deallocate_direction_pages(&entry.directions, &mut gpu);
+            deallocate_direction_pages(&entry.transparent_directions, &mut gpu);
         }
 
         shadow::grid::remove_chunk_from_grid(
@@ -707,16 +769,20 @@ pub fn cleanup_unloaded_chunks(
 }
 
 /// Build a cached draw entry for one (chunk, direction) pair.
-/// Returns None if backfacing, zero faces, or chunk itself is fully covered.
+/// Returns None if backfacing (when `do_backface_cull` is true), zero faces,
+/// or chunk itself is fully covered.
+/// `directions` selects which face set (opaque or transparent) to read from.
 fn build_draw_for_direction(
     entity: Entity,
     entry: &ChunkRenderEntry,
+    directions: &[DirectionPages; NUM_DIRECTIONS],
     dir: usize,
     cam_world: [f64; 3],
     loaded_index: &LoadedChunkIndex,
     lod_count: usize,
+    do_backface_cull: bool,
 ) -> Option<CachedDraw> {
-    let dir_pages = &entry.directions[dir];
+    let dir_pages = &directions[dir];
     if dir_pages.total_faces == 0 {
         return None;
     }
@@ -738,17 +804,19 @@ fn build_draw_for_direction(
         chunk_min_w[2] + w_extent,
     ];
 
-    let backface = match dir {
-        0 => cam_world[0] <= chunk_min_w[0],
-        1 => cam_world[0] >= chunk_max_w[0],
-        2 => cam_world[1] <= chunk_min_w[1],
-        3 => cam_world[1] >= chunk_max_w[1],
-        4 => cam_world[2] <= chunk_min_w[2],
-        5 => cam_world[2] >= chunk_max_w[2],
-        _ => false,
-    };
-    if backface {
-        return None;
+    if do_backface_cull {
+        let backface = match dir {
+            0 => cam_world[0] <= chunk_min_w[0],
+            1 => cam_world[0] >= chunk_max_w[0],
+            2 => cam_world[1] <= chunk_min_w[1],
+            3 => cam_world[1] >= chunk_max_w[1],
+            4 => cam_world[2] <= chunk_min_w[2],
+            5 => cam_world[2] >= chunk_max_w[2],
+            _ => false,
+        };
+        if backface {
+            return None;
+        }
     }
 
     let neighbor_pos = entry.chunk_pos + DIR_OFFSETS[dir];
@@ -801,12 +869,16 @@ fn build_draw_for_direction(
 
 /// Build cached draw entries for a single chunk's render data.
 /// Returns empty if the chunk is fully covered by finer LOD.
+/// `directions` selects which face set (opaque or transparent) to read from.
+/// `do_backface_cull` should be false for transparent geometry (visible from both sides).
 fn build_draws_for_entry(
     entity: Entity,
     entry: &ChunkRenderEntry,
+    directions: &[DirectionPages; NUM_DIRECTIONS],
     cam_world: [f64; 3],
     loaded_index: &LoadedChunkIndex,
     lod_count: usize,
+    do_backface_cull: bool,
 ) -> Vec<CachedDraw> {
     if entry.lod > 0 && is_fully_covered(entry.chunk_pos, entry.lod, loaded_index) {
         return Vec::new();
@@ -814,7 +886,7 @@ fn build_draws_for_entry(
 
     let mut draws = Vec::new();
     for dir in 0..NUM_DIRECTIONS {
-        if let Some(draw) = build_draw_for_direction(entity, entry, dir, cam_world, loaded_index, lod_count) {
+        if let Some(draw) = build_draw_for_direction(entity, entry, directions, dir, cam_world, loaded_index, lod_count, do_backface_cull) {
             draws.push(draw);
         }
     }
@@ -823,12 +895,13 @@ fn build_draws_for_entry(
 
 pub fn synchronize_gpu(
     mut commands: Commands,
-    query: Query<(Entity, &ChunkPos, &ChunkLod, &ChunkFaces)>,
+    query: Query<(Entity, &ChunkPos, &ChunkLod, &ChunkFaces, &TransparentChunkFaces)>,
     mut render_data: ResMut<ChunkRenderData>,
     mut loaded_index: ResMut<LoadedChunkIndex>,
     _allocator: Res<PageAllocator>,
     mut gpu: ResMut<GpuBuffers>,
     mut draw_cache: ResMut<DrawCache>,
+    mut trans_draw_cache: ResMut<TransparentDrawCache>,
     device: Res<modul_core::DeviceRes>,
     queue: Res<modul_core::QueueRes>,
     lod_maps: Res<crate::chunk::LodChunkMaps>,
@@ -837,14 +910,11 @@ pub fn synchronize_gpu(
 ) {
     let _t_upload = std::time::Instant::now();
     let mut uploaded_entities: Vec<Entity> = Vec::new();
-    for (entity, pos, lod, faces) in query.iter() {
-        // Deallocate old pages
+    for (entity, pos, lod, faces, trans_faces) in query.iter() {
+        // Deallocate old pages (both opaque and transparent)
         if let Some(old) = render_data.entries.remove(&entity) {
-            for dir_pages in &old.directions {
-                for page in &dir_pages.pages {
-                    PageAllocator::deallocate(&mut gpu, page.slab_index as usize, page.page_index);
-                }
-            }
+            deallocate_direction_pages(&old.directions, &mut gpu);
+            deallocate_direction_pages(&old.transparent_directions, &mut gpu);
         }
 
         let meta_base = PageMetadata {
@@ -854,51 +924,8 @@ pub fn synchronize_gpu(
             direction_and_lod: 0,
         };
 
-        let directions = std::array::from_fn(|dir| {
-            let dir_faces = &faces.0[dir];
-            let standard_count = dir_faces.standard.len() as u32;
-            let total_count = standard_count + dir_faces.border.len() as u32;
-
-            let combined: Vec<FaceData> = dir_faces
-                .standard
-                .iter()
-                .chain(dir_faces.border.iter())
-                .copied()
-                .collect();
-
-            let mut pages = Vec::new();
-            for face_chunk in combined.chunks(PAGE_SIZE) {
-                let (slab_idx, page_idx) = PageAllocator::allocate(&mut gpu, &device.0);
-
-                let slab = &gpu.slabs[slab_idx];
-                let face_offset =
-                    page_idx as u64 * PAGE_SIZE as u64 * std::mem::size_of::<FaceData>() as u64;
-                queue
-                    .0
-                    .write_buffer(&slab.face_buffer, face_offset, bytemuck::cast_slice(face_chunk));
-
-                let dir_meta = PageMetadata {
-                    direction_and_lod: (dir as u32) | ((lod.0 as u32) << 8),
-                    ..meta_base
-                };
-                let meta_offset = page_idx as u64 * std::mem::size_of::<PageMetadata>() as u64;
-                queue
-                    .0
-                    .write_buffer(&slab.metadata_buffer, meta_offset, bytemuck::bytes_of(&dir_meta));
-
-                pages.push(AllocatedPage {
-                    slab_index: slab_idx as u16,
-                    page_index: page_idx,
-                    face_count: face_chunk.len() as u32,
-                });
-            }
-
-            DirectionPages {
-                pages,
-                standard_faces: standard_count,
-                total_faces: total_count,
-            }
-        });
+        let directions = upload_direction_faces(&faces.0, &meta_base, lod.0, &mut gpu, &device.0, &queue.0);
+        let transparent_directions = upload_direction_faces(&trans_faces.0, &meta_base, lod.0, &mut gpu, &device.0, &queue.0);
 
         loaded_index.0.insert((pos.0, lod.0));
 
@@ -908,16 +935,19 @@ pub fn synchronize_gpu(
                 chunk_pos: pos.0,
                 lod: lod.0,
                 directions,
+                transparent_directions,
             },
         );
         uploaded_entities.push(entity);
         commands.entity(entity).remove::<ChunkFaces>();
+        commands.entity(entity).remove::<TransparentChunkFaces>();
     }
 
-    // Mark that chunks changed so the draw cache rebuilds.
+    // Mark that chunks changed so both draw caches rebuild.
     if !uploaded_entities.is_empty() || render_data.dirty {
         render_data.dirty = false;
         draw_cache.generation += 1;
+        trans_draw_cache.0.generation += 1;
     }
 
     crate::TIMING_SYNC_UPLOAD_US.store(_t_upload.elapsed().as_micros() as u32, std::sync::atomic::Ordering::Relaxed);
@@ -940,101 +970,109 @@ pub fn synchronize_gpu(
 
     let lod_count = lod_maps.maps.len();
 
-    // --- Update draw cache ---
-    if draw_cache.last_camera_chunk != Some(camera_chunk) {
-        // Full rebuild: camera chunk changed (backface + unloads + coverage all refresh)
-        draw_cache.last_camera_chunk = Some(camera_chunk);
-        draw_cache.cached_generation = draw_cache.generation;
-        draw_cache.entries.clear();
+    /// Update one draw cache (opaque or transparent). `get_directions` extracts the
+    /// relevant DirectionPages from a ChunkRenderEntry.
+    /// `do_backface_cull` should be false for transparent geometry.
+    fn update_draw_cache(
+        cache: &mut DrawCache,
+        render_data: &ChunkRenderData,
+        uploaded_entities: &[Entity],
+        camera_chunk: IVec3,
+        cam_world: [f64; 3],
+        loaded_index: &LoadedChunkIndex,
+        lod_count: usize,
+        lod_maps: &crate::chunk::LodChunkMaps,
+        get_directions: fn(&ChunkRenderEntry) -> &[DirectionPages; NUM_DIRECTIONS],
+        do_backface_cull: bool,
+    ) {
+        if cache.last_camera_chunk != Some(camera_chunk) {
+            // Full rebuild
+            cache.last_camera_chunk = Some(camera_chunk);
+            cache.cached_generation = cache.generation;
+            cache.entries.clear();
 
-        for (&entity, entry) in &render_data.entries {
-            draw_cache.entries.extend(build_draws_for_entry(
-                entity, entry, cam_world, &loaded_index, lod_count,
-            ));
-        }
-    } else if draw_cache.cached_generation != draw_cache.generation {
-        // Incremental: only new uploads arrived, camera stayed in same chunk
-        draw_cache.cached_generation = draw_cache.generation;
-
-        // Mark old entries for re-meshed entities as stale (their pages were reallocated)
-        for cached in draw_cache.entries.iter_mut() {
-            if cached.skip { continue; }
-            for &ent in &uploaded_entities {
-                if cached.entity == ent {
-                    cached.skip = true;
-                    break;
-                }
-            }
-        }
-
-        // Add fresh entries for all uploaded entities
-        for &entity in &uploaded_entities {
-            if let Some(entry) = render_data.entries.get(&entity) {
-                draw_cache.entries.extend(build_draws_for_entry(
-                    entity, entry, cam_world, &loaded_index, lod_count,
+            for (&entity, entry) in &render_data.entries {
+                cache.entries.extend(build_draws_for_entry(
+                    entity, entry, get_directions(entry), cam_world, loaded_index, lod_count, do_backface_cull,
                 ));
             }
-        }
+        } else if cache.cached_generation != cache.generation {
+            // Incremental update
+            cache.cached_generation = cache.generation;
 
-        // Mark parent LOD entries as stale if they became fully covered
-        let mut newly_covered: Vec<(IVec3, u8)> = Vec::new();
-        for &entity in &uploaded_entities {
-            if let Some(entry) = render_data.entries.get(&entity) {
-                let parent_lod = entry.lod + 1;
-                if (parent_lod as usize) < lod_count {
-                    let parent_pos = IVec3::new(
-                        entry.chunk_pos.x.div_euclid(2),
-                        entry.chunk_pos.y.div_euclid(2),
-                        entry.chunk_pos.z.div_euclid(2),
-                    );
-                    if is_fully_covered(parent_pos, parent_lod, &loaded_index) {
-                        newly_covered.push((parent_pos, parent_lod));
-                    }
-                }
-            }
-        }
-        if !newly_covered.is_empty() {
-            for cached in draw_cache.entries.iter_mut() {
+            for cached in cache.entries.iter_mut() {
                 if cached.skip { continue; }
-                for &(pos, lod) in &newly_covered {
-                    if cached.chunk_pos == pos && cached.chunk_lod == lod {
+                for &ent in uploaded_entities {
+                    if cached.entity == ent {
                         cached.skip = true;
                         break;
                     }
                 }
             }
 
-            // Update border faces on same-LOD neighbors of newly covered chunks.
-            // The neighbor's direction toward the covered chunk now needs total_faces
-            // instead of standard_faces to fill the seam.
-            for &(covered_pos, covered_lod) in &newly_covered {
-                let lod_idx = covered_lod as usize;
-                if lod_idx >= lod_maps.maps.len() { continue; }
-                for dir in 0..NUM_DIRECTIONS {
-                    let neighbor_pos = covered_pos + DIR_OFFSETS[dir];
-                    let opposite_dir = (dir ^ 1) as u8;
+            for &entity in uploaded_entities {
+                if let Some(entry) = render_data.entries.get(&entity) {
+                    cache.entries.extend(build_draws_for_entry(
+                        entity, entry, get_directions(entry), cam_world, loaded_index, lod_count, do_backface_cull,
+                    ));
+                }
+            }
 
-                    // Skip neighbors that are themselves fully covered
-                    if is_fully_covered(neighbor_pos, covered_lod, &loaded_index) { continue; }
+            // Mark parent LOD entries as stale if they became fully covered
+            let mut newly_covered: Vec<(IVec3, u8)> = Vec::new();
+            for &entity in uploaded_entities {
+                if let Some(entry) = render_data.entries.get(&entity) {
+                    let parent_lod = entry.lod + 1;
+                    if (parent_lod as usize) < lod_count {
+                        let parent_pos = IVec3::new(
+                            entry.chunk_pos.x.div_euclid(2),
+                            entry.chunk_pos.y.div_euclid(2),
+                            entry.chunk_pos.z.div_euclid(2),
+                        );
+                        if is_fully_covered(parent_pos, parent_lod, loaded_index) {
+                            newly_covered.push((parent_pos, parent_lod));
+                        }
+                    }
+                }
+            }
+            if !newly_covered.is_empty() {
+                for cached in cache.entries.iter_mut() {
+                    if cached.skip { continue; }
+                    for &(pos, lod) in &newly_covered {
+                        if cached.chunk_pos == pos && cached.chunk_lod == lod {
+                            cached.skip = true;
+                            break;
+                        }
+                    }
+                }
 
-                    let neighbor_entity = match lod_maps.maps[lod_idx].get(&neighbor_pos) {
-                        Some(&e) => e,
-                        None => continue,
-                    };
-                    let neighbor_entry = match render_data.entries.get(&neighbor_entity) {
-                        Some(e) => e,
-                        None => continue,
-                    };
+                for &(covered_pos, covered_lod) in &newly_covered {
+                    let lod_idx = covered_lod as usize;
+                    if lod_idx >= lod_maps.maps.len() { continue; }
+                    for dir in 0..NUM_DIRECTIONS {
+                        let neighbor_pos = covered_pos + DIR_OFFSETS[dir];
+                        let opposite_dir = (dir ^ 1) as u8;
 
-                    // Find existing cache entry for this (entity, dir) and update in place
-                    if let Some(cached) = draw_cache.entries.iter_mut().find(|c| {
-                        !c.skip && c.entity == neighbor_entity && c.dir == opposite_dir
-                    }) {
-                        if let Some(updated) = build_draw_for_direction(
-                            neighbor_entity, neighbor_entry, opposite_dir as usize,
-                            cam_world, &loaded_index, lod_count,
-                        ) {
-                            cached.args = updated.args;
+                        if is_fully_covered(neighbor_pos, covered_lod, loaded_index) { continue; }
+
+                        let neighbor_entity = match lod_maps.maps[lod_idx].get(&neighbor_pos) {
+                            Some(&e) => e,
+                            None => continue,
+                        };
+                        let neighbor_entry = match render_data.entries.get(&neighbor_entity) {
+                            Some(e) => e,
+                            None => continue,
+                        };
+
+                        if let Some(cached) = cache.entries.iter_mut().find(|c| {
+                            !c.skip && c.entity == neighbor_entity && c.dir == opposite_dir
+                        }) {
+                            if let Some(updated) = build_draw_for_direction(
+                                neighbor_entity, neighbor_entry, get_directions(neighbor_entry),
+                                opposite_dir as usize, cam_world, loaded_index, lod_count, do_backface_cull,
+                            ) {
+                                cached.args = updated.args;
+                            }
                         }
                     }
                 }
@@ -1042,25 +1080,42 @@ pub fn synchronize_gpu(
         }
     }
 
-    // --- Per-frame: frustum cull cached entries and write to indirect buffer ---
-    {
-        let lod_count = lod_maps.maps.len();
-        let slab_count = gpu.slabs.len();
+    // --- Update opaque draw cache ---
+    update_draw_cache(
+        &mut draw_cache, &render_data, &uploaded_entities,
+        camera_chunk, cam_world, &loaded_index, lod_count, &lod_maps,
+        |e| &e.directions, true,
+    );
 
+    // --- Update transparent draw cache (no backface cull — visible from both sides) ---
+    update_draw_cache(
+        &mut trans_draw_cache.0, &render_data, &uploaded_entities,
+        camera_chunk, cam_world, &loaded_index, lod_count, &lod_maps,
+        |e| &e.transparent_directions, false,
+    );
+
+    // --- Per-frame: frustum cull cached entries and write to indirect buffer ---
+    /// Frustum cull a draw cache and collect indirect draw args grouped by slab+lod.
+    fn frustum_cull_cache(
+        cache: &DrawCache,
+        frustum_planes: &[[f32; 4]; 6],
+        frustum_chunk_offset: IVec3,
+        lod_count: usize,
+        slab_count: usize,
+    ) -> (Vec<Vec<Vec<DrawIndirectArgs>>>, u32) {
         let mut args_per_slab_lod: Vec<Vec<Vec<DrawIndirectArgs>>> = (0..slab_count)
             .map(|_| (0..lod_count).map(|_| Vec::new()).collect())
             .collect();
-
         let mut frustum_culled = 0u32;
         let cs = crate::chunk::CHUNK_SIZE as f32;
 
-        for cached in &draw_cache.entries {
+        for cached in &cache.entries {
             if cached.skip { continue; }
             let rel = cached.rel_chunk_pos - frustum_chunk_offset;
             let min = [rel.x as f32 * cs, rel.y as f32 * cs, rel.z as f32 * cs];
             let extent = cached.lod_scale as f32 * cs;
             let max = [min[0] + extent, min[1] + extent, min[2] + extent];
-            if !crate::camera::is_aabb_in_frustum(&frustum_planes, min, max) {
+            if !crate::camera::is_aabb_in_frustum(frustum_planes, min, max) {
                 frustum_culled += 1;
                 continue;
             }
@@ -1072,10 +1127,20 @@ pub fn synchronize_gpu(
             args_per_slab_lod[slab][cached.lod].extend_from_slice(&cached.args);
         }
 
-        // Write to indirect buffer grouped by LOD then slab
-        let mut draws = Vec::new();
-        let mut offset = 0u64;
+        (args_per_slab_lod, frustum_culled)
+    }
+
+    /// Write frustum-culled args into indirect buffer, returning SlabLodDraw list and next offset.
+    fn write_draws_to_indirect(
+        args_per_slab_lod: &[Vec<Vec<DrawIndirectArgs>>],
+        lod_count: usize,
+        queue: &wgpu::Queue,
+        indirect_buffer: &Buffer,
+        start_offset: u64,
+    ) -> (Vec<SlabLodDraw>, u64) {
         let stride = std::mem::size_of::<DrawIndirectArgs>() as u64;
+        let mut draws = Vec::new();
+        let mut offset = start_offset;
 
         for lod in 0..lod_count {
             for (slab_idx, slab_lods) in args_per_slab_lod.iter().enumerate() {
@@ -1083,21 +1148,42 @@ pub fn synchronize_gpu(
                 if args.is_empty() {
                     continue;
                 }
-                let byte_offset = offset;
-                queue
-                    .0
-                    .write_buffer(&gpu.indirect_buffer, byte_offset, bytemuck::cast_slice(args));
+                queue.write_buffer(indirect_buffer, offset, bytemuck::cast_slice(args));
                 draws.push(SlabLodDraw {
                     slab_index: slab_idx,
-                    offset: byte_offset,
+                    offset,
                     count: args.len() as u32,
                 });
                 offset += args.len() as u64 * stride;
             }
         }
 
-        gpu.draws = draws;
-        gpu.frustum_culled = frustum_culled;
+        (draws, offset)
+    }
+
+    {
+        let lod_count = lod_maps.maps.len();
+        let slab_count = gpu.slabs.len();
+
+        // Opaque
+        let (opaque_args, frustum_culled) = frustum_cull_cache(
+            &draw_cache, &frustum_planes, frustum_chunk_offset, lod_count, slab_count,
+        );
+        let (opaque_draws, next_offset) = write_draws_to_indirect(
+            &opaque_args, lod_count, &queue.0, &gpu.indirect_buffer, 0,
+        );
+
+        // Transparent
+        let (trans_args, trans_culled) = frustum_cull_cache(
+            &trans_draw_cache.0, &frustum_planes, frustum_chunk_offset, lod_count, slab_count,
+        );
+        let (trans_draws, _) = write_draws_to_indirect(
+            &trans_args, lod_count, &queue.0, &gpu.indirect_buffer, next_offset,
+        );
+
+        gpu.draws = opaque_draws;
+        gpu.transparent_draws = trans_draws;
+        gpu.frustum_culled = frustum_culled + trans_culled;
     }
 
     crate::TIMING_SYNC_DRAWS_US.store(_t_draws.elapsed().as_micros() as u32, std::sync::atomic::Ordering::Relaxed);
@@ -1130,6 +1216,20 @@ impl OperationBuilder for ClearAll {
 pub fn draw_voxel_geometry(pass: &mut wgpu::RenderPass, gpu: &GpuBuffers) {
     let mut current_slab = usize::MAX;
     for draw in &gpu.draws {
+        if draw.slab_index != current_slab {
+            current_slab = draw.slab_index;
+            let slab = &gpu.slabs[current_slab];
+            pass.set_vertex_buffer(0, slab.face_buffer.slice(..));
+            pass.set_bind_group(1, &slab.metadata_bind_group, &[]);
+        }
+        pass.multi_draw_indirect(&gpu.indirect_buffer, draw.offset, draw.count);
+    }
+}
+
+/// Draw loop for transparent geometry. Same as opaque but uses transparent_draws.
+pub fn draw_transparent_geometry(pass: &mut wgpu::RenderPass, gpu: &GpuBuffers) {
+    let mut current_slab = usize::MAX;
+    for draw in &gpu.transparent_draws {
         if draw.slab_index != current_slab {
             current_slab = draw.slab_index;
             let slab = &gpu.slabs[current_slab];

@@ -200,6 +200,7 @@ fn main() {
         app.insert_resource(chunk::LoadedChunkIndex::default());
         app.insert_resource(render::ChunkRenderData::default());
         app.insert_resource(render::DrawCache::default());
+        app.insert_resource(render::TransparentDrawCache::default());
         app.insert_resource(chunk::loading::ChunkLoader::default());
         app.insert_resource(render::shadow::grid::ShadowGrid::new(end_radius, lod_count as u32));
         app.insert_resource(render::shadow::grid::BitmaskPool::new());
@@ -216,6 +217,7 @@ fn main() {
             render::shadow::init_shadow,
             render::taa::init_taa,
             render::atmosphere::init_atmosphere,
+            render::wboit::init_wboit,
         ).chain());
 
         // Gameplay systems (before render). process_input runs first so debug
@@ -303,6 +305,8 @@ fn init_window(
         .add(render::shadow::pass::ShadowTraceOperationBuilder)
         .add(render::taa::TaaVoxelDrawOperationBuilder)
         .add(render::atmosphere::SkyPassOperationBuilder)
+        .add(render::wboit::TransparentDrawOperationBuilder)
+        .add(render::wboit::WboitResolveOperationBuilder)
         .add(render::taa::TaaResolveOperationBuilder {
             surface_entity: window_entity,
         })

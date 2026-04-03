@@ -20,6 +20,11 @@ pub struct DirFaces {
 #[component(storage = "SparseSet")]
 pub struct ChunkFaces(pub [DirFaces; NUM_DIRECTIONS]);
 
+/// Transparent faces, separate from opaque. Same standard/border split per direction.
+#[derive(Component)]
+#[component(storage = "SparseSet")]
+pub struct TransparentChunkFaces(pub [DirFaces; NUM_DIRECTIONS]);
+
 struct MeshRequest {
     entity: Entity,
     storage: Arc<ChunkStorage>,
@@ -28,7 +33,8 @@ struct MeshRequest {
 
 struct MeshResult {
     entity: Entity,
-    faces: [DirFaces; NUM_DIRECTIONS],
+    opaque_faces: [DirFaces; NUM_DIRECTIONS],
+    transparent_faces: [DirFaces; NUM_DIRECTIONS],
 }
 
 /// Channel-based worker pool for chunk meshing.
@@ -56,18 +62,24 @@ impl MeshPool {
                 .name(format!("mesh-worker-{i}"))
                 .spawn(move || {
                     while let Ok(req) = req_rx.recv() {
-                        let mut faces = mesh_chunk(&req.storage, &req.neighbors);
+                        let (mut opaque, mut transparent) = mesh_chunk(&req.storage, &req.neighbors);
                         // Drop border faces for directions with no standard faces.
                         // If there's no visible surface in a direction, border faces
                         // are pure overhead (the chunk is buried on that side).
-                        for dir_faces in &mut faces {
+                        for dir_faces in &mut opaque {
+                            if dir_faces.standard.is_empty() {
+                                dir_faces.border.clear();
+                            }
+                        }
+                        for dir_faces in &mut transparent {
                             if dir_faces.standard.is_empty() {
                                 dir_faces.border.clear();
                             }
                         }
                         let _ = res_tx.send(MeshResult {
                             entity: req.entity,
-                            faces,
+                            opaque_faces: opaque,
+                            transparent_faces: transparent,
                         });
                     }
                 })
@@ -121,15 +133,17 @@ pub fn start_meshing(
     chunk_data_query: Query<&ChunkData>,
     pool: Res<MeshPool>,
 ) {
-    let empty_faces = || ChunkFaces(std::array::from_fn(|_| DirFaces {
+    let empty_dir_faces = || std::array::from_fn(|_| DirFaces {
         standard: Vec::new(),
         border: Vec::new(),
-    }));
+    });
 
     for (entity, pos, lod, data) in query.iter() {
         // Skip meshing for all-air chunks -- no faces possible
         if let ChunkStorage::Filled(AIR) = &*data.0 {
-            commands.entity(entity).insert(empty_faces()).remove::<NeedsRemesh>();
+            commands.entity(entity)
+                .insert((ChunkFaces(empty_dir_faces()), TransparentChunkFaces(empty_dir_faces())))
+                .remove::<NeedsRemesh>();
             continue;
         }
 
@@ -159,15 +173,20 @@ pub fn poll_meshing(
 ) {
     while let Ok(result) = pool.rx.try_recv() {
         if entity_check.get(result.entity).is_ok() {
-            commands.entity(result.entity).insert(ChunkFaces(result.faces));
+            commands.entity(result.entity).insert((
+                ChunkFaces(result.opaque_faces),
+                TransparentChunkFaces(result.transparent_faces),
+            ));
         }
     }
 }
 
 // --- Meshing internals ---
 
-/// Check if a block at (x, y, z) is solid, handling cross-chunk lookups.
+/// Check if a block at (x, y, z) is opaque (solid and non-transparent),
+/// handling cross-chunk lookups.
 /// Coordinates outside all accessible chunks (diagonal neighbors) default to air.
+/// Used for AO computation: only opaque blocks cast AO.
 fn is_solid_at(
     x: i32,
     y: i32,
@@ -177,7 +196,7 @@ fn is_solid_at(
 ) -> bool {
     let cs = CHUNK_SIZE as i32;
     if x >= 0 && x < cs && y >= 0 && y < cs && z >= 0 && z < cs {
-        return storage.get(x as usize, y as usize, z as usize) != AIR;
+        return is_opaque(storage.get(x as usize, y as usize, z as usize));
     }
     // Determine which axis is out of bounds and the corrected coordinate
     let (nx, dir_x) = if x < 0 {
@@ -209,7 +228,7 @@ fn is_solid_at(
         _ => return false, // diagonal/corner neighbor — no data, treat as air
     };
     match &neighbors[active_dir] {
-        Some(n) => n.get(nx as usize, ny as usize, nz as usize) != AIR,
+        Some(n) => is_opaque(n.get(nx as usize, ny as usize, nz as usize)),
         None => false,
     }
 }
@@ -298,20 +317,23 @@ fn get_neighbor_block(
     }
 }
 
-/// Produce standard + border faces per direction.
+/// Produce standard + border faces per direction, split into opaque and transparent.
 ///
-/// Standard face: exposed to air (neighbor voxel is AIR).
-/// Border face: hidden by a same-LOD neighbor's solid voxel. These are faces that
+/// Standard face: exposed to a different visibility class.
+/// Border face: hidden by a same-LOD neighbor's same-class voxel. These are faces that
 /// would become visible if that neighbor stopped rendering (LOD coverage).
 fn mesh_chunk(
     storage: &ChunkStorage,
     neighbors: &[Option<Arc<ChunkStorage>>; 6],
-) -> [DirFaces; NUM_DIRECTIONS] {
-    // Stage 1: extract face buffers.
-    // For each direction, two buffers: standard (exposed to air) and border (hidden by neighbor solid).
-    let mut std_buffers: [Vec<BlockId>; NUM_DIRECTIONS] =
+) -> ([DirFaces; NUM_DIRECTIONS], [DirFaces; NUM_DIRECTIONS]) {
+    // Stage 1: extract face buffers — separate opaque and transparent.
+    let mut opaque_std: [Vec<BlockId>; NUM_DIRECTIONS] =
         std::array::from_fn(|_| vec![AIR; CHUNK_SIZE_3]);
-    let mut border_buffers: [Vec<BlockId>; NUM_DIRECTIONS] =
+    let mut opaque_border: [Vec<BlockId>; NUM_DIRECTIONS] =
+        std::array::from_fn(|_| vec![AIR; CHUNK_SIZE_3]);
+    let mut trans_std: [Vec<BlockId>; NUM_DIRECTIONS] =
+        std::array::from_fn(|_| vec![AIR; CHUNK_SIZE_3]);
+    let mut trans_border: [Vec<BlockId>; NUM_DIRECTIONS] =
         std::array::from_fn(|_| vec![AIR; CHUNK_SIZE_3]);
 
     for z in 0..CHUNK_SIZE {
@@ -322,84 +344,108 @@ fn mesh_chunk(
                     continue;
                 }
                 let idx = x + y * CHUNK_SIZE + z * CHUNK_SIZE_2;
+                let (std_bufs, border_bufs) = if is_transparent(block) {
+                    (&mut trans_std, &mut trans_border)
+                } else {
+                    (&mut opaque_std, &mut opaque_border)
+                };
 
-                // For each direction, check if the face is exposed.
-                // If neighbor is AIR -> standard face.
-                // If neighbor is solid AND comes from a neighbor chunk -> border face.
-                // If neighbor is solid AND within same chunk -> no face (interior).
                 check_face(block, idx, x, CHUNK_SIZE - 1, true,
                     || storage.get(x + 1, y, z),
                     || get_neighbor_block(&neighbors[DIR_POS_X], 0, y, z),
-                    &mut std_buffers[DIR_POS_X], &mut border_buffers[DIR_POS_X]);
+                    &mut std_bufs[DIR_POS_X], &mut border_bufs[DIR_POS_X]);
 
                 check_face(block, idx, x, 0, false,
                     || storage.get(x - 1, y, z),
                     || get_neighbor_block(&neighbors[DIR_NEG_X], CHUNK_SIZE - 1, y, z),
-                    &mut std_buffers[DIR_NEG_X], &mut border_buffers[DIR_NEG_X]);
+                    &mut std_bufs[DIR_NEG_X], &mut border_bufs[DIR_NEG_X]);
 
                 check_face(block, idx, y, CHUNK_SIZE - 1, true,
                     || storage.get(x, y + 1, z),
                     || get_neighbor_block(&neighbors[DIR_POS_Y], x, 0, z),
-                    &mut std_buffers[DIR_POS_Y], &mut border_buffers[DIR_POS_Y]);
+                    &mut std_bufs[DIR_POS_Y], &mut border_bufs[DIR_POS_Y]);
 
                 check_face(block, idx, y, 0, false,
                     || storage.get(x, y - 1, z),
                     || get_neighbor_block(&neighbors[DIR_NEG_Y], x, CHUNK_SIZE - 1, z),
-                    &mut std_buffers[DIR_NEG_Y], &mut border_buffers[DIR_NEG_Y]);
+                    &mut std_bufs[DIR_NEG_Y], &mut border_bufs[DIR_NEG_Y]);
 
                 check_face(block, idx, z, CHUNK_SIZE - 1, true,
                     || storage.get(x, y, z + 1),
                     || get_neighbor_block(&neighbors[DIR_POS_Z], x, y, 0),
-                    &mut std_buffers[DIR_POS_Z], &mut border_buffers[DIR_POS_Z]);
+                    &mut std_bufs[DIR_POS_Z], &mut border_bufs[DIR_POS_Z]);
 
                 check_face(block, idx, z, 0, false,
                     || storage.get(x, y, z - 1),
                     || get_neighbor_block(&neighbors[DIR_NEG_Z], x, y, CHUNK_SIZE - 1),
-                    &mut std_buffers[DIR_NEG_Z], &mut border_buffers[DIR_NEG_Z]);
+                    &mut std_bufs[DIR_NEG_Z], &mut border_bufs[DIR_NEG_Z]);
             }
         }
     }
 
     // Stage 2: greedy mesh each set separately per direction.
-    std::array::from_fn(|dir| DirFaces {
-        standard: greedy_mesh_buffer(dir, &std_buffers[dir], storage, neighbors),
-        border: greedy_mesh_buffer(dir, &border_buffers[dir], storage, neighbors),
-    })
+    let opaque = std::array::from_fn(|dir| DirFaces {
+        standard: greedy_mesh_buffer(dir, &opaque_std[dir], storage, neighbors),
+        border: greedy_mesh_buffer(dir, &opaque_border[dir], storage, neighbors),
+    });
+    let transparent = std::array::from_fn(|dir| DirFaces {
+        standard: greedy_mesh_buffer(dir, &trans_std[dir], storage, neighbors),
+        border: greedy_mesh_buffer(dir, &trans_border[dir], storage, neighbors),
+    });
+    (opaque, transparent)
 }
 
-/// Check one face direction. If at chunk boundary, a solid neighbor produces a border face.
-/// If interior, a solid neighbor means no face at all.
+/// Returns true if neighbor `nb` exposes a face on block `block`.
+///   opaque block → face shown if neighbor is air or transparent
+///   transparent block → face shown only if neighbor is air or different transparent type
+///     (NOT next to opaque — the opaque face already exists there, avoids z-fighting)
+#[inline]
+fn face_exposed(block: BlockId, nb: BlockId) -> bool {
+    if nb == AIR {
+        return true;
+    }
+    let block_trans = is_transparent(block);
+    let nb_trans = is_transparent(nb);
+    // Opaque faces exposed by transparent neighbor
+    if !block_trans && nb_trans {
+        return true;
+    }
+    // Different-type transparent blocks: show face
+    if block_trans && nb_trans && block != nb {
+        return true;
+    }
+    false
+}
+
+/// Check one face direction. If at chunk boundary, a non-exposing neighbor produces a border face.
+/// If interior, a non-exposing neighbor means no face at all.
 #[inline]
 fn check_face(
     block: BlockId,
     idx: usize,
     coord: usize,
     boundary: usize,
-    at_boundary_when_eq: bool,
+    _at_boundary_when_eq: bool,
     get_interior: impl FnOnce() -> BlockId,
     get_neighbor: impl FnOnce() -> BlockId,
     std_buf: &mut [BlockId],
     border_buf: &mut [BlockId],
 ) {
-    let at_boundary = if at_boundary_when_eq {
-        coord == boundary
-    } else {
-        coord == boundary
-    };
+    let at_boundary = coord == boundary;
 
     if at_boundary {
         let nb = get_neighbor();
-        if nb == AIR {
-            std_buf[idx] = block; // exposed to air -- always draw
+        if face_exposed(block, nb) {
+            std_buf[idx] = block; // exposed -- always draw
         } else {
-            border_buf[idx] = block; // hidden by neighbor solid -- border face
+            border_buf[idx] = block; // hidden by same-class neighbor -- border face
         }
     } else {
         let nb = get_interior();
-        if nb == AIR {
-            std_buf[idx] = block; // interior face exposed to air
+        if face_exposed(block, nb) {
+            std_buf[idx] = block; // interior face exposed
         }
-        // interior solid neighbor = no face at all
+        // same-class neighbor = no face at all
     }
 }
 
