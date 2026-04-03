@@ -89,14 +89,15 @@ impl Drop for MeshPool {
     }
 }
 
-/// Consumes ChunkChangedQueue, marks affected chunks + neighbors with NeedsRemesh.
+/// Reads ChunkChangedQueue, marks affected chunks + neighbors with NeedsRemesh.
+/// Does not drain — queue is cleared separately at end of frame.
 pub fn resolve_changes(
     mut commands: Commands,
-    mut changed: ResMut<ChunkChangedQueue>,
+    changed: Res<ChunkChangedQueue>,
     lod_maps: Res<LodChunkMaps>,
     loaded_index: Res<LoadedChunkIndex>,
 ) {
-    for change in changed.0.drain(..) {
+    for change in &changed.0 {
         let map = &lod_maps.maps[change.lod as usize];
         if let Some(&entity) = map.get(&change.pos) {
             commands.entity(entity).insert(NeedsRemesh);

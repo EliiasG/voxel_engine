@@ -18,6 +18,7 @@ pub const AIR: BlockId = 0;
 pub const STONE: BlockId = 1;
 pub const DIRT: BlockId = 2;
 pub const GRASS: BlockId = 3;
+pub const GLASS: BlockId = 4;
 
 pub const NUM_DIRECTIONS: usize = 6;
 pub const DIR_POS_X: usize = 0;
@@ -51,6 +52,7 @@ pub struct FaceData {
 
 // --- Palette-compressed chunk storage ---
 
+#[derive(Clone)]
 pub enum ChunkStorage {
     Filled(BlockId),
     Paletted {
@@ -268,13 +270,24 @@ impl LodChunkMaps {
 pub struct LoadedChunkIndex(pub std::collections::HashSet<(IVec3, u8)>);
 
 pub struct ChunkChange {
+    pub entity: Entity,
     pub pos: IVec3,
     pub lod: u8,
 }
 
-/// Change queue. Generation pushes, meshing drains.
+/// Change queue. Generation pushes, consumers iterate, cleared at end of frame.
 #[derive(Resource, Default)]
 pub struct ChunkChangedQueue(pub Vec<ChunkChange>);
+
+pub struct ChunkUnload {
+    pub entity: Entity,
+    pub pos: IVec3,
+    pub lod: u8,
+}
+
+/// Unload queue. Loading pushes, render-side cleanup drains.
+#[derive(Resource, Default)]
+pub struct ChunkUnloadQueue(pub Vec<ChunkUnload>);
 
 /// Convert a LOD 0 chunk coordinate to a LOD N chunk coordinate.
 pub fn lod_chunk_pos(lod0_pos: IVec3, lod: u32) -> IVec3 {
@@ -287,4 +300,70 @@ pub fn lod_chunk_pos(lod0_pos: IVec3, lod: u32) -> IVec3 {
         lod0_pos.y.div_euclid(scale),
         lod0_pos.z.div_euclid(scale),
     )
+}
+
+// --- Occupancy bitmask (chunk data, used by shadow system) ---
+
+/// Per-chunk occupancy bitmask for shadow ray tracing.
+/// Two levels: a coarse 4x4x4 mask and a fine 32x32x32 mask.
+#[repr(C)]
+#[derive(Copy, Clone, Pod, Zeroable)]
+pub struct ChunkBitmask {
+    pub coarse: u64,
+    pub fine: [u64; 512],
+}
+
+pub enum ChunkBitmaskResult {
+    AllAir,
+    AllSolid,
+    Partial(ChunkBitmask),
+}
+
+/// Build a bitmask from chunk storage.
+pub fn build_bitmask(storage: &ChunkStorage) -> ChunkBitmaskResult {
+    match storage {
+        ChunkStorage::Filled(block) => {
+            if *block == AIR {
+                ChunkBitmaskResult::AllAir
+            } else {
+                ChunkBitmaskResult::AllSolid
+            }
+        }
+        ChunkStorage::Paletted { .. } => {
+            let mut fine = [0u64; 512];
+            let mut coarse = 0u64;
+            let mut solid_count = 0u32;
+
+            for z in 0..CHUNK_SIZE {
+                for y in 0..CHUNK_SIZE {
+                    for x in 0..CHUNK_SIZE {
+                        if storage.get(x, y, z) != AIR {
+                            solid_count += 1;
+                            let fine_idx = x + y * CHUNK_SIZE + z * CHUNK_SIZE * CHUNK_SIZE;
+                            fine[fine_idx / 64] |= 1u64 << (fine_idx % 64);
+
+                            let rx = x / 8;
+                            let ry = y / 8;
+                            let rz = z / 8;
+                            let coarse_idx = rx + ry * 4 + rz * 16;
+                            coarse |= 1u64 << coarse_idx;
+                        }
+                    }
+                }
+            }
+
+            if solid_count == 0 {
+                ChunkBitmaskResult::AllAir
+            } else if solid_count == CHUNK_SIZE_3 as u32 {
+                ChunkBitmaskResult::AllSolid
+            } else {
+                ChunkBitmaskResult::Partial(ChunkBitmask { coarse, fine })
+            }
+        }
+    }
+}
+
+/// Clears the chunk changed queue. Scheduled after all consumers have run.
+pub fn clear_chunk_changed_queue(mut changed: ResMut<ChunkChangedQueue>) {
+    changed.0.clear();
 }

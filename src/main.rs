@@ -196,8 +196,10 @@ fn main() {
         // Resources
         app.insert_resource(chunk::LodChunkMaps::new(lod_count));
         app.insert_resource(chunk::ChunkChangedQueue::default());
+        app.insert_resource(chunk::ChunkUnloadQueue::default());
         app.insert_resource(chunk::LoadedChunkIndex::default());
         app.insert_resource(render::ChunkRenderData::default());
+        app.insert_resource(render::DrawCache::default());
         app.insert_resource(chunk::loading::ChunkLoader::default());
         app.insert_resource(render::shadow::grid::ShadowGrid::new(end_radius, lod_count as u32));
         app.insert_resource(render::shadow::grid::BitmaskPool::new());
@@ -242,12 +244,19 @@ fn main() {
         app.add_systems(
             Synchronize,
             (
+                render::cleanup_unloaded_chunks.before(render::synchronize_gpu),
+                render::shadow::grid::process_chunk_bitmasks
+                    .before(render::shadow::gpu::synchronize_shadow_buffers),
+                render::shadow::grid::update_shadow_grid_origins
+                    .before(render::shadow::gpu::synchronize_shadow_buffers),
                 render::synchronize_gpu,
                 render::shadow::gpu::synchronize_shadow_buffers,
                 update_day_cycle,
                 render::atmosphere::update_atmosphere,
                 update_camera.before(render::shadow::pass::update_previous_frame_data),
                 render::shadow::pass::update_previous_frame_data,
+                chunk::clear_chunk_changed_queue
+                    .after(render::shadow::grid::process_chunk_bitmasks),
             ),
         );
     });
@@ -338,6 +347,83 @@ fn set_cursor_captured(window: &winit::window::Window, captured: bool) {
 }
 
 
+/// DDA raycast through LOD-0 chunks. Returns (hit_pos, face_normal) in world block coords.
+/// `max_dist` is in blocks.
+fn raycast_blocks(
+    origin: [f64; 3],
+    dir: [f32; 3],
+    max_dist: f32,
+    lod_maps: &chunk::LodChunkMaps,
+    chunk_data_q: &Query<&mut chunk::ChunkData>,
+) -> Option<([i32; 3], [i32; 3])> {
+    let cs = chunk::CHUNK_SIZE as i32;
+
+    // Current voxel position
+    let mut vx = origin[0].floor() as i32;
+    let mut vy = origin[1].floor() as i32;
+    let mut vz = origin[2].floor() as i32;
+
+    let step_x = if dir[0] >= 0.0 { 1i32 } else { -1 };
+    let step_y = if dir[1] >= 0.0 { 1i32 } else { -1 };
+    let step_z = if dir[2] >= 0.0 { 1i32 } else { -1 };
+
+    let inv_dx = if dir[0] != 0.0 { 1.0 / dir[0] as f64 } else { f64::MAX };
+    let inv_dy = if dir[1] != 0.0 { 1.0 / dir[1] as f64 } else { f64::MAX };
+    let inv_dz = if dir[2] != 0.0 { 1.0 / dir[2] as f64 } else { f64::MAX };
+
+    let mut t_max_x = ((if step_x > 0 { vx + 1 } else { vx }) as f64 - origin[0]) * inv_dx;
+    let mut t_max_y = ((if step_y > 0 { vy + 1 } else { vy }) as f64 - origin[1]) * inv_dy;
+    let mut t_max_z = ((if step_z > 0 { vz + 1 } else { vz }) as f64 - origin[2]) * inv_dz;
+
+    let t_delta_x = (step_x as f64 * inv_dx).abs();
+    let t_delta_y = (step_y as f64 * inv_dy).abs();
+    let t_delta_z = (step_z as f64 * inv_dz).abs();
+
+    let mut face = [0i32; 3];
+    let max_steps = (max_dist * 2.0) as usize;
+
+    for _ in 0..max_steps {
+        // Look up chunk and local coords
+        let cx = vx.div_euclid(cs);
+        let cy = vy.div_euclid(cs);
+        let cz = vz.div_euclid(cs);
+        let lx = vx.rem_euclid(cs) as usize;
+        let ly = vy.rem_euclid(cs) as usize;
+        let lz = vz.rem_euclid(cs) as usize;
+
+        let chunk_pos = glam::IVec3::new(cx, cy, cz);
+        if let Some(&entity) = lod_maps.maps[0].get(&chunk_pos) {
+            if let Ok(data) = chunk_data_q.get(entity) {
+                let block = data.0.get(lx, ly, lz);
+                if block != chunk::AIR {
+                    return Some(([vx, vy, vz], face));
+                }
+            }
+        }
+
+
+        // Step to next voxel
+        if t_max_x < t_max_y && t_max_x < t_max_z {
+            if t_max_x > max_dist as f64 { break; }
+            vx += step_x;
+            t_max_x += t_delta_x;
+            face = [-step_x, 0, 0];
+        } else if t_max_y < t_max_z {
+            if t_max_y > max_dist as f64 { break; }
+            vy += step_y;
+            t_max_y += t_delta_y;
+            face = [0, -step_y, 0];
+        } else {
+            if t_max_z > max_dist as f64 { break; }
+            vz += step_z;
+            t_max_z += t_delta_z;
+            face = [0, 0, -step_z];
+        }
+    }
+
+    None
+}
+
 fn process_input(
     events: Res<EventBuffer>,
     mut input: ResMut<InputState>,
@@ -350,11 +436,11 @@ fn process_input(
     frame_count: Res<FrameCount>,
     loaded_index: Res<chunk::LoadedChunkIndex>,
     lod_maps: Res<chunk::LodChunkMaps>,
-    _loader: Res<chunk::loading::ChunkLoader>,
-    chunk_data_q: Query<(), With<chunk::ChunkData>>,
+    mut chunk_data_q: Query<&mut chunk::ChunkData>,
     needs_remesh_q: Query<(), With<chunk::meshing::NeedsRemesh>>,
     window_query: Query<&WindowComponent, With<MainWindow>>,
     mut cam_query: Query<(&mut Position, &mut FlyCamera, &CameraConfig), With<MainCamera>>,
+    mut changed_queue: ResMut<chunk::ChunkChangedQueue>,
 ) {
     let now = std::time::Instant::now();
     input.dt = now.duration_since(input.last_instant).as_secs_f32();
@@ -490,13 +576,46 @@ fn process_input(
             }
 
             Event::WindowEvent {
-                event: WindowEvent::MouseInput { state: ElementState::Pressed, .. },
+                event: WindowEvent::MouseInput { state: ElementState::Pressed, button, .. },
                 ..
             } => {
                 if !input.captured {
                     input.captured = true;
                     if let Ok(wc) = window_query.get_single() {
                         set_cursor_captured(&wc.window, true);
+                    }
+                } else {
+                    let dir = fly_cam.look_dir();
+                    let dir_arr = [dir.x, dir.y, dir.z];
+                    let ray_hit = raycast_blocks(
+                        cam_pos.0, dir_arr, 100.0, &lod_maps, &chunk_data_q,
+                    );
+                    if let Some((hit, face)) = ray_hit {
+                        let cs = chunk::CHUNK_SIZE as i32;
+                        let (target, block) = match button {
+                            winit::event::MouseButton::Left => (hit, chunk::AIR),
+                            winit::event::MouseButton::Right => {
+                                ([hit[0] + face[0], hit[1] + face[1], hit[2] + face[2]], chunk::GLASS)
+                            }
+                            _ => { continue; }
+                        };
+                        let cx = target[0].div_euclid(cs);
+                        let cy = target[1].div_euclid(cs);
+                        let cz = target[2].div_euclid(cs);
+                        let chunk_pos = glam::IVec3::new(cx, cy, cz);
+                        if let Some(&entity) = lod_maps.maps[0].get(&chunk_pos) {
+                            if let Ok(mut data) = chunk_data_q.get_mut(entity) {
+                                let lx = target[0].rem_euclid(cs) as usize;
+                                let ly = target[1].rem_euclid(cs) as usize;
+                                let lz = target[2].rem_euclid(cs) as usize;
+                                std::sync::Arc::make_mut(&mut data.0).set(lx, ly, lz, block);
+                                changed_queue.0.push(chunk::ChunkChange {
+                                    entity,
+                                    pos: chunk_pos,
+                                    lod: 0,
+                                });
+                            }
+                        }
                     }
                 }
             }

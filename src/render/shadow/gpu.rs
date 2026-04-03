@@ -2,7 +2,7 @@ use bevy_ecs::prelude::*;
 use modul_render::BindGroupLayoutDef;
 use wgpu::{Buffer, BufferDescriptor, BufferUsages, Device};
 
-use super::bitmask::ChunkBitmask;
+use crate::chunk::ChunkBitmask;
 use super::grid::{BitmaskPool, LodInfo, ShadowGrid};
 
 const INITIAL_BITMASK_CAPACITY: u32 = 8192;

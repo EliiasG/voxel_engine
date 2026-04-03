@@ -7,14 +7,11 @@ use glam::IVec3;
 use super::{
     ChunkStorage, AIR, CHUNK_SIZE, CHUNK_SIZE_2, CHUNK_SIZE_3, DIRT, GRASS, STONE,
 };
-use crate::render::shadow::bitmask::{self, ChunkBitmaskResult};
-
 pub struct GenResult {
     pub entity: Entity,
     pub pos: IVec3,
     pub lod: u8,
     pub storage: ChunkStorage,
-    pub bitmask: ChunkBitmaskResult,
 }
 
 /// Trait for chunk generation backends.
@@ -64,13 +61,11 @@ impl GenPool {
                 .spawn(move || {
                     while let Ok(req) = req_rx.recv() {
                         let storage = generate_terrain(req.pos, req.lod);
-                        let bitmask = bitmask::build_bitmask(&storage);
                         let _ = res_tx.send(GenResult {
                             entity: req.entity,
                             pos: req.pos,
                             lod: req.lod,
                             storage,
-                            bitmask,
                         });
                     }
                 })

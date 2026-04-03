@@ -6,7 +6,7 @@ use glam::IVec3;
 
 use crate::chunk::lod_chunk_pos;
 
-use super::bitmask::{ChunkBitmask, ChunkBitmaskResult};
+use crate::chunk::{ChunkBitmask, ChunkBitmaskResult};
 
 pub const GRID_EMPTY: u32 = 0xFFFFFFFF;
 pub const GRID_SOLID: u32 = 0xFFFFFFFE;
@@ -30,6 +30,8 @@ pub struct ShadowGrid {
     /// Source of truth: (chunk_pos, lod) → grid value (slot index or sentinel).
     /// Grid data is rebuilt from this whenever origins change.
     chunk_values: HashMap<(IVec3, u8), u32>,
+    /// Last camera chunk seen — drives origin rebuilds.
+    last_camera_chunk: Option<IVec3>,
 }
 
 impl ShadowGrid {
@@ -55,6 +57,7 @@ impl ShadowGrid {
             lod_count,
             dirty: true,
             chunk_values: HashMap::new(),
+            last_camera_chunk: None,
         }
     }
 
@@ -152,7 +155,7 @@ pub fn update_grid_for_chunk(
     pool: &mut BitmaskPool,
     chunk_pos: IVec3,
     lod: u8,
-    result: ChunkBitmaskResult,
+    result: &ChunkBitmaskResult,
 ) {
     // Deallocate old slot if this chunk already had one
     if let Some(&old_value) = grid.chunk_values.get(&(chunk_pos, lod)) {
@@ -164,7 +167,7 @@ pub fn update_grid_for_chunk(
     let value = match result {
         ChunkBitmaskResult::AllAir => GRID_EMPTY,
         ChunkBitmaskResult::AllSolid => GRID_SOLID,
-        ChunkBitmaskResult::Partial(bitmask) => pool.allocate(bitmask),
+        ChunkBitmaskResult::Partial(bitmask) => pool.allocate(*bitmask),
     };
     grid.chunk_values.insert((chunk_pos, lod), value);
     grid.set(lod, chunk_pos, value);
@@ -183,4 +186,49 @@ pub fn remove_chunk_from_grid(
         }
     }
     grid.set(lod, chunk_pos, GRID_EMPTY);
+}
+
+/// Rebuilds bitmasks for changed chunks and updates the shadow grid.
+/// Reacts to ChunkChangedQueue — covers both newly generated and player-modified chunks.
+pub fn process_chunk_bitmasks(
+    changed: Res<crate::chunk::ChunkChangedQueue>,
+    mut shadow_grid: ResMut<ShadowGrid>,
+    mut bitmask_pool: ResMut<BitmaskPool>,
+    chunk_data_query: Query<&crate::chunk::ChunkData>,
+) {
+    for change in &changed.0 {
+        if let Ok(data) = chunk_data_query.get(change.entity) {
+            let bitmask_result = crate::chunk::build_bitmask(&data.0);
+            update_grid_for_chunk(
+                &mut shadow_grid,
+                &mut bitmask_pool,
+                change.pos,
+                change.lod,
+                &bitmask_result,
+            );
+        }
+    }
+}
+
+/// Rebuilds shadow grid origins when the camera moves to a new chunk.
+pub fn update_shadow_grid_origins(
+    mut shadow_grid: ResMut<ShadowGrid>,
+    debug: Res<crate::DebugMode>,
+    cam_query: Query<&crate::camera::Position, With<crate::camera::MainCamera>>,
+    source_query: Query<&crate::chunk::demand::ChunkSource>,
+) {
+    let camera_chunk = if let Some(ref frozen) = debug.frozen {
+        frozen.chunk_pos
+    } else if let Ok(pos) = cam_query.get_single() {
+        crate::camera::chunk_pos(pos)
+    } else {
+        return;
+    };
+
+    if shadow_grid.last_camera_chunk != Some(camera_chunk) {
+        shadow_grid.last_camera_chunk = Some(camera_chunk);
+        if let Some(source) = source_query.iter().next() {
+            shadow_grid.rebuild_origins(camera_chunk, source.end_radius);
+        }
+    }
 }

@@ -114,10 +114,15 @@ impl FlyCamera {
 
 /// The chunk coordinate for a world position.
 pub fn chunk_pos(position: &Position) -> IVec3 {
+    chunk_pos_from_world(position.0)
+}
+
+/// The chunk coordinate for a world-space [f64; 3].
+pub fn chunk_pos_from_world(pos: [f64; 3]) -> IVec3 {
     IVec3::new(
-        (position.0[0] / CHUNK_SIZE as f64).floor() as i32,
-        (position.0[1] / CHUNK_SIZE as f64).floor() as i32,
-        (position.0[2] / CHUNK_SIZE as f64).floor() as i32,
+        (pos[0] / CHUNK_SIZE as f64).floor() as i32,
+        (pos[1] / CHUNK_SIZE as f64).floor() as i32,
+        (pos[2] / CHUNK_SIZE as f64).floor() as i32,
     )
 }
 
