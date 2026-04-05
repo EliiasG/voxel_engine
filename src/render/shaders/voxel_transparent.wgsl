@@ -4,10 +4,10 @@
 
 fn transparent_color(material_id: u32) -> vec4<f32> {
     switch material_id {
-        // GLASS = 4: light blue tint
-        case 4u: { return vec4<f32>(0.6, 0.8, 0.9, 0.3); }
+        // GLASS = 4: red tint
+        case 4u: { return vec4<f32>(0.35, 0.05, 0.05, 0.45); }
         // WATER = 5: blue-green tint
-        case 5u: { return vec4<f32>(0.2, 0.5, 0.7, 0.5); }
+        case 5u: { return vec4<f32>(0.05, 0.15, 0.3, 0.6); }
         default: { return vec4<f32>(1.0, 1.0, 1.0, 0.5); }
     }
 }

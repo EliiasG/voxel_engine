@@ -819,9 +819,10 @@ fn vs_debug(@builtin(vertex_index) vi: u32) -> DebugVaryings {
 
 @fragment
 fn fs_debug(in: DebugVaryings) -> @location(0) vec4<f32> {
-    let shadow_val = textureSample(shadow_mask, shadow_sampler, in.uv).r;
+    let shadow_rgb = textureSample(shadow_mask, shadow_sampler, in.uv).rgb;
+    let shadow_lum = max(shadow_rgb.r, max(shadow_rgb.g, shadow_rgb.b));
     // Red tint for shadow, transparent for lit
-    let alpha = (1.0 - shadow_val) * 0.5;
+    let alpha = (1.0 - shadow_lum) * 0.5;
     return vec4<f32>(1.0, 0.0, 0.0, alpha);
 }
 ";

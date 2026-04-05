@@ -1,12 +1,14 @@
 // Shadow ray trace compute shader
 // Reads depth buffer, reconstructs world position,
 // traces a ray toward the sun through the bitmask acceleration structure.
-// Outputs: 0.0 = shadow, 1.0 = lit.
+// Outputs: rgb = colored shadow multiplier, a = normal_height.
 
 const CHUNK_SIZE: i32 = 32;
 const GRID_EMPTY: u32 = 0xFFFFFFFFu;
 const GRID_SOLID: u32 = 0xFFFFFFFEu;
 const MAX_STEPS: u32 = 512u;
+const TRANSPARENT_AIR: u32 = 254u;
+const TRANSPARENT_OPAQUE: u32 = 255u;
 
 struct ShadowUniform {
     inv_view_proj: mat4x4<f32>,
@@ -53,6 +55,16 @@ var<uniform> lod_infos: array<LodInfo, 6>;
 var<storage, read> grid: array<u32>;
 @group(2) @binding(2)
 var<storage, read> bitmask_data: array<u32>;
+@group(2) @binding(3)
+var<storage, read> indirection_data: array<u32>;
+@group(2) @binding(4)
+var<storage, read> color_pool_data: array<u32>;
+@group(2) @binding(5)
+var<storage, read> absorption_coeffs: array<vec4<f32>>;
+
+// Module-scope absorption accumulator (avoids ptr<function> parameter which
+// can be unreliable with unchecked shader compilation).
+var<private> g_total_absorption: vec3<f32>;
 
 @group(3) @binding(0)
 var prev_accum_tex: texture_2d<f32>;
@@ -82,8 +94,17 @@ fn test_coarse_bit(slot: u32, rx: u32, ry: u32, rz: u32) -> bool {
     }
 }
 
-// Look up the grid entry for a chunk position at a given LOD
-fn grid_lookup(lod: u32, chunk_pos: vec3<i32>) -> u32 {
+// Read a byte from the color pool (8x8x8 region, 512 bytes = 128 u32s per slot)
+fn read_color_byte(pool_slot: u32, local_x: u32, local_y: u32, local_z: u32) -> u32 {
+    let local_idx = local_x + local_y * 8u + local_z * 64u;
+    let word_offset = pool_slot * 128u + local_idx / 4u;
+    let byte_offset = local_idx % 4u;
+    return (color_pool_data[word_offset] >> (byte_offset * 8u)) & 0xFFu;
+}
+
+// Compute the flat grid index for a chunk position at a given LOD.
+// Returns GRID_EMPTY if out of bounds.
+fn grid_flat_index(lod: u32, chunk_pos: vec3<i32>) -> u32 {
     let info = lod_infos[lod];
     let local = chunk_pos - vec3<i32>(info.grid_origin_x, info.grid_origin_y, info.grid_origin_z);
     let s = i32(info.grid_size);
@@ -93,13 +114,22 @@ fn grid_lookup(lod: u32, chunk_pos: vec3<i32>) -> u32 {
     let entries_per_lod = info.grid_size * info.grid_size * info.grid_size;
     let lod_offset = lod * entries_per_lod;
     let flat = u32(local.x) + u32(local.y) * info.grid_size + u32(local.z) * info.grid_size * info.grid_size;
-    return grid[lod_offset + flat];
+    return lod_offset + flat;
 }
 
-// Trace ray through a single chunk's bitmask. Returns true if hit.
+// Look up the grid entry for a chunk position at a given LOD
+fn grid_lookup(lod: u32, chunk_pos: vec3<i32>) -> u32 {
+    let idx = grid_flat_index(lod, chunk_pos);
+    if (idx == GRID_EMPTY) { return GRID_EMPTY; }
+    return grid[idx];
+}
+
+// Trace ray through a single chunk's bitmask. Returns true if hit opaque.
+// Accumulates absorption through transparent voxels via g_total_absorption.
 // Flat DDA through 32x32x32 with O(1) coarse region skipping.
 fn trace_chunk_bitmask(
     slot: u32,
+    g_idx: u32,
     ray_pos: vec3<f32>,
     ray_dir: vec3<f32>,
     chunk_origin: vec3<f32>,
@@ -119,6 +149,7 @@ fn trace_chunk_bitmask(
     ) - local) * inv_dir;
 
     let t_delta = abs(inv_dir);
+    var t_current = 0.0;
 
     for (var i = 0u; i < 96u; i++) {
         if (any(vpos < vec3<i32>(0)) || any(vpos >= vec3<i32>(32))) {
@@ -145,13 +176,42 @@ fn trace_chunk_bitmask(
                 select(f32(vpos.y), f32(vpos.y + 1), ray_dir.y >= 0.0),
                 select(f32(vpos.z), f32(vpos.z + 1), ray_dir.z >= 0.0),
             ) - local) * inv_dir;
+            t_current = t_skip + 0.001;
             continue;
         }
 
-        if (test_fine_bit(slot, u32(vpos.x), u32(vpos.y), u32(vpos.z))) {
-            return true;
+        // Distance through this voxel (for absorption calculation)
+        let t_exit_voxel = min(t_max.x, min(t_max.y, t_max.z));
+        let dt = max(t_exit_voxel - t_current, 0.0);
+
+        // Check indirection for this region
+        let coarse_idx = coarse.x + coarse.y * 4u + coarse.z * 16u;
+        let indir = indirection_data[g_idx * 64u + coarse_idx];
+
+        if (indir != GRID_EMPTY) {
+            // Region has transparent color data — use color buffer
+            let lx = u32(vpos.x) % 8u;
+            let ly = u32(vpos.y) % 8u;
+            let lz = u32(vpos.z) % 8u;
+            let color_byte = read_color_byte(indir, lx, ly, lz);
+
+            if (color_byte == TRANSPARENT_OPAQUE) {
+                return true; // opaque hit
+            } else if (color_byte < TRANSPARENT_AIR) {
+                // transparent: accumulate absorption (Beer-Lambert)
+                let abs_coeff = absorption_coeffs[color_byte].xyz;
+                g_total_absorption += abs_coeff * dt * voxel_size;
+            }
+            // else TRANSPARENT_AIR: continue
+        } else {
+            // No transparent blocks in this region — use fine bitmask
+            if (test_fine_bit(slot, u32(vpos.x), u32(vpos.y), u32(vpos.z))) {
+                return true;
+            }
         }
 
+        // DDA step
+        t_current = t_exit_voxel;
         if (t_max.x < t_max.y && t_max.x < t_max.z) {
             vpos.x += step.x;
             t_max.x += t_delta.x;
@@ -209,7 +269,7 @@ fn cs_shadow(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     // At night, skip ray tracing entirely — everything is in shadow
     if (shadow.night_factor >= 1.0) {
-        textureStore(output_tex, pixel, vec4<f32>(0.0, normal_height, 0.0, 0.0));
+        textureStore(output_tex, pixel, vec4<f32>(0.0, 0.0, 0.0, normal_height));
         return;
     }
 
@@ -226,7 +286,7 @@ fn cs_shadow(@builtin(global_invocation_id) gid: vec3<u32>) {
             }
         }
         let prev = textureSampleLevel(prev_accum_tex, prev_accum_sampler, prev_uv, 0.0);
-        textureStore(output_tex, pixel, vec4<f32>(prev.r, normal_height, 0.0, 0.0));
+        textureStore(output_tex, pixel, vec4<f32>(prev.rgb, normal_height));
         return;
     }
 
@@ -235,13 +295,13 @@ fn cs_shadow(@builtin(global_invocation_id) gid: vec3<u32>) {
         let face_normal_early = textureSampleLevel(normal_tex, depth_sampler, uv, 0.0).xyz * 2.0 - 1.0;
         let ndotl_early = dot(face_normal_early, normalize(shadow.sun_direction));
         if (ndotl_early <= 0.0) {
-            textureStore(output_tex, pixel, vec4<f32>(0.0, normal_height, 0.0, 0.0));
+            textureStore(output_tex, pixel, vec4<f32>(0.0, 0.0, 0.0, normal_height));
             return;
         }
     }
 
-    // Trace result: 0.0 = shadow, 1.0 = lit
-    var trace_result = 1.0;
+    // Trace result: vec3(1) = lit, vec3(0) = fully shadowed
+    var trace_result = vec3<f32>(1.0);
     var cam_rel_pos = vec3<f32>(0.0);
 
     // Sky pixels are always lit (reversed-Z: sky = 0.0)
@@ -301,6 +361,7 @@ fn cs_shadow(@builtin(global_invocation_id) gid: vec3<u32>) {
             var pos = world_pos + normal_push + ray_dir * dir_bias * start_voxel_size;
             var total_dist = 0.0;
             var hit = false;
+            g_total_absorption = vec3<f32>(0.0);
 
             for (var step_count = 0u; step_count < MAX_STEPS; step_count++) {
                 if (hit) {
@@ -322,14 +383,15 @@ fn cs_shadow(@builtin(global_invocation_id) gid: vec3<u32>) {
                     break;
                 }
 
-                let slot = grid_lookup(current_lod, chunk_pos);
+                let g_idx = grid_flat_index(current_lod, chunk_pos);
+                let slot = grid[g_idx];
 
                 if (slot == GRID_SOLID) {
                     hit = true;
                 } else if (slot != GRID_EMPTY) {
                     let chunk_origin = vec3<f32>(chunk_pos * CHUNK_SIZE * lod_scale);
                     let voxel_size = f32(lod_scale);
-                    if (trace_chunk_bitmask(slot, pos, ray_dir, chunk_origin, voxel_size)) {
+                    if (trace_chunk_bitmask(slot, g_idx, pos, ray_dir, chunk_origin, voxel_size)) {
                         hit = true;
                     }
                 }
@@ -350,7 +412,10 @@ fn cs_shadow(@builtin(global_invocation_id) gid: vec3<u32>) {
             }
 
             if (hit) {
-                trace_result = 0.0;
+                trace_result = vec3<f32>(0.0);
+            } else {
+                // No opaque hit: apply colored shadow from transparent blocks
+                trace_result = exp(-g_total_absorption);
             }
         }
     }
@@ -372,14 +437,14 @@ fn cs_shadow(@builtin(global_invocation_id) gid: vec3<u32>) {
         }
 
         if (reprojection_valid) {
-            let prev_sample = textureSampleLevel(prev_accum_tex, prev_accum_sampler, prev_uv, 0.0).r;
+            let prev_sample = textureSampleLevel(prev_accum_tex, prev_accum_sampler, prev_uv, 0.0).rgb;
             let dist = length(cam_rel_pos);
             let t = clamp((dist - 30.0) / 170.0, 0.0, 1.0); // 30..200 range
             // Moving: aggressive blend so near shadows respond fast
             // Static: gentle adaptive blend for smooth convergence
             var blend = mix(0.7, 0.5, t);
             if (shadow.camera_moving == 0u) {
-                let diff = abs(trace_result - prev_sample);
+                let diff = length(trace_result - prev_sample);
                 blend = mix(0.04, 0.5, smoothstep(0.02, 0.2, diff));
             }
             result = mix(prev_sample, trace_result, blend);
@@ -387,7 +452,7 @@ fn cs_shadow(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
 
     // Blend toward full shadow during sunset/sunrise transition
-    result = mix(result, 0.0, shadow.night_factor);
+    result = result * (1.0 - shadow.night_factor);
 
-    textureStore(output_tex, pixel, vec4<f32>(result, normal_height, 0.0, 0.0));
+    textureStore(output_tex, pixel, vec4<f32>(result, normal_height));
 }

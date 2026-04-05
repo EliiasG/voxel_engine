@@ -751,6 +751,7 @@ pub fn cleanup_unloaded_chunks(
     mut gpu: ResMut<GpuBuffers>,
     mut shadow_grid: ResMut<shadow::grid::ShadowGrid>,
     mut bitmask_pool: ResMut<shadow::grid::BitmaskPool>,
+    mut color_pool: ResMut<shadow::grid::TransparentColorPool>,
 ) {
     for unload in unload_queue.0.drain(..) {
         if let Some(entry) = render_data.entries.remove(&unload.entity) {
@@ -762,6 +763,12 @@ pub fn cleanup_unloaded_chunks(
         shadow::grid::remove_chunk_from_grid(
             &mut shadow_grid,
             &mut bitmask_pool,
+            unload.pos,
+            unload.lod,
+        );
+        shadow::grid::remove_chunk_transparent_data(
+            &mut shadow_grid,
+            &mut color_pool,
             unload.pos,
             unload.lod,
         );
@@ -1073,6 +1080,11 @@ pub fn synchronize_gpu(
                             ) {
                                 cached.args = updated.args;
                             }
+                        } else if let Some(new_draw) = build_draw_for_direction(
+                            neighbor_entity, neighbor_entry, get_directions(neighbor_entry),
+                            opposite_dir as usize, cam_world, loaded_index, lod_count, do_backface_cull,
+                        ) {
+                            cache.entries.push(new_draw);
                         }
                     }
                 }

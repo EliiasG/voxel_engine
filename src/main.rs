@@ -35,6 +35,11 @@ use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
 
 pub static TIMING_DEMAND_US: AtomicU32 = AtomicU32::new(0);
 pub static TIMING_LOADING_US: AtomicU32 = AtomicU32::new(0);
+pub static TIMING_RESOLVE_US: AtomicU32 = AtomicU32::new(0);
+pub static TIMING_POLL_MESH_US: AtomicU32 = AtomicU32::new(0);
+pub static TIMING_START_MESH_US: AtomicU32 = AtomicU32::new(0);
+pub static TIMING_MESH_WORKER_MAX_US: AtomicU32 = AtomicU32::new(0);
+pub static TIMING_MESH_WORKER_COUNT: AtomicU32 = AtomicU32::new(0);
 pub static TIMING_SYNC_UPLOAD_US: AtomicU32 = AtomicU32::new(0);
 pub static TIMING_SYNC_DRAWS_US: AtomicU32 = AtomicU32::new(0);
 
@@ -204,6 +209,7 @@ fn main() {
         app.insert_resource(chunk::loading::ChunkLoader::default());
         app.insert_resource(render::shadow::grid::ShadowGrid::new(end_radius, lod_count as u32));
         app.insert_resource(render::shadow::grid::BitmaskPool::new());
+        app.insert_resource(render::shadow::grid::TransparentColorPool::new());
         app.insert_resource(chunk::generation::GenPool::new());
         app.insert_resource(chunk::meshing::MeshPool::new());
         app.insert_resource(InputState::default());
@@ -249,6 +255,8 @@ fn main() {
                 render::cleanup_unloaded_chunks.before(render::synchronize_gpu),
                 render::shadow::grid::process_chunk_bitmasks
                     .before(render::shadow::gpu::synchronize_shadow_buffers),
+                render::shadow::grid::process_chunk_transparent_colors
+                    .before(render::shadow::gpu::synchronize_shadow_buffers),
                 render::shadow::grid::update_shadow_grid_origins
                     .before(render::shadow::gpu::synchronize_shadow_buffers),
                 render::synchronize_gpu,
@@ -258,7 +266,8 @@ fn main() {
                 update_camera.before(render::shadow::pass::update_previous_frame_data),
                 render::shadow::pass::update_previous_frame_data,
                 chunk::clear_chunk_changed_queue
-                    .after(render::shadow::grid::process_chunk_bitmasks),
+                    .after(render::shadow::grid::process_chunk_bitmasks)
+                    .after(render::shadow::grid::process_chunk_transparent_colors),
             ),
         );
     });
@@ -720,10 +729,15 @@ fn update_camera(
 
         if let Ok(wc) = window_query.get_single() {
             let title = format!(
-                "Voxel Engine \u{2014} {:.0} FPS | demand {}us load {}us sync_up {}us sync_draw {}us{}",
+                "Voxel Engine \u{2014} {:.0} FPS | demand {}us load {}us resolve {}us poll {}us start {}us worker {}us(max)x{} sync_up {}us sync_draw {}us{}",
                 fps.fps,
                 TIMING_DEMAND_US.load(Relaxed),
                 TIMING_LOADING_US.load(Relaxed),
+                TIMING_RESOLVE_US.load(Relaxed),
+                TIMING_POLL_MESH_US.load(Relaxed),
+                TIMING_START_MESH_US.load(Relaxed),
+                TIMING_MESH_WORKER_MAX_US.load(Relaxed),
+                TIMING_MESH_WORKER_COUNT.load(Relaxed),
                 TIMING_SYNC_UPLOAD_US.load(Relaxed),
                 TIMING_SYNC_DRAWS_US.load(Relaxed),
                 if debug.frozen.is_some() { " [DEBUG]" } else { "" },

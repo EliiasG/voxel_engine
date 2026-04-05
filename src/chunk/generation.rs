@@ -5,7 +5,7 @@ use crossbeam_channel::{Receiver, Sender};
 use glam::IVec3;
 
 use super::{
-    ChunkStorage, AIR, CHUNK_SIZE, CHUNK_SIZE_2, CHUNK_SIZE_3, DIRT, GRASS, STONE,
+    ChunkStorage, AIR, CHUNK_SIZE, CHUNK_SIZE_2, CHUNK_SIZE_3, DIRT, GRASS, STONE, WATER,
 };
 pub struct GenResult {
     pub entity: Entity,
@@ -157,7 +157,10 @@ fn generate_terrain(chunk_pos: IVec3, lod: u8) -> ChunkStorage {
     let mut blocks = vec![AIR; CHUNK_SIZE_3];
     let mut all_same = true;
     let h0 = height_at(wx0 as f32, wz0 as f32);
-    let first_block = if wy0 > h0 {
+    let water_level: i32 = 200 - lod_scale;
+    let first_block = if wy0 > h0 && wy0 <= water_level {
+        WATER
+    } else if wy0 > h0 {
         AIR
     } else if wy0 >= h0 {
         GRASS
@@ -175,7 +178,9 @@ fn generate_terrain(chunk_pos: IVec3, lod: u8) -> ChunkStorage {
 
             for y in 0..CHUNK_SIZE {
                 let wy = wy0 + y as i32 * lod_scale;
-                let block = if wy > height {
+                let block = if wy > height && wy <= water_level {
+                    WATER
+                } else if wy > height {
                     AIR
                 } else if wy >= height - 0 {
                     GRASS

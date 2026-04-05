@@ -51,6 +51,16 @@ pub fn is_transparent(block: BlockId) -> bool {
     block != AIR && block_props(block).is_transparent
 }
 
+/// Returns the tint color for a transparent block type's color index.
+/// Used to compute absorption coefficients for Beer-Lambert shadow coloring.
+pub fn transparent_tint(color_index: u8) -> [f32; 3] {
+    match color_index {
+        0 => [0.99, 0.3, 0.3],    // Glass: red-tinted shadow
+        1 => [0.9, 0.96, 0.995],  // Water: subtle per-block, accumulates over distance
+        _ => [1.0, 1.0, 1.0],    // Default: no absorption
+    }
+}
+
 pub const NUM_DIRECTIONS: usize = 6;
 pub const DIR_POS_X: usize = 0;
 pub const DIR_NEG_X: usize = 1;

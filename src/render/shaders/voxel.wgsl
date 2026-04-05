@@ -40,9 +40,9 @@ fn triplanar_project(pos: vec3<f32>, direction: u32) -> vec2<f32> {
 }
 
 fn evaluate_material(in: VertexOutput) -> Surface {
-    // GLASS = 4: solid light blue, no texture
+    // GLASS = 4: solid red, no texture
     if in.material_id == 4u {
-        return Surface(vec3<f32>(0.6, 0.8, 0.9), in.normal, in.world_pos, in.clip_position, in.ao);
+        return Surface(vec3<f32>(0.35, 0.05, 0.05), in.normal, in.world_pos, in.clip_position, in.ao);
     }
 
     // Reconstruct absolute world position (block coordinates)

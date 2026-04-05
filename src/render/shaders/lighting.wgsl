@@ -23,49 +23,49 @@ fn apply_lighting(surface: Surface) -> vec4<f32> {
     let center_i = vec2<i32>(round(center_texel));
     let dims_i = vec2<i32>(shadow_dims);
 
-    var total_shadow = 0.0;
+    var total_shadow = vec3<f32>(0.0);
     var total_weight = 0.0;
-    var best_shadow = 0.0;
+    var best_shadow = vec3<f32>(0.0);
     var best_dist = 999.0;
     for (var dy = -1; dy <= 1; dy++) {
         for (var dx = -1; dx <= 1; dx++) {
             let tc = clamp(center_i + vec2<i32>(dx, dy), vec2<i32>(0), dims_i - 1);
             let ss = textureLoad(shadow_mask, tc, 0);
             let n = textureLoad(shadow_normal, tc, 0).xyz * 2.0 - 1.0;
-            let height_diff = abs(ss.g - frag_height);
+            let height_diff = abs(ss.a - frag_height);
             if (dot(n, surface.normal) > 0.9 && height_diff < 0.3) {
                 let d = vec2<f32>(tc) + 0.5 - (center_texel + 0.5);
                 let w = 1.0 / (1.0 + dot(d, d));
-                total_shadow += ss.r * w;
+                total_shadow += ss.rgb * w;
                 total_weight += w;
             }
             let spatial_d = length(vec2<f32>(tc) - center_texel);
             if (spatial_d < best_dist) {
                 best_dist = spatial_d;
-                best_shadow = ss.r;
+                best_shadow = ss.rgb;
             }
         }
     }
 
-    var shadow_val: f32;
+    var shadow_color: vec3<f32>;
     if (total_weight > 0.001) {
-        shadow_val = total_shadow / total_weight;
+        shadow_color = total_shadow / total_weight;
     } else {
-        shadow_val = best_shadow;
+        shadow_color = best_shadow;
     }
 
     // Faces pointing away from sun are always in shadow regardless of mask
-    let shadow = select(shadow_val, 0.0, raw_ndotl <= 0.0);
+    let shadow = select(shadow_color, vec3<f32>(0.0), raw_ndotl <= 0.0);
 
     // Modulate lighting by time of day
     let day = 1.0 - atmosphere.night_factor;
     let sky_light = max(surface.normal.y * 0.5 + 0.5, 0.0) * mix(0.04, 0.15, day);
 
-    let effective_shadow = mix(0.0, 1.0, shadow);
     let ambient = mix(0.08, 0.25, day);
-    let diffuse = 0.7 * ndotl * effective_shadow * day;
+    let diffuse = 0.7 * ndotl * shadow * day;
     let ao = mix(0.4, 1.0, surface.ao);
-    let lit_color = surface.base_color * (ambient * ao + sky_light * ao + diffuse);
+    let ambient_term = ambient * ao + sky_light * ao;
+    let lit_color = surface.base_color * (vec3<f32>(ambient_term) + diffuse);
 
     // Exponential distance fog
     let view_dir = normalize(surface.world_pos - camera.camera_local_pos);

@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use bevy_ecs::prelude::*;
 use glam::IVec3;
 
@@ -94,6 +96,27 @@ pub fn update_chunk_demand(
                         }
                     }
                 }
+                // Expand to complete 2x2x2 groups aligned to the parent LOD's
+                // grid so that is_fully_covered transitions atomically.
+                if lod + 1 < source.lod_count && !segment.is_empty() {
+                    let mut expanded: HashSet<(IVec3, u8)> = HashSet::new();
+                    for &(pos, l) in &segment {
+                        let base = IVec3::new(
+                            pos.x.div_euclid(2) * 2,
+                            pos.y.div_euclid(2) * 2,
+                            pos.z.div_euclid(2) * 2,
+                        );
+                        for dx in 0..2 {
+                            for dy in 0..2 {
+                                for dz in 0..2 {
+                                    expanded.insert((base + IVec3::new(dx, dy, dz), l));
+                                }
+                            }
+                        }
+                    }
+                    segment = expanded.into_iter().collect();
+                }
+
                 if !segment.is_empty() {
                     segments.push(segment);
                 }
