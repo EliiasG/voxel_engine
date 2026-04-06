@@ -562,7 +562,7 @@ pub fn update_shadow_grid_origins(
     let _timer = crate::SysTimer::new(&crate::TIMING_SHADOW_ORIGINS_US);
     let camera_chunk = if let Some(ref frozen) = debug.frozen {
         frozen.chunk_pos
-    } else if let Ok(pos) = cam_query.get_single() {
+    } else if let Ok(pos) = cam_query.single() {
         crate::camera::chunk_pos(pos)
     } else {
         return;

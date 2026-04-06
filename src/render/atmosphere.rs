@@ -3,7 +3,8 @@ use bytemuck::{Pod, Zeroable};
 use modul_render::{
     BindGroupLayoutDef, Operation, OperationBuilder, RenderTarget, RenderTargetSource,
 };
-use wgpu::{
+use modul_core::wgpu;
+use modul_core::wgpu::{
     BufferDescriptor, BufferUsages, CommandEncoder, Device, TextureFormat, TextureUsages,
 };
 
@@ -491,8 +492,8 @@ impl AtmosphereResources {
         let camera_layout = device.create_bind_group_layout(render::CameraBGLayout::LAYOUT);
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("Sky pipeline layout"),
-            bind_group_layouts: &[&camera_layout, &bg_layout],
-            push_constant_ranges: &[],
+            bind_group_layouts: &[Some(&camera_layout), Some(&bg_layout)],
+            immediate_size: 0,
         });
 
         let camera_wgsl = render::CameraBGLayout::LIBRARY.replace("#BIND_GROUP", "0");
@@ -521,8 +522,8 @@ impl AtmosphereResources {
             },
             depth_stencil: Some(wgpu::DepthStencilState {
                 format: TextureFormat::Depth32Float,
-                depth_write_enabled: false,
-                depth_compare: wgpu::CompareFunction::GreaterEqual,
+                depth_write_enabled: Some(false),
+                depth_compare: Some(wgpu::CompareFunction::GreaterEqual),
                 stencil: wgpu::StencilState::default(),
                 bias: wgpu::DepthBiasState::default(),
             }),
@@ -537,7 +538,7 @@ impl AtmosphereResources {
                 })],
                 compilation_options: Default::default(),
             }),
-            multiview: None,
+            multiview_mask: None,
             cache: None,
         });
 
@@ -594,9 +595,9 @@ pub fn update_atmosphere(
     sun_dir: Res<SunDirection>,
     config: Res<AtmosphereConfig>,
     atmo_res: Res<AtmosphereResources>,
-    queue: Res<modul_core::QueueRes>,
+    ctx: Res<modul_core::RenderContext>,
 ) {
-    atmo_res.update(&queue.0, &sun_dir, &config);
+    atmo_res.update(&ctx.queue, &sun_dir, &config);
 }
 
 // --- Sky Pass Operation ---
@@ -613,7 +614,8 @@ impl Operation for SkyPassOperation {
         let atmo_bg_ptr: *const wgpu::BindGroup;
         let main_window = world
             .query_filtered::<bevy_ecs::prelude::Entity, bevy_ecs::prelude::With<modul_core::MainWindow>>()
-            .single(world);
+            .single(world)
+            .expect("main window not spawned");
         if taa_enabled {
             let taa_res = world.resource::<crate::render::taa::TaaResources>();
             color_view_ptr = &taa_res.scene_view as *const _;
@@ -646,6 +648,7 @@ impl Operation for SkyPassOperation {
             label: Some("Sky pass"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                 view: scene_view,
+                depth_slice: None,
                 resolve_target: None,
                 ops: wgpu::Operations {
                     load: wgpu::LoadOp::Load, // preserve voxel geometry
@@ -662,6 +665,7 @@ impl Operation for SkyPassOperation {
             }),
             timestamp_writes: None,
             occlusion_query_set: None,
+            multiview_mask: None,
         });
 
         pass.set_pipeline(sky_pipeline);
@@ -690,14 +694,13 @@ impl OperationBuilder for SkyPassOperationBuilder {
 /// Initializes atmosphere resources (LUT baking, sky pipeline, config).
 pub fn init_atmosphere(
     mut commands: Commands,
-    device: Res<modul_core::DeviceRes>,
-    queue: Res<modul_core::QueueRes>,
+    ctx: Res<modul_core::RenderContext>,
     sun_dir: Res<crate::render::shadow::pass::SunDirection>,
     surface_fmt: Res<modul_core::SurfaceFormat>,
 ) {
     let atmo_config = AtmosphereConfig::default();
     let atmo_res = AtmosphereResources::new(
-        &device.0, &queue.0, &sun_dir, &atmo_config, surface_fmt.0,
+        &ctx.device, &ctx.queue, &sun_dir, &atmo_config, surface_fmt.0,
     );
     commands.insert_resource(atmo_config);
     commands.insert_resource(atmo_res);

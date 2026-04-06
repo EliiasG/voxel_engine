@@ -3,7 +3,8 @@ use modul_asset::AssetWorldExt;
 use modul_render::{
     BindGroupLayoutDef, Operation, OperationBuilder, RenderTarget, RenderTargetSource,
 };
-use wgpu::{
+use modul_core::wgpu;
+use modul_core::wgpu::{
     CommandEncoder, Device, TextureFormat, TextureUsages,
 };
 
@@ -127,8 +128,8 @@ impl TaaResources {
         let pipeline_layout =
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("TAA resolve pipeline layout"),
-                bind_group_layouts: &[&camera_layout, &taa_bind_group_layout],
-                push_constant_ranges: &[],
+                bind_group_layouts: &[Some(&camera_layout), Some(&taa_bind_group_layout)],
+                immediate_size: 0,
             });
 
         // Compose shader: camera library (group 0) + TAA bindings + TAA shader
@@ -183,7 +184,7 @@ impl TaaResources {
                     ],
                     compilation_options: Default::default(),
                 }),
-                multiview: None,
+                multiview_mask: None,
                 cache: None,
             });
 
@@ -243,7 +244,8 @@ impl Operation for TaaVoxelDrawOperation {
 
         let main_window_entity = world
             .query_filtered::<Entity, With<modul_core::MainWindow>>()
-            .single(world);
+            .single(world)
+            .expect("main window not spawned");
 
         // Resize scene + history if TAA is on
         if taa_enabled {
@@ -252,7 +254,7 @@ impl Operation for TaaVoxelDrawOperation {
                 .unwrap();
             let (w, h) = RenderTarget::size(surface_rt);
             world.resource_scope(|world, mut taa_res: Mut<TaaResources>| {
-                let device = &world.resource::<modul_core::DeviceRes>().0;
+                let device = &world.resource::<modul_core::RenderContext>().device;
                 taa_res.resize(device, w, h);
             });
         }
@@ -287,6 +289,7 @@ impl Operation for TaaVoxelDrawOperation {
             label: Some("Voxel draw pass"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                 view: color_view,
+                depth_slice: None,
                 resolve_target: None,
                 ops: wgpu::Operations {
                     load: wgpu::LoadOp::Clear(wgpu::Color {
@@ -305,6 +308,7 @@ impl Operation for TaaVoxelDrawOperation {
             }),
             timestamp_writes: None,
             occlusion_query_set: None,
+            multiview_mask: None,
         });
 
         // Get compatible voxel pipeline for the scene format
@@ -329,7 +333,7 @@ impl Operation for TaaVoxelDrawOperation {
                 let camera_bg = &world.resource::<render::CameraBindGroup>().bind_group;
                 let atlas_bg = &world.resource::<render::TextureAtlasBindGroup>().bind_group;
                 let gpu = world.resource::<render::GpuBuffers>();
-                let device = &world.resource::<modul_core::DeviceRes>().0;
+                let device = &world.resource::<modul_core::RenderContext>().device;
                 let shadow_res = world.resource::<crate::render::shadow::pass::ShadowPassResources>();
                 let shadow_mask_bg = render::create_shadow_mask_bind_group(device, shadow_res);
 
@@ -378,7 +382,7 @@ impl Operation for TaaResolveOperation {
             let (w, h) = RenderTarget::size(surface_rt);
             world.resource_scope(
                 |world, mut taa_res: Mut<TaaResources>| {
-                    let device = &world.resource::<modul_core::DeviceRes>().0;
+                    let device = &world.resource::<modul_core::RenderContext>().device;
                     taa_res.resize(device, w, h);
                 },
             );
@@ -420,7 +424,7 @@ impl Operation for TaaResolveOperation {
         let depth_view = unsafe { &*depth_view_ptr };
 
         // Build TAA input bind group
-        let device = &world.resource::<modul_core::DeviceRes>().0;
+        let device = &world.resource::<modul_core::RenderContext>().device;
         let taa_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("TAA input BG"),
             layout: taa_bg_layout,
@@ -453,6 +457,7 @@ impl Operation for TaaResolveOperation {
                 // Attachment 0: surface (display)
                 Some(wgpu::RenderPassColorAttachment {
                     view: surface_view,
+                    depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Load,
@@ -462,6 +467,7 @@ impl Operation for TaaResolveOperation {
                 // Attachment 1: history[current] (for next frame)
                 Some(wgpu::RenderPassColorAttachment {
                     view: current_history_view,
+                    depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Load,
@@ -472,6 +478,7 @@ impl Operation for TaaResolveOperation {
             depth_stencil_attachment: None,
             timestamp_writes: None,
             occlusion_query_set: None,
+            multiview_mask: None,
         });
 
         pass.set_pipeline(taa_pipeline);
@@ -504,10 +511,10 @@ impl OperationBuilder for TaaResolveOperationBuilder {
 /// Initializes TAA resources.
 pub fn init_taa(
     mut commands: Commands,
-    device: Res<modul_core::DeviceRes>,
+    ctx: Res<modul_core::RenderContext>,
     surface_fmt: Res<modul_core::SurfaceFormat>,
 ) {
-    let taa_res = TaaResources::new(&device.0, surface_fmt.0, 800, 600);
+    let taa_res = TaaResources::new(&ctx.device, surface_fmt.0, 800, 600);
     commands.insert_resource(taa_res);
     commands.insert_resource(TaaEnabled(true));
 }

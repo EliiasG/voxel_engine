@@ -2,7 +2,8 @@ use bevy_ecs::prelude::*;
 use bytemuck::{Pod, Zeroable};
 use modul_asset::AssetWorldExt;
 use modul_render::{Operation, OperationBuilder, RenderTargetSource};
-use wgpu::{
+use modul_core::wgpu;
+use modul_core::wgpu::{
     Buffer, BufferDescriptor, BufferUsages, CommandEncoder, Device, TextureFormat,
     TextureUsages,
 };
@@ -335,12 +336,12 @@ impl ShadowPassResources {
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("Shadow compute pipeline layout"),
             bind_group_layouts: &[
-                &uniform_bind_group_layout,
-                &depth_bind_group_layout,
-                &shadow_gpu.bind_group_layout,
-                &prev_accum_bind_group_layout,
+                Some(&uniform_bind_group_layout),
+                Some(&depth_bind_group_layout),
+                Some(&shadow_gpu.bind_group_layout),
+                Some(&prev_accum_bind_group_layout),
             ],
-            push_constant_ranges: &[],
+            immediate_size: 0,
         });
 
         // SAFETY: shadow shader does its own bounds checking on grid/bitmask accesses
@@ -425,7 +426,7 @@ pub fn update_previous_frame_data(
     prev.valid = prev.next_valid;
 
     // Store current frame's data in staging (will be used next frame)
-    if let Ok(cam) = cam_query.get_single() {
+    if let Ok(cam) = cam_query.single() {
         prev.next_view_proj = cam.view_proj;
         prev.next_inv_view_proj = crate::camera::invert_mat4(&cam.view_proj);
         prev.next_chunk_offset = cam.chunk_offset;
@@ -450,6 +451,7 @@ impl Operation for ShadowDepthOperation {
             label: Some("Shadow depth+normal pass"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                 view: shadow_normal_view,
+                depth_slice: None,
                 resolve_target: None,
                 ops: wgpu::Operations {
                     // Clear to encoded up-normal (0,1,0) → (0.5, 1.0, 0.5)
@@ -467,6 +469,7 @@ impl Operation for ShadowDepthOperation {
             }),
             timestamp_writes: None,
             occlusion_query_set: None,
+            multiview_mask: None,
         });
 
         pass.set_viewport(0.0, 0.0, sw as f32, sh as f32, 0.0, 1.0);
@@ -514,14 +517,15 @@ impl Operation for ShadowTraceOperation {
         {
             let main_window = world
                 .query_filtered::<bevy_ecs::prelude::Entity, bevy_ecs::prelude::With<modul_core::MainWindow>>()
-                .single(world);
+                .single(world)
+                .expect("main window not spawned");
             let size = world
                 .get::<modul_render::SurfaceRenderTarget>(main_window)
                 .map(|rt| modul_render::RenderTarget::size(rt));
             if let Some((w, h)) = size {
                 let scale = world.resource::<ShadowConfig>().scale_denominator;
-                world.resource_scope(|world, mut device: bevy_ecs::prelude::Mut<modul_core::DeviceRes>| {
-                    world.resource_mut::<ShadowPassResources>().resize(&device.0, w, h, scale);
+                world.resource_scope(|world, ctx: bevy_ecs::prelude::Mut<modul_core::RenderContext>| {
+                    world.resource_mut::<ShadowPassResources>().resize(&ctx.device, w, h, scale);
                 });
             }
         }
@@ -532,7 +536,7 @@ impl Operation for ShadowTraceOperation {
             // Read the precomputed Camera component (unjittered VP for motion detection)
             let cam_data = {
                 let mut q = world.query_filtered::<&crate::camera::Camera, bevy_ecs::prelude::With<crate::camera::MainCamera>>();
-                q.single(world).clone()
+                q.single(world).expect("main camera not spawned").clone()
             };
             let taa_res = world.resource::<render::taa::TaaResources>();
             // The shadow depth pass rendered with the jittered VP (from camera bind group),
@@ -571,16 +575,16 @@ impl Operation for ShadowTraceOperation {
 
         // Upload uniform
         {
-            let queue = &world.resource::<modul_core::QueueRes>().0;
+            let ctx = world.resource::<modul_core::RenderContext>();
             let shadow_res = world.resource::<ShadowPassResources>();
-            queue.write_buffer(
+            ctx.queue.write_buffer(
                 &shadow_res.shadow_uniform_buffer,
                 0,
                 bytemuck::bytes_of(&uniform),
             );
         }
 
-        let device = &world.resource::<modul_core::DeviceRes>().0;
+        let device = &world.resource::<modul_core::RenderContext>().device;
         let shadow_res = world.resource::<ShadowPassResources>();
 
         // Use the downscaled shadow depth texture (rendered by ShadowDepthOperation)
@@ -671,8 +675,8 @@ impl Operation for ShadowDebugOverlay {
         let shadow_res = world.resource::<ShadowPassResources>();
 
         let bind_group = world
-            .resource::<modul_core::DeviceRes>()
-            .0
+            .resource::<modul_core::RenderContext>()
+            .device
             .create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("Shadow debug BG"),
                 layout: &self.bind_group_layout,
@@ -738,8 +742,8 @@ impl OperationBuilder for ShadowDebugOverlayBuilder {
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("Shadow debug pipeline layout"),
-            bind_group_layouts: &[&bind_group_layout],
-            push_constant_ranges: &[],
+            bind_group_layouts: &[Some(&bind_group_layout)],
+            immediate_size: 0,
         });
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -762,8 +766,8 @@ impl OperationBuilder for ShadowDebugOverlayBuilder {
             },
             depth_stencil: Some(wgpu::DepthStencilState {
                 format: TextureFormat::Depth32Float,
-                depth_write_enabled: false,
-                depth_compare: wgpu::CompareFunction::Always,
+                depth_write_enabled: Some(false),
+                depth_compare: Some(wgpu::CompareFunction::Always),
                 stencil: wgpu::StencilState::default(),
                 bias: wgpu::DepthBiasState::default(),
             }),
@@ -785,7 +789,7 @@ impl OperationBuilder for ShadowDebugOverlayBuilder {
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
             }),
-            multiview: None,
+            multiview_mask: None,
             cache: None,
         });
 

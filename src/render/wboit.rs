@@ -1,6 +1,7 @@
 use bevy_ecs::prelude::*;
 use modul_render::{BindGroupLayoutDef, Operation, OperationBuilder, RenderTarget, RenderTargetSource};
-use wgpu::{CommandEncoder, Device, TextureFormat, TextureUsages};
+use modul_core::wgpu;
+use modul_core::wgpu::{CommandEncoder, Device, TextureFormat, TextureUsages};
 
 use crate::render;
 
@@ -95,8 +96,8 @@ impl WboitResources {
 
         let resolve_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("WBOIT resolve layout"),
-            bind_group_layouts: &[&resolve_bind_group_layout],
-            push_constant_ranges: &[],
+            bind_group_layouts: &[Some(&resolve_bind_group_layout)],
+            immediate_size: 0,
         });
 
         let resolve_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -140,7 +141,7 @@ impl WboitResources {
                 })],
                 compilation_options: Default::default(),
             }),
-            multiview: None,
+            multiview_mask: None,
             cache: None,
         });
 
@@ -214,13 +215,13 @@ pub fn init_transparent_pipeline(
     let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some("Transparent voxel pipeline layout"),
         bind_group_layouts: &[
-            &camera_layout,
-            &metadata_layout,
-            &atlas_layout,
-            &shadow_mask_layout,
-            &atmosphere_layout,
+            Some(&camera_layout),
+            Some(&metadata_layout),
+            Some(&atlas_layout),
+            Some(&shadow_mask_layout),
+            Some(&atmosphere_layout),
         ],
-        push_constant_ranges: &[],
+        immediate_size: 0,
     });
 
     let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -255,8 +256,8 @@ pub fn init_transparent_pipeline(
         },
         depth_stencil: Some(wgpu::DepthStencilState {
             format: TextureFormat::Depth32Float,
-            depth_write_enabled: false, // Read depth, don't write
-            depth_compare: wgpu::CompareFunction::GreaterEqual, // Reverse-Z
+            depth_write_enabled: Some(false), // Read depth, don't write
+            depth_compare: Some(wgpu::CompareFunction::GreaterEqual), // Reverse-Z
             stencil: wgpu::StencilState::default(),
             bias: wgpu::DepthBiasState::default(),
         }),
@@ -298,7 +299,7 @@ pub fn init_transparent_pipeline(
             ],
             compilation_options: Default::default(),
         }),
-        multiview: None,
+        multiview_mask: None,
         cache: None,
     });
 
@@ -321,7 +322,8 @@ impl Operation for TransparentDrawOperation {
         // Get surface depth view
         let main_window_entity = world
             .query_filtered::<Entity, With<modul_core::MainWindow>>()
-            .single(world);
+            .single(world)
+            .expect("main window not spawned");
 
         let depth_view_ptr: *const wgpu::TextureView;
         {
@@ -338,7 +340,7 @@ impl Operation for TransparentDrawOperation {
                 .unwrap();
             let (w, h) = RenderTarget::size(surface_rt);
             world.resource_scope(|world, mut wboit_res: Mut<WboitResources>| {
-                let device = &world.resource::<modul_core::DeviceRes>().0;
+                let device = &world.resource::<modul_core::RenderContext>().device;
                 wboit_res.resize(device, w, h);
             });
         }
@@ -358,6 +360,7 @@ impl Operation for TransparentDrawOperation {
                 // Accumulation: clear to 0
                 Some(wgpu::RenderPassColorAttachment {
                     view: accum_view,
+                    depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
@@ -367,6 +370,7 @@ impl Operation for TransparentDrawOperation {
                 // Revealage: clear to 1 (fully transparent = no coverage)
                 Some(wgpu::RenderPassColorAttachment {
                     view: revealage_view,
+                    depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color { r: 1.0, g: 1.0, b: 1.0, a: 1.0 }),
@@ -384,6 +388,7 @@ impl Operation for TransparentDrawOperation {
             }),
             timestamp_writes: None,
             occlusion_query_set: None,
+            multiview_mask: None,
         });
 
         let trans_pipeline = world.resource::<TransparentVoxelPipeline>();
@@ -391,7 +396,7 @@ impl Operation for TransparentDrawOperation {
 
         let camera_bg = &world.resource::<render::CameraBindGroup>().bind_group;
         let atlas_bg = &world.resource::<render::TextureAtlasBindGroup>().bind_group;
-        let device = &world.resource::<modul_core::DeviceRes>().0;
+        let device = &world.resource::<modul_core::RenderContext>().device;
         let shadow_res = world.resource::<render::shadow::pass::ShadowPassResources>();
         let shadow_mask_bg = render::create_shadow_mask_bind_group(device, shadow_res);
         let atmo_res = world.resource::<render::atmosphere::AtmosphereResources>();
@@ -431,7 +436,8 @@ impl Operation for WboitResolveOperation {
         let taa_enabled = world.resource::<render::taa::TaaEnabled>().0;
         let main_window_entity = world
             .query_filtered::<Entity, With<modul_core::MainWindow>>()
-            .single(world);
+            .single(world)
+            .expect("main window not spawned");
 
         // Color target: scene texture (TAA on) or surface (TAA off)
         let color_view_ptr: *const wgpu::TextureView;
@@ -457,7 +463,7 @@ impl Operation for WboitResolveOperation {
         let accum_view = unsafe { &*accum_view_ptr };
         let revealage_view = unsafe { &*revealage_view_ptr };
 
-        let device = &world.resource::<modul_core::DeviceRes>().0;
+        let device = &world.resource::<modul_core::RenderContext>().device;
         let resolve_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("WBOIT resolve BG"),
             layout: bg_layout,
@@ -477,6 +483,7 @@ impl Operation for WboitResolveOperation {
             label: Some("WBOIT resolve pass"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                 view: color_view,
+                depth_slice: None,
                 resolve_target: None,
                 ops: wgpu::Operations {
                     load: wgpu::LoadOp::Load, // Keep opaque scene
@@ -486,6 +493,7 @@ impl Operation for WboitResolveOperation {
             depth_stencil_attachment: None,
             timestamp_writes: None,
             occlusion_query_set: None,
+            multiview_mask: None,
         });
 
         pass.set_pipeline(resolve_pipeline);
@@ -508,11 +516,11 @@ impl OperationBuilder for WboitResolveOperationBuilder {
 
 pub fn init_wboit(
     mut commands: Commands,
-    device: Res<modul_core::DeviceRes>,
+    ctx: Res<modul_core::RenderContext>,
     surface_fmt: Res<modul_core::SurfaceFormat>,
 ) {
-    let wboit_res = WboitResources::new(&device.0, surface_fmt.0, 800, 600);
-    let trans_pipeline = init_transparent_pipeline(&device.0, surface_fmt.0);
+    let wboit_res = WboitResources::new(&ctx.device, surface_fmt.0, 800, 600);
+    let trans_pipeline = init_transparent_pipeline(&ctx.device, surface_fmt.0);
     commands.insert_resource(wboit_res);
     commands.insert_resource(trans_pipeline);
 }

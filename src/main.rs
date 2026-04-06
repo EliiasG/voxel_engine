@@ -8,7 +8,7 @@ use bevy_ecs::prelude::*;
 use modul_asset::Assets;
 use modul_core::{
     run_app, EventBuffer, GraphicsInitializer, GraphicsInitializerResult, Init,
-    MainWindow, QueueRes, Redraw, WindowComponent,
+    MainWindow, Redraw, RenderContext, WindowComponent,
 };
 use modul_render::{
     InitialSurfaceConfig, RenderPlugin, RenderTargetColorConfig,
@@ -16,14 +16,16 @@ use modul_render::{
     SurfaceRenderTargetConfig, RenderTargetDepthStencilConfig, RenderSystemSet, Synchronize,
 };
 use modul_util::ExitPlugin;
-use wgpu::{
+use modul_core::wgpu;
+use modul_core::wgpu::{
     Backends, Color, DeviceDescriptor, Features, Instance, InstanceDescriptor,
     PowerPreference, PresentMode, RequestAdapterOptions, TextureFormat,
     TextureUsages,
 };
-use winit::event::{DeviceEvent, ElementState, Event, KeyEvent, WindowEvent};
-use winit::keyboard::{KeyCode, PhysicalKey};
-use winit::window::{CursorGrabMode, WindowAttributes};
+use modul_core::winit;
+use modul_core::winit::event::{DeviceEvent, ElementState, Event, KeyEvent, WindowEvent};
+use modul_core::winit::keyboard::{KeyCode, PhysicalKey};
+use modul_core::winit::window::{CursorGrabMode, WindowAttributes};
 
 use camera::{FlyCamera, Position, Rotation, CameraConfig, MainCamera};
 use chunk::demand::{ChunkSource, ChunkLoadList};
@@ -143,9 +145,9 @@ impl GraphicsInitializer for VoxelGraphicsInitializer {
         event_loop: &winit::event_loop::ActiveEventLoop,
     ) -> GraphicsInitializerResult {
         env_logger::init();
-        let instance = Instance::new(&InstanceDescriptor {
+        let instance = Instance::new(InstanceDescriptor {
             backends: Backends::all(),
-            ..Default::default()
+            ..InstanceDescriptor::new_without_display_handle()
         });
 
         let window = std::sync::Arc::new(
@@ -168,14 +170,13 @@ impl GraphicsInitializer for VoxelGraphicsInitializer {
         let (device, queue) = pollster::block_on(adapter.request_device(
             &DeviceDescriptor {
                 label: None,
-                required_features: Features::POLYGON_MODE_LINE | Features::MULTI_DRAW_INDIRECT,
+                required_features: Features::POLYGON_MODE_LINE | Features::INDIRECT_FIRST_INSTANCE,
                 required_limits: wgpu::Limits {
                     max_bind_groups: 5,
                     ..wgpu::Limits::default()
                 },
                 ..Default::default()
             },
-            None,
         ))
         .expect("no device?");
 
@@ -245,11 +246,11 @@ fn main() {
                     process_input,
                     chunk::demand::update_chunk_demand,
                     chunk::loading::update_chunk_loading,
-                    apply_deferred,
+                    ApplyDeferred,
                 ).chain(),
                 (
                     chunk::meshing::resolve_changes,
-                    apply_deferred,
+                    ApplyDeferred,
                     chunk::meshing::poll_meshing,
                     chunk::meshing::start_meshing,
                 ).chain(),
@@ -288,7 +289,7 @@ fn init_window(
     main_window: Query<Entity, With<MainWindow>>,
     mut sequences: ResMut<Assets<Sequence>>,
 ) {
-    let window_entity = main_window.single();
+    let window_entity = main_window.single().expect("main window not spawned");
 
     commands
         .entity(window_entity)
@@ -471,7 +472,7 @@ fn process_input(
     input.mouse_dx = 0.0;
     input.mouse_dy = 0.0;
 
-    let Ok((mut cam_pos, mut fly_cam, cam_config)) = cam_query.get_single_mut() else { return };
+    let Ok((mut cam_pos, mut fly_cam, cam_config)) = cam_query.single_mut() else { return };
 
     for event in events.events() {
         match event {
@@ -497,7 +498,7 @@ fn process_input(
                     match key {
                         KeyCode::Escape => {
                             input.captured = !input.captured;
-                            if let Ok(wc) = window_query.get_single() {
+                            if let Ok(wc) = window_query.single() {
                                 set_cursor_captured(&wc.window, input.captured);
                             }
                         }
@@ -624,7 +625,7 @@ fn process_input(
             } => {
                 if !input.captured {
                     input.captured = true;
-                    if let Ok(wc) = window_query.get_single() {
+                    if let Ok(wc) = window_query.single() {
                         set_cursor_captured(&wc.window, true);
                     }
                 } else {
@@ -669,7 +670,7 @@ fn process_input(
             } => {
                 if input.captured {
                     input.captured = false;
-                    if let Ok(wc) = window_query.get_single() {
+                    if let Ok(wc) = window_query.single() {
                         set_cursor_captured(&wc.window, false);
                     }
                 }
@@ -742,7 +743,7 @@ fn update_camera(
     mut taa_res: ResMut<render::taa::TaaResources>,
     taa_enabled: Res<render::taa::TaaEnabled>,
     debug: Res<DebugMode>,
-    queue: Res<QueueRes>,
+    ctx: Res<RenderContext>,
     camera_bg: Res<render::CameraBindGroup>,
     rt_query: Query<&modul_render::SurfaceRenderTarget, With<MainWindow>>,
     window_query: Query<&WindowComponent, With<MainWindow>>,
@@ -757,7 +758,7 @@ fn update_camera(
         fps.frame_count = 0;
         fps.last_instant = std::time::Instant::now();
 
-        if let Ok(wc) = window_query.get_single() {
+        if let Ok(wc) = window_query.single() {
             let title = format!(
                 "Voxel Engine \u{2014} {:.0} FPS | demand {}us load {}us sync_up {}us sync_draw {}us [op {}us tr {}us cull {}us write {}us n={}] cleanup {}us shd_sync {}us{}",
                 fps.fps,
@@ -778,10 +779,10 @@ fn update_camera(
         }
     }
 
-    let Ok((cam_pos, fly_cam, cam_config, mut cam_component)) = cam_query.get_single_mut() else { return };
+    let Ok((cam_pos, fly_cam, cam_config, mut cam_component)) = cam_query.single_mut() else { return };
 
     let mut aspect = 16.0 / 9.0;
-    if let Ok(rt) = rt_query.get_single() {
+    if let Ok(rt) = rt_query.single() {
         let (w, h) = modul_render::RenderTarget::size(rt);
         if w > 0 && h > 0 {
             aspect = w as f32 / h as f32;
@@ -791,7 +792,7 @@ fn update_camera(
     // Compute and store Camera component so other systems can read it
     *cam_component = camera::compute_camera(cam_pos, &Rotation(fly_cam.rotation()), cam_config, aspect);
     let mut uniform = camera::CameraUniform::from_camera(&cam_component);
-    if let Ok(rt) = rt_query.get_single() {
+    if let Ok(rt) = rt_query.single() {
         let (w, h) = modul_render::RenderTarget::size(rt);
         uniform.screen_size = [w as f32, h as f32];
     }
@@ -828,7 +829,6 @@ fn update_camera(
     // Inverse of (possibly jittered) VP for depth reconstruction
     uniform.inv_view_proj = camera::invert_mat4(&uniform.view_proj);
 
-    queue
-        .0
+    ctx.queue
         .write_buffer(&camera_bg.buffer, 0, bytemuck::bytes_of(&uniform));
 }

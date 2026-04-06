@@ -15,7 +15,8 @@ use modul_render::{
     GenericVertexBufferLayout, GenericVertexState, Operation, OperationBuilder,
     RenderPipelineManager, RenderTargetSource,
 };
-use wgpu::{
+use modul_core::wgpu;
+use modul_core::wgpu::{
     BlendState, Buffer, BufferDescriptor, BufferUsages, ColorWrites, CommandEncoder,
     CompareFunction, DepthBiasState, Device, FrontFace, PipelineLayout, PipelineLayoutDescriptor,
     PolygonMode, PrimitiveState, PrimitiveTopology, ShaderModule, ShaderModuleDescriptor,
@@ -507,21 +508,23 @@ impl<'a> GeometryPipelineBuilder<'a> {
         // Full layout: geometry BGs + shadow mask + atmosphere
         let shadow_mask_layout = device.create_bind_group_layout(ShadowMaskBGLayout::LAYOUT);
         let atmosphere_layout = device.create_bind_group_layout(atmosphere::AtmosphereBGLayout::LAYOUT);
-        let mut full_layouts: Vec<&wgpu::BindGroupLayout> = self.bind_group_layouts.iter().collect();
-        full_layouts.push(&shadow_mask_layout);
-        full_layouts.push(&atmosphere_layout);
+        let mut full_layouts: Vec<Option<&wgpu::BindGroupLayout>> =
+            self.bind_group_layouts.iter().map(Some).collect();
+        full_layouts.push(Some(&shadow_mask_layout));
+        full_layouts.push(Some(&atmosphere_layout));
         let full_layout = layouts.add(device.create_pipeline_layout(&PipelineLayoutDescriptor {
             label: Some(&format!("{} pipeline layout (full)", self.label)),
             bind_group_layouts: &full_layouts,
-            push_constant_ranges: &[],
+            immediate_size: 0,
         }));
 
         // Normal layout: geometry BGs only
-        let normal_bg_layouts: Vec<&wgpu::BindGroupLayout> = self.bind_group_layouts.iter().collect();
+        let normal_bg_layouts: Vec<Option<&wgpu::BindGroupLayout>> =
+            self.bind_group_layouts.iter().map(Some).collect();
         let normal_layout = layouts.add(device.create_pipeline_layout(&PipelineLayoutDescriptor {
             label: Some(&format!("{} pipeline layout (normal)", self.label)),
             bind_group_layouts: &normal_bg_layouts,
-            push_constant_ranges: &[],
+            immediate_size: 0,
         }));
 
         let make_desc = |shader, layout, polygon_mode, label: &str, frag_entry: &str| {
@@ -921,8 +924,7 @@ pub fn synchronize_gpu(
     mut gpu: ResMut<GpuBuffers>,
     mut draw_cache: ResMut<DrawCache>,
     mut trans_draw_cache: ResMut<TransparentDrawCache>,
-    device: Res<modul_core::DeviceRes>,
-    queue: Res<modul_core::QueueRes>,
+    ctx: Res<modul_core::RenderContext>,
     lod_maps: Res<crate::chunk::LodChunkMaps>,
     debug: Res<crate::DebugMode>,
     cam_query: Query<(&crate::camera::Position, &crate::camera::Camera), With<crate::camera::MainCamera>>,
@@ -943,8 +945,8 @@ pub fn synchronize_gpu(
             direction_and_lod: 0,
         };
 
-        let directions = upload_direction_faces(&faces.0, &meta_base, lod.0, &mut gpu, &device.0, &queue.0);
-        let transparent_directions = upload_direction_faces(&trans_faces.0, &meta_base, lod.0, &mut gpu, &device.0, &queue.0);
+        let directions = upload_direction_faces(&faces.0, &meta_base, lod.0, &mut gpu, &ctx.device, &ctx.queue);
+        let transparent_directions = upload_direction_faces(&trans_faces.0, &meta_base, lod.0, &mut gpu, &ctx.device, &ctx.queue);
 
         loaded_index.0.insert((pos.0, lod.0));
 
@@ -975,7 +977,7 @@ pub fn synchronize_gpu(
     // --- Determine camera state ---
     let (frustum_planes, frustum_chunk_offset, cam_world) = if let Some(ref f) = debug.frozen {
         (f.planes, f.chunk_pos, f.camera_world)
-    } else if let Ok((pos, cam)) = cam_query.get_single() {
+    } else if let Ok((pos, cam)) = cam_query.single() {
         (
             crate::camera::extract_frustum_planes(&cam.view_proj),
             IVec3::from_array(cam.chunk_offset),
@@ -1277,10 +1279,10 @@ pub fn synchronize_gpu(
 
         let _t_write = std::time::Instant::now();
         let (opaque_draws, next_offset) = write_draws_to_indirect(
-            &opaque_args, lod_count, &queue.0, &gpu.indirect_buffer, 0,
+            &opaque_args, lod_count, &ctx.queue, &gpu.indirect_buffer, 0,
         );
         let (trans_draws, _) = write_draws_to_indirect(
-            &trans_args, lod_count, &queue.0, &gpu.indirect_buffer, next_offset,
+            &trans_args, lod_count, &ctx.queue, &gpu.indirect_buffer, next_offset,
         );
         crate::TIMING_WRITE_INDIRECT_US.fetch_max(_t_write.elapsed().as_micros() as u32, std::sync::atomic::Ordering::Relaxed);
 
@@ -1416,7 +1418,7 @@ fn create_texture_atlas_bind_group(device: &Device, queue: &wgpu::Queue) -> Text
         label: Some("Atlas sampler"),
         mag_filter: wgpu::FilterMode::Nearest,
         min_filter: wgpu::FilterMode::Nearest,
-        mipmap_filter: wgpu::FilterMode::Linear,
+        mipmap_filter: wgpu::MipmapFilterMode::Linear,
         ..Default::default()
     });
 
@@ -1442,16 +1444,15 @@ fn create_texture_atlas_bind_group(device: &Device, queue: &wgpu::Queue) -> Text
 /// Initializes core render resources: GPU buffers, camera bind group, voxel pipelines.
 pub fn init_render(
     mut commands: Commands,
-    device: Res<modul_core::DeviceRes>,
-    queue: Res<modul_core::QueueRes>,
+    ctx: Res<modul_core::RenderContext>,
     mut shaders: ResMut<Assets<ShaderModule>>,
     mut layouts: ResMut<Assets<PipelineLayout>>,
     mut pipelines: ResMut<Assets<RenderPipelineManager>>,
 ) {
-    let gpu_buffers = create_gpu_buffers(&device.0);
-    let camera_bg = create_camera_bind_group(&device.0);
-    let atlas_bg = create_texture_atlas_bind_group(&device.0, &queue.0);
-    let voxel_pipeline = init_voxel_pipeline(&device.0, &mut pipelines, &mut shaders, &mut layouts);
+    let gpu_buffers = create_gpu_buffers(&ctx.device);
+    let camera_bg = create_camera_bind_group(&ctx.device);
+    let atlas_bg = create_texture_atlas_bind_group(&ctx.device, &ctx.queue);
+    let voxel_pipeline = init_voxel_pipeline(&ctx.device, &mut pipelines, &mut shaders, &mut layouts);
 
     commands.insert_resource(gpu_buffers);
     commands.insert_resource(camera_bg);

@@ -1,6 +1,7 @@
 use bevy_ecs::prelude::*;
 use modul_render::BindGroupLayoutDef;
-use wgpu::{Buffer, BufferDescriptor, BufferUsages, Device};
+use modul_core::wgpu;
+use modul_core::wgpu::{Buffer, BufferDescriptor, BufferUsages, Device};
 
 use crate::chunk::ChunkBitmask;
 use super::grid::{BitmaskPool, LodInfo, ShadowGrid, TransparentColorPool, TransparentColorRegion};
@@ -290,19 +291,17 @@ pub fn synchronize_shadow_buffers(
     mut grid: ResMut<ShadowGrid>,
     mut pool: ResMut<BitmaskPool>,
     mut color_pool: ResMut<TransparentColorPool>,
-    device: Res<modul_core::DeviceRes>,
-    queue: Res<modul_core::QueueRes>,
+    ctx: Res<modul_core::RenderContext>,
 ) {
     let _timer = crate::SysTimer::new(&crate::TIMING_SHADOW_SYNC_US);
     // Check if bitmask buffer needs to grow
     let slots_needed = pool.slots.len() as u32;
     if slots_needed > shadow_gpu.bitmask_capacity {
-        shadow_gpu.grow_bitmask_buffer(&device.0, slots_needed);
+        shadow_gpu.grow_bitmask_buffer(&ctx.device, slots_needed);
         // Re-upload all existing slots
         for (i, slot) in pool.slots.iter().enumerate() {
             let offset = i as u64 * BITMASK_SLOT_SIZE;
-            queue
-                .0
+            ctx.queue
                 .write_buffer(&shadow_gpu.bitmask_buffer, offset, bytemuck::bytes_of(slot));
         }
         pool.dirty_slots.clear();
@@ -312,8 +311,7 @@ pub fn synchronize_shadow_buffers(
     for &slot_idx in &pool.dirty_slots {
         let offset = slot_idx as u64 * BITMASK_SLOT_SIZE;
         let slot = &pool.slots[slot_idx as usize];
-        queue
-            .0
+        ctx.queue
             .write_buffer(&shadow_gpu.bitmask_buffer, offset, bytemuck::bytes_of(slot));
     }
     pool.dirty_slots.clear();
@@ -321,12 +319,11 @@ pub fn synchronize_shadow_buffers(
     // Check if color pool buffer needs to grow
     let color_slots_needed = color_pool.slots.len() as u32;
     if color_slots_needed > shadow_gpu.color_pool_capacity {
-        shadow_gpu.grow_color_pool_buffer(&device.0, color_slots_needed);
+        shadow_gpu.grow_color_pool_buffer(&ctx.device, color_slots_needed);
         // Re-upload all existing color pool slots
         for (i, slot) in color_pool.slots.iter().enumerate() {
             let offset = i as u64 * COLOR_REGION_SIZE;
-            queue
-                .0
+            ctx.queue
                 .write_buffer(&shadow_gpu.color_pool_buffer, offset, bytemuck::bytes_of(slot));
         }
         color_pool.dirty_slots.clear();
@@ -336,8 +333,7 @@ pub fn synchronize_shadow_buffers(
     for &slot_idx in &color_pool.dirty_slots {
         let offset = slot_idx as u64 * COLOR_REGION_SIZE;
         let slot = &color_pool.slots[slot_idx as usize];
-        queue
-            .0
+        ctx.queue
             .write_buffer(&shadow_gpu.color_pool_buffer, offset, bytemuck::bytes_of(slot));
     }
     color_pool.dirty_slots.clear();
@@ -345,7 +341,7 @@ pub fn synchronize_shadow_buffers(
     // Upload absorption coefficients once
     if shadow_gpu.absorption_dirty {
         let coeffs = compute_absorption_coefficients();
-        queue.0.write_buffer(
+        ctx.queue.write_buffer(
             &shadow_gpu.absorption_buffer,
             0,
             bytemuck::cast_slice(&coeffs),
@@ -355,7 +351,7 @@ pub fn synchronize_shadow_buffers(
 
     // Upload lod infos if origins changed
     if grid.lod_infos_dirty {
-        queue.0.write_buffer(
+        ctx.queue.write_buffer(
             &shadow_gpu.lod_info_buffer,
             0,
             bytemuck::cast_slice(&grid.lod_infos),
@@ -365,7 +361,7 @@ pub fn synchronize_shadow_buffers(
 
     // Upload grid data if dirty (full upload — only ~157KB, not worth per-cell)
     if grid.grid_dirty {
-        queue.0.write_buffer(
+        ctx.queue.write_buffer(
             &shadow_gpu.grid_buffer,
             0,
             bytemuck::cast_slice(&grid.grid_data),
@@ -381,7 +377,7 @@ pub fn synchronize_shadow_buffers(
             let byte_offset = cell_idx as u64 * 64 * 4;
             let start = cell_idx * 64;
             let end = start + 64;
-            queue.0.write_buffer(
+            ctx.queue.write_buffer(
                 &shadow_gpu.indirection_buffer,
                 byte_offset,
                 bytemuck::cast_slice(&grid.indirection_data[start..end]),
