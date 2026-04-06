@@ -172,7 +172,7 @@ impl GraphicsInitializer for VoxelGraphicsInitializer {
                 label: None,
                 required_features: Features::POLYGON_MODE_LINE | Features::INDIRECT_FIRST_INSTANCE,
                 required_limits: wgpu::Limits {
-                    max_bind_groups: 5,
+                    max_bind_groups: 6,
                     ..wgpu::Limits::default()
                 },
                 ..Default::default()
@@ -231,6 +231,7 @@ fn main() {
             init_window,
             init_gameplay,
             render::init_render,
+            render::lights::init_lights,
             render::shadow::init_shadow,
             render::taa::init_taa,
             render::atmosphere::init_atmosphere,
@@ -263,6 +264,9 @@ fn main() {
         app.add_systems(
             Synchronize,
             (
+                render::lights::synchronize_lights
+                    .before(render::cleanup_unloaded_chunks)
+                    .after(update_camera),
                 render::cleanup_unloaded_chunks.before(render::synchronize_gpu),
                 render::shadow::grid::process_chunk_bitmasks
                     .before(render::shadow::gpu::synchronize_shadow_buffers),
@@ -351,7 +355,21 @@ fn init_gameplay(mut commands: Commands) {
     };
     let cam = camera::compute_camera(&pos, &rot, &config, 16.0 / 9.0);
 
-    commands.spawn((pos, rot, config, cam, fly, MainCamera, ChunkSource::default(), ChunkLoadList::default()));
+    // Debug headlamp: spot light parented to the camera, pointing forward
+    // (-Z in camera local space). Direction is rotated by the camera's
+    // Rotation in the lights synchronizer.
+    let headlamp = render::lights::Light {
+        color: glam::Vec3::new(1.0, 0.95, 0.85),
+        intensity: 12.0,
+        range: 32.0,
+        kind: render::lights::LightKind::Spot {
+            direction: glam::Vec3::new(0.0, 0.0, -1.0),
+            inner_cos: 0.92, // ~23° half-angle inner cone
+            outer_cos: 0.80, // ~37° half-angle outer cone
+        },
+    };
+
+    commands.spawn((pos, rot, config, cam, fly, MainCamera, ChunkSource::default(), ChunkLoadList::default(), headlamp));
 
     commands.insert_resource(FrameCount(0));
     commands.insert_resource(DayCycle::default());
@@ -639,7 +657,8 @@ fn process_input(
                         let (target, block) = match button {
                             winit::event::MouseButton::Left => (hit, chunk::AIR),
                             winit::event::MouseButton::Right => {
-                                ([hit[0] + face[0], hit[1] + face[1], hit[2] + face[2]], chunk::GLASS)
+                                // Slice 1 lighting test: place torches.
+                                ([hit[0] + face[0], hit[1] + face[1], hit[2] + face[2]], chunk::TORCH)
                             }
                             _ => { continue; }
                         };
@@ -747,7 +766,7 @@ fn update_camera(
     camera_bg: Res<render::CameraBindGroup>,
     rt_query: Query<&modul_render::SurfaceRenderTarget, With<MainWindow>>,
     window_query: Query<&WindowComponent, With<MainWindow>>,
-    mut cam_query: Query<(&Position, &FlyCamera, &CameraConfig, &mut camera::Camera), With<MainCamera>>,
+    mut cam_query: Query<(&Position, &FlyCamera, &CameraConfig, &mut camera::Camera, &mut Rotation), With<MainCamera>>,
 ) {
     frame_count.0 += 1;
     fps.frame_count += 1;
@@ -779,7 +798,7 @@ fn update_camera(
         }
     }
 
-    let Ok((cam_pos, fly_cam, cam_config, mut cam_component)) = cam_query.single_mut() else { return };
+    let Ok((cam_pos, fly_cam, cam_config, mut cam_component, mut cam_rotation)) = cam_query.single_mut() else { return };
 
     let mut aspect = 16.0 / 9.0;
     if let Ok(rt) = rt_query.single() {
@@ -789,8 +808,12 @@ fn update_camera(
         }
     }
 
+    // Keep the entity's Rotation component in sync with the FlyCamera, so
+    // other systems (e.g. dynamic light upload) can read the current pose.
+    cam_rotation.0 = fly_cam.rotation();
+
     // Compute and store Camera component so other systems can read it
-    *cam_component = camera::compute_camera(cam_pos, &Rotation(fly_cam.rotation()), cam_config, aspect);
+    *cam_component = camera::compute_camera(cam_pos, &cam_rotation, cam_config, aspect);
     let mut uniform = camera::CameraUniform::from_camera(&cam_component);
     if let Ok(rt) = rt_query.single() {
         let (w, h) = modul_render::RenderTarget::size(rt);

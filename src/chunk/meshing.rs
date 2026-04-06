@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use bevy_ecs::prelude::*;
 use crossbeam_channel::{Receiver, Sender};
+use glam::Vec3;
 
 use super::*;
 
@@ -25,17 +26,111 @@ pub struct ChunkFaces(pub [DirFaces; NUM_DIRECTIONS]);
 #[component(storage = "SparseSet")]
 pub struct TransparentChunkFaces(pub [DirFaces; NUM_DIRECTIONS]);
 
+/// One simple light extracted from a chunk, in chunk-local voxel coordinates.
+/// `chunk_pos` is added at the synchronize-lights stage when the chunk's
+/// position is known.
+#[derive(Clone, Copy, Debug)]
+pub struct ChunkLocalLight {
+    pub local_pos: Vec3,
+    pub direction: Vec3,
+    pub color: Vec3,
+    pub intensity: f32,
+    pub range: f32,
+    pub inner_cos: f32,
+    pub outer_cos: f32,
+}
+
+/// Simple lights extracted from a chunk by the meshing pass. Mirrors the
+/// `ChunkFaces` lifecycle: produced by the mesh worker, consumed by the
+/// light synchronizer, then removed.
+#[derive(Component)]
+#[component(storage = "SparseSet")]
+pub struct ChunkSimpleLights(pub Vec<ChunkLocalLight>);
+
 struct MeshRequest {
     entity: Entity,
     storage: Arc<ChunkStorage>,
     neighbors: [Option<Arc<ChunkStorage>>; 6],
+    /// LOD 0 chunks extract lights; coarser LODs skip extraction.
+    extract_lights: bool,
 }
 
 struct MeshResult {
     entity: Entity,
     opaque_faces: [DirFaces; NUM_DIRECTIONS],
     transparent_faces: [DirFaces; NUM_DIRECTIONS],
+    simple_lights: Vec<ChunkLocalLight>,
     mesh_us: u32,
+}
+
+/// Walks every block in `storage` and emits a `ChunkLocalLight` for each
+/// block whose `LightSpec` is `Simple`. Range is clamped to
+/// `MAX_SIMPLE_LIGHT_RANGE`.
+fn extract_simple_lights(storage: &ChunkStorage) -> Vec<ChunkLocalLight> {
+    // Fast path: a uniform-filled chunk either has no light blocks at all
+    // or is filled with one light block — the latter is exotic. Either way,
+    // a single property lookup decides everything.
+    if let ChunkStorage::Filled(block) = storage {
+        let Some(LightSpec::Simple { offset, color, intensity, range, kind }) =
+            block_props(*block).light else {
+            return Vec::new();
+        };
+        let range = range.min(MAX_SIMPLE_LIGHT_RANGE);
+        let (direction, inner_cos, outer_cos) = match kind {
+            SimpleLightKind::Point => (Vec3::ZERO, -1.0, -1.0),
+            SimpleLightKind::Spot { direction, inner_cos, outer_cos } => {
+                (direction.normalize_or_zero(), inner_cos, outer_cos)
+            }
+        };
+        let mut out = Vec::with_capacity(CHUNK_SIZE_3);
+        for z in 0..CHUNK_SIZE { for y in 0..CHUNK_SIZE { for x in 0..CHUNK_SIZE {
+            out.push(ChunkLocalLight {
+                local_pos: Vec3::new(x as f32, y as f32, z as f32) + offset,
+                direction,
+                color,
+                intensity,
+                range,
+                inner_cos,
+                outer_cos,
+            });
+        }}}
+        return out;
+    }
+
+    // Paletted: skim the palette for any block with a light spec, abort
+    // early if there are none.
+    let palette = match storage {
+        ChunkStorage::Paletted { palette, .. } => palette,
+        _ => unreachable!(),
+    };
+    let any_lights = palette.iter().any(|&b| matches!(block_props(b).light, Some(LightSpec::Simple { .. })));
+    if !any_lights {
+        return Vec::new();
+    }
+
+    let mut out = Vec::new();
+    for z in 0..CHUNK_SIZE { for y in 0..CHUNK_SIZE { for x in 0..CHUNK_SIZE {
+        let block = storage.get(x, y, z);
+        let Some(LightSpec::Simple { offset, color, intensity, range, kind }) =
+            block_props(block).light else { continue };
+        let range = range.min(MAX_SIMPLE_LIGHT_RANGE);
+        let (direction, inner_cos, outer_cos) = match kind {
+            SimpleLightKind::Point => (Vec3::ZERO, -1.0, -1.0),
+            SimpleLightKind::Spot { direction, inner_cos, outer_cos } => {
+                (direction.normalize_or_zero(), inner_cos, outer_cos)
+            }
+        };
+        out.push(ChunkLocalLight {
+            local_pos: Vec3::new(x as f32, y as f32, z as f32) + offset,
+            direction,
+            color,
+            intensity,
+            range,
+            inner_cos,
+            outer_cos,
+        });
+    }}}
+    out
 }
 
 /// Channel-based worker pool for chunk meshing.
@@ -78,11 +173,17 @@ impl MeshPool {
                                 dir_faces.border.clear();
                             }
                         }
+                        let simple_lights = if req.extract_lights {
+                            extract_simple_lights(&req.storage)
+                        } else {
+                            Vec::new()
+                        };
                         let mesh_us = t0.elapsed().as_micros() as u32;
                         let _ = res_tx.send(MeshResult {
                             entity: req.entity,
                             opaque_faces: opaque,
                             transparent_faces: transparent,
+                            simple_lights,
                             mesh_us,
                         });
                     }
@@ -148,7 +249,11 @@ pub fn start_meshing(
         // Skip meshing for all-air chunks -- no faces possible
         if let ChunkStorage::Filled(AIR) = &*data.0 {
             commands.entity(entity)
-                .insert((ChunkFaces(empty_dir_faces()), TransparentChunkFaces(empty_dir_faces())))
+                .insert((
+                    ChunkFaces(empty_dir_faces()),
+                    TransparentChunkFaces(empty_dir_faces()),
+                    ChunkSimpleLights(Vec::new()),
+                ))
                 .remove::<NeedsRemesh>();
             continue;
         }
@@ -166,6 +271,7 @@ pub fn start_meshing(
             entity,
             storage: data.0.clone(),
             neighbors,
+            extract_lights: lod.0 == 0,
         });
         commands.entity(entity).remove::<NeedsRemesh>();
     }
@@ -187,6 +293,7 @@ pub fn poll_meshing(
             commands.entity(result.entity).insert((
                 ChunkFaces(result.opaque_faces),
                 TransparentChunkFaces(result.transparent_faces),
+                ChunkSimpleLights(result.simple_lights),
             ));
         }
     }

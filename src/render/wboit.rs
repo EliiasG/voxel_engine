@@ -184,7 +184,10 @@ pub fn init_transparent_pipeline(
     _surface_format: TextureFormat,
 ) -> TransparentVoxelPipeline {
     // Build shader: camera BG (0) + metadata BG (1) + atlas BG (2) + shadow mask BG (3) + atmosphere BG (4)
-    // + sky_sample + lighting + vertex + transparent fragment
+    // + sky_sample + fog + vertex + transparent fragment.
+    // Slice 1 transparent path does not call apply_lighting() — it has its own
+    // ad-hoc shading — so lighting.wgsl is intentionally not included here, which
+    // also keeps the transparent pipeline free of the lights bind group.
     let camera_wgsl = render::CameraBGLayout::LIBRARY.replace("#BIND_GROUP", "0");
     let metadata_wgsl = render::MetadataBGLayout::LIBRARY.replace("#BIND_GROUP", "1");
     let atlas_wgsl = render::TextureAtlasBGLayout::LIBRARY.replace("#BIND_GROUP", "2");
@@ -192,13 +195,12 @@ pub fn init_transparent_pipeline(
     let atmosphere_wgsl = render::atmosphere::AtmosphereBGLayout::LIBRARY.replace("#BIND_GROUP", "4");
     let sky_sample_wgsl = include_str!("shaders/sky_sample.wgsl");
     let fog_wgsl = include_str!("shaders/fog.wgsl");
-    let lighting_wgsl = include_str!("shaders/lighting.wgsl");
     let vertex_wgsl = include_str!("shaders/voxel_vertex.wgsl");
     let transparent_wgsl = include_str!("shaders/voxel_transparent.wgsl");
 
     let full_source = format!(
         "{camera_wgsl}\n{metadata_wgsl}\n{atlas_wgsl}\n{shadow_mask_wgsl}\n{atmosphere_wgsl}\n\
-         {sky_sample_wgsl}\n{fog_wgsl}\n{lighting_wgsl}\n{vertex_wgsl}\n{transparent_wgsl}"
+         {sky_sample_wgsl}\n{fog_wgsl}\n{vertex_wgsl}\n{transparent_wgsl}"
     );
 
     let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {

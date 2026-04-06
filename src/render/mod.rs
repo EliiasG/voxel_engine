@@ -1,4 +1,5 @@
 pub mod atmosphere;
+pub mod lights;
 pub mod shadow;
 pub mod taa;
 pub mod wboit;
@@ -480,16 +481,22 @@ impl<'a> GeometryPipelineBuilder<'a> {
         let geometry_bg_count = self.bind_group_libraries.len();
         let geometry_bg_wgsl: String = self.bind_group_libraries.join("\n");
 
-        // Full shader: geometry BGs + shadow mask BG + atmosphere BG + shared snippets + vertex + material
+        // Full shader: geometry BGs + shadow mask BG + atmosphere BG + lights BG + shared
+        // snippets + vertex + material. Lights BG is full-only because the depth-only
+        // normal pipeline never needs lighting.
         let shadow_mask_index = geometry_bg_count;
         let atmosphere_index = geometry_bg_count + 1;
+        let lights_index = geometry_bg_count + 2;
         let shadow_mask_wgsl = ShadowMaskBGLayout::LIBRARY.replace("#BIND_GROUP", &shadow_mask_index.to_string());
         let atmosphere_wgsl = atmosphere::AtmosphereBGLayout::LIBRARY.replace("#BIND_GROUP", &atmosphere_index.to_string());
+        let lights_wgsl = lights::LightsBGLayout::LIBRARY.replace("#BIND_GROUP", &lights_index.to_string());
+        let lights_common_wgsl = include_str!("shaders/lights_common.wgsl");
         let sky_sample_wgsl = include_str!("shaders/sky_sample.wgsl");
         let fog_wgsl = include_str!("shaders/fog.wgsl");
         let lighting_wgsl = include_str!("shaders/lighting.wgsl");
         let full_source = format!(
-            "{geometry_bg_wgsl}\n{shadow_mask_wgsl}\n{atmosphere_wgsl}\n{sky_sample_wgsl}\n{fog_wgsl}\n{lighting_wgsl}\n{}\n{}",
+            "{geometry_bg_wgsl}\n{shadow_mask_wgsl}\n{atmosphere_wgsl}\n{lights_wgsl}\n\
+             {sky_sample_wgsl}\n{fog_wgsl}\n{lights_common_wgsl}\n{lighting_wgsl}\n{}\n{}",
             self.vertex_source, self.material_source,
         );
         let full_shader = shaders.add(device.create_shader_module(ShaderModuleDescriptor {
@@ -505,13 +512,15 @@ impl<'a> GeometryPipelineBuilder<'a> {
             source: ShaderSource::Wgsl(normal_source.into()),
         }));
 
-        // Full layout: geometry BGs + shadow mask + atmosphere
+        // Full layout: geometry BGs + shadow mask + atmosphere + lights
         let shadow_mask_layout = device.create_bind_group_layout(ShadowMaskBGLayout::LAYOUT);
         let atmosphere_layout = device.create_bind_group_layout(atmosphere::AtmosphereBGLayout::LAYOUT);
+        let lights_layout = device.create_bind_group_layout(lights::LightsBGLayout::LAYOUT);
         let mut full_layouts: Vec<Option<&wgpu::BindGroupLayout>> =
             self.bind_group_layouts.iter().map(Some).collect();
         full_layouts.push(Some(&shadow_mask_layout));
         full_layouts.push(Some(&atmosphere_layout));
+        full_layouts.push(Some(&lights_layout));
         let full_layout = layouts.add(device.create_pipeline_layout(&PipelineLayoutDescriptor {
             label: Some(&format!("{} pipeline layout (full)", self.label)),
             bind_group_layouts: &full_layouts,

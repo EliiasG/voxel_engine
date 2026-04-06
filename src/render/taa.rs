@@ -341,10 +341,15 @@ impl Operation for TaaVoxelDrawOperation {
                 let atmo_bg_ptr = &atmo_res.bind_group as *const wgpu::BindGroup;
                 let atmo_bg = unsafe { &*atmo_bg_ptr };
 
+                let lights_buffers = world.resource::<crate::render::lights::LightBuffers>();
+                let lights_bg_ptr = &lights_buffers.bind_group as *const wgpu::BindGroup;
+                let lights_bg = unsafe { &*lights_bg_ptr };
+
                 pass.set_bind_group(0, camera_bg, &[]);
                 pass.set_bind_group(2, atlas_bg, &[]);
                 pass.set_bind_group(3, &shadow_mask_bg, &[]);
                 pass.set_bind_group(4, atmo_bg, &[]);
+                pass.set_bind_group(5, lights_bg, &[]);
 
                 render::draw_voxel_geometry(&mut pass, gpu);
             },

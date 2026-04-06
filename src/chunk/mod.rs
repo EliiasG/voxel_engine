@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use bevy_ecs::prelude::*;
 use bytemuck::{Pod, Zeroable};
-use glam::IVec3;
+use glam::{IVec3, Vec3};
 
 pub const CHUNK_SIZE: usize = 32;
 pub const CHUNK_SIZE_2: usize = CHUNK_SIZE * CHUNK_SIZE;
@@ -20,6 +20,7 @@ pub const DIRT: BlockId = 2;
 pub const GRASS: BlockId = 3;
 pub const GLASS: BlockId = 4;
 pub const WATER: BlockId = 5;
+pub const TORCH: BlockId = 6;
 
 /// Per-block-type properties for rendering.
 pub struct BlockProperties {
@@ -27,15 +28,69 @@ pub struct BlockProperties {
     pub is_transparent: bool,
     /// Index into the absorption coefficient table (0-253). Only meaningful when is_transparent.
     pub color_index: u8,
+    /// Optional emissive light spec attached to this block.
+    pub light: Option<LightSpec>,
 }
+
+/// Specification of an emissive light owned by a block.
+#[derive(Clone, Copy)]
+pub enum LightSpec {
+    /// Block contributes a simple point/spot light extracted by the chunk light pass.
+    Simple {
+        /// Local offset from the block-min corner, in voxels (typically 0..1 per axis).
+        offset: Vec3,
+        color: Vec3,
+        intensity: f32,
+        /// Hard cutoff distance, clamped to MAX_SIMPLE_LIGHT_RANGE.
+        range: f32,
+        kind: SimpleLightKind,
+    },
+}
+
+#[derive(Clone, Copy)]
+pub enum SimpleLightKind {
+    Point,
+    #[allow(dead_code)]
+    Spot {
+        direction: Vec3,
+        inner_cos: f32,
+        outer_cos: f32,
+    },
+}
+
+/// Hard cap on simple light range, in voxels (1 chunk).
+pub const MAX_SIMPLE_LIGHT_RANGE: f32 = 32.0;
 
 /// Look up properties for a block type.
 #[inline]
 pub fn block_props(block: BlockId) -> BlockProperties {
     match block {
-        GLASS => BlockProperties { is_transparent: true, color_index: 0 },
-        WATER => BlockProperties { is_transparent: true, color_index: 1 },
-        _ => BlockProperties { is_transparent: false, color_index: 0 },
+        GLASS => BlockProperties {
+            is_transparent: true,
+            color_index: 0,
+            light: None,
+        },
+        WATER => BlockProperties {
+            is_transparent: true,
+            color_index: 1,
+            light: None,
+        },
+        TORCH => BlockProperties {
+            is_transparent: false,
+            color_index: 0,
+            light: Some(LightSpec::Simple {
+                offset: Vec3::splat(0.5),
+                color: Vec3::new(1.0, 0.75, 0.4),
+                intensity: 8.0,
+                range: 16.0,
+                kind: SimpleLightKind::Point,
+            }),
+        },
+        _ => BlockProperties {
+            is_transparent: false,
+            color_index: 0,
+            light: None,
+        },
     }
 }
 

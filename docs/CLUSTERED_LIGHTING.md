@@ -132,9 +132,10 @@ let camera_chunk_origin_f64 = (camera_chunk_offset.as_dvec3()) * CHUNK_SIZE_F64;
 let local = (entity_position.0 - camera_chunk_origin_f64).as_vec3();
 ```
 
-Stored with `chunk_pos = ivec3(0, 0, 0)` and `local_pos = local`. The shader's rebasing math
-works without modification because `rel_chunk = 0`. No per-light integer chunk bookkeeping
-needed for dynamic lights — they're per-frame uploads anyway.
+Stored with `chunk_pos = camera_chunk_offset` and `local_pos = local`. The shader's rebasing
+math then collapses to `rel_chunk = 0` and `local_pos` is used directly. No per-light integer
+chunk bookkeeping needed for dynamic lights — they're per-frame uploads anyway, and the
+camera chunk offset is the same across all of them.
 
 ---
 

@@ -65,7 +65,12 @@ fn apply_lighting(surface: Surface) -> vec4<f32> {
     let diffuse = 0.7 * ndotl * shadow * day;
     let ao = mix(0.4, 1.0, surface.ao);
     let ambient_term = ambient * ao + sky_light * ao;
-    let lit_color = surface.base_color * (vec3<f32>(ambient_term) + diffuse);
+    var lit_color = surface.base_color * (vec3<f32>(ambient_term) + diffuse);
+
+    // Additive simple light contribution (chunk-owned + dynamic). Slice 1
+    // walks the entire flat global lights buffer with no clustering.
+    let light_contrib = accumulate_simple_lights(surface.world_pos, surface.normal);
+    lit_color = lit_color + surface.base_color * light_contrib;
 
     // Exponential distance fog
     let final_color = apply_fog(lit_color, surface.world_pos);
