@@ -438,10 +438,16 @@ pub fn create_cluster_build_pipeline(
     let cluster_wgsl = include_str!("shaders/cluster_build.wgsl");
     let source = format!("{camera_wgsl}\n{cluster_wgsl}");
 
-    let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-        label: Some("Cluster build shader"),
-        source: wgpu::ShaderSource::Wgsl(source.into()),
-    });
+    // SAFETY: cluster build's loops are bounded by `light_counts.*` (CPU-written
+    // to actual buffer content) and `cluster_id < NUM_CLUSTERS` is enforced by
+    // the early-out at the top of the entry point.
+    let module = unsafe { device.create_shader_module_trusted(
+        wgpu::ShaderModuleDescriptor {
+            label: Some("Cluster build shader"),
+            source: wgpu::ShaderSource::Wgsl(source.into()),
+        },
+        wgpu::ShaderRuntimeChecks::unchecked(),
+    ) };
 
     let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some("Cluster build pipeline layout"),

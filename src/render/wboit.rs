@@ -100,12 +100,16 @@ impl WboitResources {
             immediate_size: 0,
         });
 
-        let resolve_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("WBOIT resolve shader"),
-            source: wgpu::ShaderSource::Wgsl(
-                include_str!("shaders/wboit_resolve.wgsl").into(),
-            ),
-        });
+        // SAFETY: fullscreen triangle that samples accum + revealage textures.
+        let resolve_shader = unsafe { device.create_shader_module_trusted(
+            wgpu::ShaderModuleDescriptor {
+                label: Some("WBOIT resolve shader"),
+                source: wgpu::ShaderSource::Wgsl(
+                    include_str!("shaders/wboit_resolve.wgsl").into(),
+                ),
+            },
+            wgpu::ShaderRuntimeChecks::unchecked(),
+        ) };
 
         // Resolve pipeline: alpha-blends transparent result over opaque scene
         let resolve_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -203,10 +207,16 @@ pub fn init_transparent_pipeline(
          {sky_sample_wgsl}\n{fog_wgsl}\n{vertex_wgsl}\n{transparent_wgsl}"
     );
 
-    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-        label: Some("Transparent voxel shader"),
-        source: wgpu::ShaderSource::Wgsl(full_source.into()),
-    });
+    // SAFETY: transparent voxel pipeline uses the same vertex shader path as
+    // opaque (page metadata indexed by instance / PAGE_SIZE) and samples textures
+    // via textureSample. No unbounded indexing.
+    let shader = unsafe { device.create_shader_module_trusted(
+        wgpu::ShaderModuleDescriptor {
+            label: Some("Transparent voxel shader"),
+            source: wgpu::ShaderSource::Wgsl(full_source.into()),
+        },
+        wgpu::ShaderRuntimeChecks::unchecked(),
+    ) };
 
     let camera_layout = device.create_bind_group_layout(render::CameraBGLayout::LAYOUT);
     let metadata_layout = device.create_bind_group_layout(render::MetadataBGLayout::LAYOUT);

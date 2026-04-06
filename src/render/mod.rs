@@ -500,18 +500,26 @@ impl<'a> GeometryPipelineBuilder<'a> {
              {sky_sample_wgsl}\n{fog_wgsl}\n{lights_common_wgsl}\n{lighting_wgsl}\n{}\n{}",
             self.vertex_source, self.material_source,
         );
-        let full_shader = shaders.add(device.create_shader_module(ShaderModuleDescriptor {
-            label: Some(&format!("{} shader (full)", self.label)),
-            source: ShaderSource::Wgsl(full_source.into()),
-        }));
+        // SAFETY: all indexing in the voxel pipeline is bounded by buffer sizes
+        // and clamped cluster IDs. See the audit notes in the slice 2 commit.
+        let full_shader = shaders.add(unsafe { device.create_shader_module_trusted(
+            ShaderModuleDescriptor {
+                label: Some(&format!("{} shader (full)", self.label)),
+                source: ShaderSource::Wgsl(full_source.into()),
+            },
+            wgpu::ShaderRuntimeChecks::unchecked(),
+        ) });
 
         // Normal shader: geometry BGs + vertex + fs_normal
         let fs_normal_src = include_str!("shaders/fs_normal.wgsl");
         let normal_source = format!("{geometry_bg_wgsl}\n{}\n{fs_normal_src}", self.vertex_source);
-        let normal_shader = shaders.add(device.create_shader_module(ShaderModuleDescriptor {
-            label: Some(&format!("{} shader (normal)", self.label)),
-            source: ShaderSource::Wgsl(normal_source.into()),
-        }));
+        let normal_shader = shaders.add(unsafe { device.create_shader_module_trusted(
+            ShaderModuleDescriptor {
+                label: Some(&format!("{} shader (normal)", self.label)),
+                source: ShaderSource::Wgsl(normal_source.into()),
+            },
+            wgpu::ShaderRuntimeChecks::unchecked(),
+        ) });
 
         // Full layout: geometry BGs + shadow mask + atmosphere + lights
         let shadow_mask_layout = device.create_bind_group_layout(ShadowMaskBGLayout::LAYOUT);

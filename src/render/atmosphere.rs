@@ -502,10 +502,15 @@ impl AtmosphereResources {
         let sky_shader_src = include_str!("shaders/sky.wgsl");
         let full_source = format!("{camera_wgsl}\n{atmo_wgsl}\n{sky_sample_wgsl}\n{sky_shader_src}");
 
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("Sky shader"),
-            source: wgpu::ShaderSource::Wgsl(full_source.into()),
-        });
+        // SAFETY: sky pass is a fullscreen triangle that only samples the sky LUT
+        // via textureSample, no manual indexing.
+        let shader = unsafe { device.create_shader_module_trusted(
+            wgpu::ShaderModuleDescriptor {
+                label: Some("Sky shader"),
+                source: wgpu::ShaderSource::Wgsl(full_source.into()),
+            },
+            wgpu::ShaderRuntimeChecks::unchecked(),
+        ) };
 
         let sky_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("Sky pipeline"),

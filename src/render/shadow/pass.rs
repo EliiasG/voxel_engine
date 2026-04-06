@@ -746,10 +746,15 @@ impl OperationBuilder for ShadowDebugOverlayBuilder {
             immediate_size: 0,
         });
 
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("Shadow debug shader"),
-            source: wgpu::ShaderSource::Wgsl(SHADOW_DEBUG_WGSL.into()),
-        });
+        // SAFETY: shadow debug overlay is a fullscreen triangle that samples
+        // the shadow mask via textureSample.
+        let shader = unsafe { device.create_shader_module_trusted(
+            wgpu::ShaderModuleDescriptor {
+                label: Some("Shadow debug shader"),
+                source: wgpu::ShaderSource::Wgsl(SHADOW_DEBUG_WGSL.into()),
+            },
+            wgpu::ShaderRuntimeChecks::unchecked(),
+        ) };
 
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("Shadow debug pipeline"),

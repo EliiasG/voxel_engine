@@ -144,10 +144,15 @@ impl TaaResources {
         let taa_shader_src = include_str!("shaders/taa.wgsl");
         let full_source = format!("{camera_wgsl}\n{taa_bindings}\n{taa_shader_src}");
 
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("TAA resolve shader"),
-            source: wgpu::ShaderSource::Wgsl(full_source.into()),
-        });
+        // SAFETY: TAA resolve is a fullscreen triangle that samples textures
+        // via textureSample/textureLoad with bounded coordinates.
+        let shader = unsafe { device.create_shader_module_trusted(
+            wgpu::ShaderModuleDescriptor {
+                label: Some("TAA resolve shader"),
+                source: wgpu::ShaderSource::Wgsl(full_source.into()),
+            },
+            wgpu::ShaderRuntimeChecks::unchecked(),
+        ) };
 
         let resolve_pipeline =
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
