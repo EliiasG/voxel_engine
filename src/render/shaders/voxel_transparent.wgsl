@@ -28,7 +28,8 @@ fn fs_transparent(in: VertexOutput) -> WboitOutput {
     let ambient = mix(0.08, 0.25, day);
     let sky_light = max(in.normal.y * 0.5 + 0.5, 0.0) * mix(0.04, 0.15, day);
     let diffuse = 0.7 * ndotl * day;
-    let lit_color = tint.rgb * (ambient + sky_light + diffuse);
+    var lit_color = tint.rgb * (ambient + sky_light + diffuse);
+    lit_color = apply_fog(lit_color, in.world_pos);
 
     let alpha = tint.a;
 

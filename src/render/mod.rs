@@ -388,8 +388,9 @@ pub struct TransparentDrawCache(pub DrawCache);
 pub struct ChunkRenderData {
     pub dirty: bool,
     pub entries: HashMap<Entity, ChunkRenderEntry>,
-    /// Entities removed this frame — drained by update_draw_cache to mark cache entries dead.
-    pub removed_entities: Vec<Entity>,
+    /// (Entity, chunk_pos, lod) removed this frame — drained by update_draw_cache.
+    /// Used to drop cache entries AND re-add parent LOD chunks that became uncovered.
+    pub removed_entities: Vec<(Entity, IVec3, u8)>,
 }
 
 #[derive(Resource)]
@@ -484,9 +485,10 @@ impl<'a> GeometryPipelineBuilder<'a> {
         let shadow_mask_wgsl = ShadowMaskBGLayout::LIBRARY.replace("#BIND_GROUP", &shadow_mask_index.to_string());
         let atmosphere_wgsl = atmosphere::AtmosphereBGLayout::LIBRARY.replace("#BIND_GROUP", &atmosphere_index.to_string());
         let sky_sample_wgsl = include_str!("shaders/sky_sample.wgsl");
+        let fog_wgsl = include_str!("shaders/fog.wgsl");
         let lighting_wgsl = include_str!("shaders/lighting.wgsl");
         let full_source = format!(
-            "{geometry_bg_wgsl}\n{shadow_mask_wgsl}\n{atmosphere_wgsl}\n{sky_sample_wgsl}\n{lighting_wgsl}\n{}\n{}",
+            "{geometry_bg_wgsl}\n{shadow_mask_wgsl}\n{atmosphere_wgsl}\n{sky_sample_wgsl}\n{fog_wgsl}\n{lighting_wgsl}\n{}\n{}",
             self.vertex_source, self.material_source,
         );
         let full_shader = shaders.add(device.create_shader_module(ShaderModuleDescriptor {
@@ -761,7 +763,7 @@ pub fn cleanup_unloaded_chunks(
     for unload in unload_queue.0.drain(..) {
         if let Some(entry) = render_data.entries.remove(&unload.entity) {
             render_data.dirty = true;
-            render_data.removed_entities.push(unload.entity);
+            render_data.removed_entities.push((unload.entity, unload.pos, unload.lod));
             deallocate_direction_pages(&entry.directions, &mut gpu);
             deallocate_direction_pages(&entry.transparent_directions, &mut gpu);
         }
@@ -994,7 +996,7 @@ pub fn synchronize_gpu(
         cache: &mut DrawCache,
         render_data: &ChunkRenderData,
         uploaded_entities: &[Entity],
-        removed_entities: &[Entity],
+        removed_entities: &[(Entity, IVec3, u8)],
         camera_chunk: IVec3,
         cam_world: [f64; 3],
         loaded_index: &LoadedChunkIndex,
@@ -1030,6 +1032,25 @@ pub fn synchronize_gpu(
             }
         }
 
+        // Compute newly_uncovered (parent LODs that lost coverage because a child unloaded).
+        // These need to be re-added to the cache since they were previously dropped via newly_covered.
+        let mut newly_uncovered: HashSet<(IVec3, u8)> = HashSet::new();
+        if gen_changed {
+            for &(_, pos, lod) in removed_entities {
+                let parent_lod = lod + 1;
+                if (parent_lod as usize) < lod_count {
+                    let parent_pos = IVec3::new(
+                        pos.x.div_euclid(2),
+                        pos.y.div_euclid(2),
+                        pos.z.div_euclid(2),
+                    );
+                    if !is_fully_covered(parent_pos, parent_lod, loaded_index) {
+                        newly_uncovered.insert((parent_pos, parent_lod));
+                    }
+                }
+            }
+        }
+
         // Build dead-entity sets for O(1) lookup during compaction.
         let upload_set: HashSet<Entity> = if gen_changed {
             uploaded_entities.iter().copied().collect()
@@ -1037,12 +1058,14 @@ pub fn synchronize_gpu(
             HashSet::new()
         };
         let removed_set: HashSet<Entity> = if gen_changed {
-            removed_entities.iter().copied().collect()
+            removed_entities.iter().map(|&(e, _, _)| e).collect()
         } else {
             HashSet::new()
         };
 
         // Single O(N) pass: drop dead entries, drop newly-stale entries, update backface flags.
+        // Also tracks which entities survive so we can avoid duplicates when re-adding parents.
+        let mut surviving_entities: HashSet<Entity> = HashSet::new();
         cache.entries.retain_mut(|cached| {
             if cached.dead {
                 return false;
@@ -1062,6 +1085,7 @@ pub fn synchronize_gpu(
                     cached.rel_chunk_pos, cached.lod_scale, cached.dir, cam_world,
                 );
             }
+            surviving_entities.insert(cached.entity);
             true
         });
 
@@ -1073,6 +1097,26 @@ pub fn synchronize_gpu(
                 if let Some(entry) = render_data.entries.get(&entity) {
                     cache.entries.extend(build_draws_for_entry(
                         entity, entry, get_directions(entry), cam_world, loaded_index, lod_count, do_backface_cull,
+                    ));
+                }
+            }
+
+            // Newly-uncovered LOD parents: a child unloaded, parent is no longer fully covered,
+            // so it needs to be drawn. Add its entries if not already in the cache.
+            for &(parent_pos, parent_lod) in &newly_uncovered {
+                let lod_idx = parent_lod as usize;
+                if lod_idx >= lod_maps.maps.len() { continue; }
+                let parent_entity = match lod_maps.maps[lod_idx].get(&parent_pos) {
+                    Some(&e) => e,
+                    None => continue,
+                };
+                if surviving_entities.contains(&parent_entity) {
+                    continue;
+                }
+                if let Some(parent_entry) = render_data.entries.get(&parent_entity) {
+                    cache.entries.extend(build_draws_for_entry(
+                        parent_entity, parent_entry, get_directions(parent_entry),
+                        cam_world, loaded_index, lod_count, do_backface_cull,
                     ));
                 }
             }

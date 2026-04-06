@@ -190,13 +190,14 @@ pub fn init_transparent_pipeline(
     let shadow_mask_wgsl = render::ShadowMaskBGLayout::LIBRARY.replace("#BIND_GROUP", "3");
     let atmosphere_wgsl = render::atmosphere::AtmosphereBGLayout::LIBRARY.replace("#BIND_GROUP", "4");
     let sky_sample_wgsl = include_str!("shaders/sky_sample.wgsl");
+    let fog_wgsl = include_str!("shaders/fog.wgsl");
     let lighting_wgsl = include_str!("shaders/lighting.wgsl");
     let vertex_wgsl = include_str!("shaders/voxel_vertex.wgsl");
     let transparent_wgsl = include_str!("shaders/voxel_transparent.wgsl");
 
     let full_source = format!(
         "{camera_wgsl}\n{metadata_wgsl}\n{atlas_wgsl}\n{shadow_mask_wgsl}\n{atmosphere_wgsl}\n\
-         {sky_sample_wgsl}\n{lighting_wgsl}\n{vertex_wgsl}\n{transparent_wgsl}"
+         {sky_sample_wgsl}\n{fog_wgsl}\n{lighting_wgsl}\n{vertex_wgsl}\n{transparent_wgsl}"
     );
 
     let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {

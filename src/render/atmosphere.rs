@@ -39,7 +39,7 @@ pub struct AtmosphereConfig {
 impl Default for AtmosphereConfig {
     fn default() -> Self {
         Self {
-            fog_density: 0.0005,
+            fog_density: 0.00035,
             sun_angular_radius: 0.00935, // ~0.535 degrees
             sun_intensity: 20.0,
             lut_width: 64,

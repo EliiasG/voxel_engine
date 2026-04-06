@@ -68,11 +68,7 @@ fn apply_lighting(surface: Surface) -> vec4<f32> {
     let lit_color = surface.base_color * (vec3<f32>(ambient_term) + diffuse);
 
     // Exponential distance fog
-    let view_dir = normalize(surface.world_pos - camera.camera_local_pos);
-    let fog_color = sample_fog_color(view_dir);
-    let dist = length(surface.world_pos);
-    let fog_factor = 1.0 - exp(-dist * atmosphere.fog_density);
-    let final_color = mix(lit_color, fog_color, fog_factor);
+    let final_color = apply_fog(lit_color, surface.world_pos);
 
     return vec4<f32>(final_color, 1.0);
 }
