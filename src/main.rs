@@ -53,6 +53,8 @@ pub static TIMING_DRAW_CACHE_TRANS_US: AtomicU32 = AtomicU32::new(0);
 pub static TIMING_FRUSTUM_CULL_US: AtomicU32 = AtomicU32::new(0);
 pub static TIMING_WRITE_INDIRECT_US: AtomicU32 = AtomicU32::new(0);
 pub static TIMING_DRAW_CACHE_ENTRIES: AtomicU32 = AtomicU32::new(0);
+pub static TIMING_SYNC_LIGHTS_US: AtomicU32 = AtomicU32::new(0);
+pub static TIMING_CLUSTER_BUILD_US: AtomicU32 = AtomicU32::new(0);
 
 /// Drop guard that writes elapsed microseconds to an atomic target on drop.
 pub struct SysTimer {
@@ -327,6 +329,7 @@ fn init_window(
         .add(render::ClearAll { render_target })
         .add(render::shadow::pass::ShadowDepthOperationBuilder)
         .add(render::shadow::pass::ShadowTraceOperationBuilder)
+        .add(render::lights::ClusterBuildOperationBuilder)
         .add(render::taa::TaaVoxelDrawOperationBuilder)
         .add(render::atmosphere::SkyPassOperationBuilder)
         .add(render::wboit::TransparentDrawOperationBuilder)
@@ -550,6 +553,8 @@ fn process_input(
                             TIMING_FRUSTUM_CULL_US.store(0, Relaxed);
                             TIMING_WRITE_INDIRECT_US.store(0, Relaxed);
                             TIMING_DRAW_CACHE_ENTRIES.store(0, Relaxed);
+                            TIMING_SYNC_LIGHTS_US.store(0, Relaxed);
+                            TIMING_CLUSTER_BUILD_US.store(0, Relaxed);
                             println!("Timer peaks reset");
                         }
                         KeyCode::Tab => {
@@ -779,7 +784,7 @@ fn update_camera(
 
         if let Ok(wc) = window_query.single() {
             let title = format!(
-                "Voxel Engine \u{2014} {:.0} FPS | demand {}us load {}us sync_up {}us sync_draw {}us [op {}us tr {}us cull {}us write {}us n={}] cleanup {}us shd_sync {}us{}",
+                "Voxel Engine \u{2014} {:.0} FPS | demand {}us load {}us sync_up {}us sync_draw {}us [op {}us tr {}us cull {}us write {}us n={}] cleanup {}us shd_sync {}us lights {}us cluster {}us{}",
                 fps.fps,
                 TIMING_DEMAND_US.load(Relaxed),
                 TIMING_LOADING_US.load(Relaxed),
@@ -792,6 +797,8 @@ fn update_camera(
                 TIMING_DRAW_CACHE_ENTRIES.load(Relaxed),
                 TIMING_CLEANUP_US.load(Relaxed),
                 TIMING_SHADOW_SYNC_US.load(Relaxed),
+                TIMING_SYNC_LIGHTS_US.load(Relaxed),
+                TIMING_CLUSTER_BUILD_US.load(Relaxed),
                 if debug.frozen.is_some() { " [DEBUG]" } else { "" },
             );
             wc.window.set_title(&title);

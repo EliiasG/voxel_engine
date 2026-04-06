@@ -67,9 +67,12 @@ fn apply_lighting(surface: Surface) -> vec4<f32> {
     let ambient_term = ambient * ao + sky_light * ao;
     var lit_color = surface.base_color * (vec3<f32>(ambient_term) + diffuse);
 
-    // Additive simple light contribution (chunk-owned + dynamic). Slice 1
-    // walks the entire flat global lights buffer with no clustering.
-    let light_contrib = accumulate_simple_lights(surface.world_pos, surface.normal);
+    // Additive simple light contribution (chunk-owned + dynamic). Slice 2
+    // looks up this fragment's cluster and walks only the lights that
+    // touch it.
+    let light_contrib = accumulate_simple_lights(
+        surface.world_pos, surface.normal, surface.clip_position,
+    );
     lit_color = lit_color + surface.base_color * light_contrib;
 
     // Exponential distance fog
