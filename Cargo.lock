@@ -3246,6 +3246,7 @@ dependencies = [
  "modul_texture",
  "modul_util",
  "pollster",
+ "windows-core 0.62.2",
 ]
 
 [[package]]

@@ -17,6 +17,15 @@ fastnoise-lite = "1"
 crossbeam-channel = "0.5"
 modul_texture = { git = "https://github.com/EliiasG/modul" }
 
+# Workaround for wgpu-hal v29.0.1 GLES backend on Windows: wgl.rs uses
+# `windows_core::Error` as a `core::error::Error` source, but wgpu-hal
+# pulls in windows-core 0.62 with `default-features = false`, leaving the
+# `std` feature (which gates the trait impl) disabled. Adding a direct
+# Windows-only dep with `features = ["std"]` triggers feature unification
+# on the same 0.62.x and re-enables the impl.
+[target.'cfg(windows)'.dependencies]
+windows-core = { version = "0.62", features = ["std"] }
+
 [profile.dev]
 opt-level = 1
 
