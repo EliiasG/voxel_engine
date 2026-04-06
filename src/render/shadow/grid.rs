@@ -17,7 +17,8 @@ pub struct LodInfo {
     pub grid_origin: [i32; 3],
     pub grid_size: u32,
     pub lod_scale: u32,
-    pub _pad: [u32; 3],
+    /// Precomputed origin.rem_euclid(grid_size) per axis — used for wrapping grid indexing.
+    pub origin_wrap: [u32; 3],
 }
 
 #[derive(Resource)]
@@ -26,14 +27,17 @@ pub struct ShadowGrid {
     pub grid_data: Vec<u32>,
     pub grid_size: u32,
     pub lod_count: u32,
-    pub dirty: bool,
+    /// Grid data changed — full upload (grid_data is only ~157KB, not worth per-cell).
+    pub grid_dirty: bool,
+    /// LodInfos changed (origin shift) — need uniform re-upload.
+    pub lod_infos_dirty: bool,
     /// Source of truth: (chunk_pos, lod) → grid value (slot index or sentinel).
-    /// Grid data is rebuilt from this whenever origins change.
     chunk_values: HashMap<(IVec3, u8), u32>,
     /// Per-chunk transparent color indirection (4x4x4 = 64 u32 entries per chunk).
     /// Parallel to grid_data: indirection_data[grid_index * 64 + region] = color pool slot or GRID_EMPTY.
     pub indirection_data: Vec<u32>,
-    pub indirection_dirty: bool,
+    /// Individual grid cells whose indirection changed (index into grid_data; each covers 64 u32s).
+    pub indirection_dirty_cells: Vec<usize>,
     /// Source of truth for indirection, rebuilt on origin change.
     chunk_indirections: HashMap<(IVec3, u8), [u32; 64]>,
     /// Last camera chunk seen — drives origin rebuilds.
@@ -50,7 +54,7 @@ impl ShadowGrid {
                 grid_origin: [0; 3],
                 grid_size,
                 lod_scale: 1 << lod,
-                _pad: [0; 3],
+                origin_wrap: [0; 3],
             })
             .collect();
 
@@ -63,10 +67,11 @@ impl ShadowGrid {
             grid_data,
             grid_size,
             lod_count,
-            dirty: true,
+            grid_dirty: true,
+            lod_infos_dirty: true,
             chunk_values: HashMap::new(),
             indirection_data,
-            indirection_dirty: true,
+            indirection_dirty_cells: Vec::new(),
             chunk_indirections: HashMap::new(),
             last_camera_chunk: None,
         }
@@ -80,12 +85,28 @@ impl ShadowGrid {
         {
             return None;
         }
-        let entries_per_lod = (self.grid_size * self.grid_size * self.grid_size) as usize;
+        let gs = self.grid_size;
+        let su = gs as usize;
+        let entries_per_lod = su * su * su;
         let lod_offset = lod as usize * entries_per_lod;
-        let flat = local.x as usize
-            + local.y as usize * self.grid_size as usize
-            + local.z as usize * self.grid_size as usize * self.grid_size as usize;
+        let ow = info.origin_wrap;
+        let wx = ((ow[0] + local.x as u32) % gs) as usize;
+        let wy = ((ow[1] + local.y as u32) % gs) as usize;
+        let wz = ((ow[2] + local.z as u32) % gs) as usize;
+        let flat = wx + wy * su + wz * su * su;
         Some(lod_offset + flat)
+    }
+
+    /// Compute wrapped flat index without bounds checking.
+    /// `local` must be in [0, grid_size) per axis.
+    fn wrapped_flat(grid_size: u32, lod: u8, origin_wrap: [u32; 3], local: [u32; 3]) -> usize {
+        let su = grid_size as usize;
+        let entries_per_lod = su * su * su;
+        let lod_offset = lod as usize * entries_per_lod;
+        let wx = ((origin_wrap[0] + local[0]) % grid_size) as usize;
+        let wy = ((origin_wrap[1] + local[1]) % grid_size) as usize;
+        let wz = ((origin_wrap[2] + local[2]) % grid_size) as usize;
+        lod_offset + wx + wy * su + wz * su * su
     }
 
     pub fn get(&self, lod: u8, chunk_pos: IVec3) -> Option<u32> {
@@ -95,42 +116,169 @@ impl ShadowGrid {
     pub fn set(&mut self, lod: u8, chunk_pos: IVec3, value: u32) {
         if let Some(i) = self.grid_index(lod, chunk_pos) {
             self.grid_data[i] = value;
-            self.dirty = true;
+            self.grid_dirty = true;
         }
     }
 
-    /// Recompute grid origins based on camera chunk position.
-    /// If any origin changes, rebuild the entire grid from the chunk_values map.
-    pub fn rebuild_origins(&mut self, camera_chunk: IVec3, end_radius: u32) {
+    /// Incrementally update grid origins when the camera moves to a new chunk.
+    /// Uses wrapping indexing: only clears and refills newly-exposed edge slices.
+    pub fn update_origins(&mut self, camera_chunk: IVec3, end_radius: u32) {
         let radius = end_radius as i32;
-        let mut changed = false;
+        let s = self.grid_size as i32;
+
         for lod in 0..self.lod_count {
             let lod_cam = lod_chunk_pos(camera_chunk, lod);
-            let info = &mut self.lod_infos[lod as usize];
-            let new_origin = (lod_cam - IVec3::splat(radius)).to_array();
-            if info.grid_origin != new_origin {
-                info.grid_origin = new_origin;
-                changed = true;
+            let old_origin = IVec3::from(self.lod_infos[lod as usize].grid_origin);
+            let new_origin = lod_cam - IVec3::splat(radius);
+
+            if old_origin == new_origin {
+                continue;
             }
-        }
-        if changed {
-            // Clear grid and repopulate from the canonical map
-            self.grid_data.fill(GRID_EMPTY);
-            self.indirection_data.fill(GRID_EMPTY);
-            for (&(pos, lod), &value) in &self.chunk_values {
-                if let Some(i) = self.grid_index(lod, pos) {
-                    self.grid_data[i] = value;
+
+            let delta = new_origin - old_origin;
+
+            // Update origin + wrap offset (grid_index needs these for bounds checks + wrapping)
+            self.lod_infos[lod as usize].grid_origin = new_origin.to_array();
+            self.lod_infos[lod as usize].origin_wrap = [
+                new_origin.x.rem_euclid(s) as u32,
+                new_origin.y.rem_euclid(s) as u32,
+                new_origin.z.rem_euclid(s) as u32,
+            ];
+            self.lod_infos_dirty = true;
+
+            // If delta too large (teleport), full rebuild for this LOD
+            if delta.x.abs() >= s || delta.y.abs() >= s || delta.z.abs() >= s {
+                self.full_rebuild_lod(lod as u8);
+                continue;
+            }
+
+            // Incremental: clear and fill only newly exposed slices per axis
+            for axis in 0..3usize {
+                let d = delta[axis];
+                if d == 0 { continue; }
+
+                let (start, end) = if d > 0 {
+                    (old_origin[axis] + s, old_origin[axis] + s + d)
+                } else {
+                    (new_origin[axis], old_origin[axis])
+                };
+
+                for coord in start..end {
+                    self.clear_and_fill_slice(lod as u8, axis, coord);
                 }
             }
-            for (&(pos, lod), indirection) in &self.chunk_indirections {
-                if let Some(i) = self.grid_index(lod, pos) {
-                    let base = i * 64;
+
+            self.grid_dirty = true;
+        }
+    }
+
+    /// Clear one 2D slice of the grid and refill from HashMaps.
+    fn clear_and_fill_slice(&mut self, lod: u8, axis: usize, coord: i32) {
+        let s = self.grid_size as i32;
+        let gs = self.grid_size;
+        let su = gs as usize;
+        let entries_per_lod = su * su * su;
+        let lod_offset = lod as usize * entries_per_lod;
+        let info = &self.lod_infos[lod as usize];
+        let origin = IVec3::from(info.grid_origin);
+        let ow = info.origin_wrap;
+
+        // Wrapped coordinate of the slice along the axis
+        let local_c = (coord - origin[axis]) as u32; // in [0, s)
+        let wc = ((ow[axis] + local_c) % gs) as usize;
+
+        // Clear the entire slice at this wrapped coordinate
+        for u in 0..su {
+            for v in 0..su {
+                let (wx, wy, wz) = match axis {
+                    0 => (wc, u, v),
+                    1 => (u, wc, v),
+                    _ => (u, v, wc),
+                };
+                let flat = lod_offset + wx + wy * su + wz * su * su;
+                self.grid_data[flat] = GRID_EMPTY;
+                let base = flat * 64;
+                self.indirection_data[base..base + 64].fill(GRID_EMPTY);
+                self.indirection_dirty_cells.push(flat);
+            }
+        }
+
+        // Fill from HashMaps for positions in the new range
+        for u in 0..s {
+            for v in 0..s {
+                let (chunk_pos, local) = match axis {
+                    0 => (
+                        IVec3::new(coord, origin.y + u, origin.z + v),
+                        [local_c, u as u32, v as u32],
+                    ),
+                    1 => (
+                        IVec3::new(origin.x + u, coord, origin.z + v),
+                        [u as u32, local_c, v as u32],
+                    ),
+                    _ => (
+                        IVec3::new(origin.x + u, origin.y + v, coord),
+                        [u as u32, v as u32, local_c],
+                    ),
+                };
+
+                let flat = Self::wrapped_flat(gs, lod, ow, local);
+
+                if let Some(&value) = self.chunk_values.get(&(chunk_pos, lod)) {
+                    self.grid_data[flat] = value;
+                }
+                if let Some(indirection) = self.chunk_indirections.get(&(chunk_pos, lod)) {
+                    let base = flat * 64;
                     self.indirection_data[base..base + 64].copy_from_slice(indirection);
                 }
             }
-            self.dirty = true;
-            self.indirection_dirty = true;
         }
+    }
+
+    /// Full clear + repopulate for a single LOD (used on teleport / first frame).
+    fn full_rebuild_lod(&mut self, lod: u8) {
+        let s = self.grid_size as i32;
+        let gs = self.grid_size;
+        let su = gs as usize;
+        let entries_per_lod = su * su * su;
+        let lod_offset = lod as usize * entries_per_lod;
+
+        self.grid_data[lod_offset..lod_offset + entries_per_lod].fill(GRID_EMPTY);
+        let ind_start = lod_offset * 64;
+        self.indirection_data[ind_start..ind_start + entries_per_lod * 64].fill(GRID_EMPTY);
+
+        let info = &self.lod_infos[lod as usize];
+        let origin = IVec3::from(info.grid_origin);
+        let ow = info.origin_wrap;
+
+        for (&(pos, l), &value) in &self.chunk_values {
+            if l != lod { continue; }
+            let local = pos - origin;
+            if local.x < 0 || local.y < 0 || local.z < 0
+                || local.x >= s || local.y >= s || local.z >= s
+            {
+                continue;
+            }
+            let flat = Self::wrapped_flat(gs, lod, ow, [local.x as u32, local.y as u32, local.z as u32]);
+            self.grid_data[flat] = value;
+        }
+        for (&(pos, l), indirection) in &self.chunk_indirections {
+            if l != lod { continue; }
+            let local = pos - origin;
+            if local.x < 0 || local.y < 0 || local.z < 0
+                || local.x >= s || local.y >= s || local.z >= s
+            {
+                continue;
+            }
+            let flat = Self::wrapped_flat(gs, lod, ow, [local.x as u32, local.y as u32, local.z as u32]);
+            let base = flat * 64;
+            self.indirection_data[base..base + 64].copy_from_slice(indirection);
+        }
+
+        // Mark all cells in this LOD as dirty for indirection upload
+        for i in lod_offset..lod_offset + entries_per_lod {
+            self.indirection_dirty_cells.push(i);
+        }
+        self.grid_dirty = true;
     }
 }
 
@@ -270,7 +418,7 @@ pub fn remove_chunk_transparent_data(
             for j in 0..64 {
                 grid.indirection_data[base + j] = GRID_EMPTY;
             }
-            grid.indirection_dirty = true;
+            grid.indirection_dirty_cells.push(i);
         }
     }
 }
@@ -307,7 +455,7 @@ fn update_chunk_transparent_data(
             for j in 0..64 {
                 grid.indirection_data[base + j] = GRID_EMPTY;
             }
-            grid.indirection_dirty = true;
+            grid.indirection_dirty_cells.push(i);
         }
         return;
     }
@@ -358,7 +506,7 @@ fn update_chunk_transparent_data(
     if let Some(i) = grid.grid_index(lod, chunk_pos) {
         let base = i * 64;
         grid.indirection_data[base..base + 64].copy_from_slice(&indirection);
-        grid.indirection_dirty = true;
+        grid.indirection_dirty_cells.push(i);
     }
 }
 
@@ -411,6 +559,7 @@ pub fn update_shadow_grid_origins(
     cam_query: Query<&crate::camera::Position, With<crate::camera::MainCamera>>,
     source_query: Query<&crate::chunk::demand::ChunkSource>,
 ) {
+    let _timer = crate::SysTimer::new(&crate::TIMING_SHADOW_ORIGINS_US);
     let camera_chunk = if let Some(ref frozen) = debug.frozen {
         frozen.chunk_pos
     } else if let Ok(pos) = cam_query.get_single() {
@@ -422,7 +571,7 @@ pub fn update_shadow_grid_origins(
     if shadow_grid.last_camera_chunk != Some(camera_chunk) {
         shadow_grid.last_camera_chunk = Some(camera_chunk);
         if let Some(source) = source_query.iter().next() {
-            shadow_grid.rebuild_origins(camera_chunk, source.end_radius);
+            shadow_grid.update_origins(camera_chunk, source.end_radius);
         }
     }
 }

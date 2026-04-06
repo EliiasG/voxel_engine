@@ -42,6 +42,15 @@ pub static TIMING_MESH_WORKER_MAX_US: AtomicU32 = AtomicU32::new(0);
 pub static TIMING_MESH_WORKER_COUNT: AtomicU32 = AtomicU32::new(0);
 pub static TIMING_SYNC_UPLOAD_US: AtomicU32 = AtomicU32::new(0);
 pub static TIMING_SYNC_DRAWS_US: AtomicU32 = AtomicU32::new(0);
+pub static TIMING_CLEANUP_US: AtomicU32 = AtomicU32::new(0);
+pub static TIMING_SHADOW_ORIGINS_US: AtomicU32 = AtomicU32::new(0);
+pub static TIMING_SHADOW_SYNC_US: AtomicU32 = AtomicU32::new(0);
+// sync_draw sub-timers
+pub static TIMING_DRAW_CACHE_OPAQUE_US: AtomicU32 = AtomicU32::new(0);
+pub static TIMING_DRAW_CACHE_TRANS_US: AtomicU32 = AtomicU32::new(0);
+pub static TIMING_FRUSTUM_CULL_US: AtomicU32 = AtomicU32::new(0);
+pub static TIMING_WRITE_INDIRECT_US: AtomicU32 = AtomicU32::new(0);
+pub static TIMING_DRAW_CACHE_ENTRIES: AtomicU32 = AtomicU32::new(0);
 
 /// Drop guard that writes elapsed microseconds to an atomic target on drop.
 pub struct SysTimer {
@@ -57,7 +66,8 @@ impl SysTimer {
 
 impl Drop for SysTimer {
     fn drop(&mut self) {
-        self.target.store(self.start.elapsed().as_micros() as u32, Relaxed);
+        let us = self.start.elapsed().as_micros() as u32;
+        self.target.fetch_max(us, Relaxed);
     }
 }
 
@@ -503,6 +513,26 @@ fn process_input(
                             day_cycle.paused = !day_cycle.paused;
                             println!("Day/night: {}", if day_cycle.paused { "PAUSED" } else { "RUNNING" });
                         }
+                        KeyCode::KeyR => {
+                            TIMING_DEMAND_US.store(0, Relaxed);
+                            TIMING_LOADING_US.store(0, Relaxed);
+                            TIMING_RESOLVE_US.store(0, Relaxed);
+                            TIMING_POLL_MESH_US.store(0, Relaxed);
+                            TIMING_START_MESH_US.store(0, Relaxed);
+                            TIMING_MESH_WORKER_MAX_US.store(0, Relaxed);
+                            TIMING_MESH_WORKER_COUNT.store(0, Relaxed);
+                            TIMING_SYNC_UPLOAD_US.store(0, Relaxed);
+                            TIMING_SYNC_DRAWS_US.store(0, Relaxed);
+                            TIMING_CLEANUP_US.store(0, Relaxed);
+                            TIMING_SHADOW_ORIGINS_US.store(0, Relaxed);
+                            TIMING_SHADOW_SYNC_US.store(0, Relaxed);
+                            TIMING_DRAW_CACHE_OPAQUE_US.store(0, Relaxed);
+                            TIMING_DRAW_CACHE_TRANS_US.store(0, Relaxed);
+                            TIMING_FRUSTUM_CULL_US.store(0, Relaxed);
+                            TIMING_WRITE_INDIRECT_US.store(0, Relaxed);
+                            TIMING_DRAW_CACHE_ENTRIES.store(0, Relaxed);
+                            println!("Timer peaks reset");
+                        }
                         KeyCode::Tab => {
                             if debug.frozen.is_some() {
                                 debug.frozen = None;
@@ -729,17 +759,19 @@ fn update_camera(
 
         if let Ok(wc) = window_query.get_single() {
             let title = format!(
-                "Voxel Engine \u{2014} {:.0} FPS | demand {}us load {}us resolve {}us poll {}us start {}us worker {}us(max)x{} sync_up {}us sync_draw {}us{}",
+                "Voxel Engine \u{2014} {:.0} FPS | demand {}us load {}us sync_up {}us sync_draw {}us [op {}us tr {}us cull {}us write {}us n={}] cleanup {}us shd_sync {}us{}",
                 fps.fps,
                 TIMING_DEMAND_US.load(Relaxed),
                 TIMING_LOADING_US.load(Relaxed),
-                TIMING_RESOLVE_US.load(Relaxed),
-                TIMING_POLL_MESH_US.load(Relaxed),
-                TIMING_START_MESH_US.load(Relaxed),
-                TIMING_MESH_WORKER_MAX_US.load(Relaxed),
-                TIMING_MESH_WORKER_COUNT.load(Relaxed),
                 TIMING_SYNC_UPLOAD_US.load(Relaxed),
                 TIMING_SYNC_DRAWS_US.load(Relaxed),
+                TIMING_DRAW_CACHE_OPAQUE_US.load(Relaxed),
+                TIMING_DRAW_CACHE_TRANS_US.load(Relaxed),
+                TIMING_FRUSTUM_CULL_US.load(Relaxed),
+                TIMING_WRITE_INDIRECT_US.load(Relaxed),
+                TIMING_DRAW_CACHE_ENTRIES.load(Relaxed),
+                TIMING_CLEANUP_US.load(Relaxed),
+                TIMING_SHADOW_SYNC_US.load(Relaxed),
                 if debug.frozen.is_some() { " [DEBUG]" } else { "" },
             );
             wc.window.set_title(&title);

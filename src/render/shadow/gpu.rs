@@ -293,6 +293,7 @@ pub fn synchronize_shadow_buffers(
     device: Res<modul_core::DeviceRes>,
     queue: Res<modul_core::QueueRes>,
 ) {
+    let _timer = crate::SysTimer::new(&crate::TIMING_SHADOW_SYNC_US);
     // Check if bitmask buffer needs to grow
     let slots_needed = pool.slots.len() as u32;
     if slots_needed > shadow_gpu.bitmask_capacity {
@@ -352,28 +353,40 @@ pub fn synchronize_shadow_buffers(
         shadow_gpu.absorption_dirty = false;
     }
 
-    // Upload grid data if dirty
-    if grid.dirty {
+    // Upload lod infos if origins changed
+    if grid.lod_infos_dirty {
         queue.0.write_buffer(
             &shadow_gpu.lod_info_buffer,
             0,
             bytemuck::cast_slice(&grid.lod_infos),
         );
+        grid.lod_infos_dirty = false;
+    }
+
+    // Upload grid data if dirty (full upload — only ~157KB, not worth per-cell)
+    if grid.grid_dirty {
         queue.0.write_buffer(
             &shadow_gpu.grid_buffer,
             0,
             bytemuck::cast_slice(&grid.grid_data),
         );
-        grid.dirty = false;
+        grid.grid_dirty = false;
     }
 
-    // Upload indirection data if dirty
-    if grid.indirection_dirty {
-        queue.0.write_buffer(
-            &shadow_gpu.indirection_buffer,
-            0,
-            bytemuck::cast_slice(&grid.indirection_data),
-        );
-        grid.indirection_dirty = false;
+    // Upload only dirty indirection cells (each cell = 64 u32s = 256 bytes)
+    if !grid.indirection_dirty_cells.is_empty() {
+        grid.indirection_dirty_cells.sort_unstable();
+        grid.indirection_dirty_cells.dedup();
+        for &cell_idx in &grid.indirection_dirty_cells {
+            let byte_offset = cell_idx as u64 * 64 * 4;
+            let start = cell_idx * 64;
+            let end = start + 64;
+            queue.0.write_buffer(
+                &shadow_gpu.indirection_buffer,
+                byte_offset,
+                bytemuck::cast_slice(&grid.indirection_data[start..end]),
+            );
+        }
+        grid.indirection_dirty_cells.clear();
     }
 }

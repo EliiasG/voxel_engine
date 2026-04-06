@@ -34,9 +34,9 @@ struct LodInfo {
     grid_origin_z: i32,
     grid_size: u32,
     lod_scale: u32,
-    _pad0: u32,
-    _pad1: u32,
-    _pad2: u32,
+    origin_wrap_x: u32,
+    origin_wrap_y: u32,
+    origin_wrap_z: u32,
 };
 
 @group(0) @binding(0)
@@ -113,7 +113,10 @@ fn grid_flat_index(lod: u32, chunk_pos: vec3<i32>) -> u32 {
     }
     let entries_per_lod = info.grid_size * info.grid_size * info.grid_size;
     let lod_offset = lod * entries_per_lod;
-    let flat = u32(local.x) + u32(local.y) * info.grid_size + u32(local.z) * info.grid_size * info.grid_size;
+    // Wrap using precomputed origin_wrap + local (all unsigned, no signed modulo)
+    let ow = vec3<u32>(info.origin_wrap_x, info.origin_wrap_y, info.origin_wrap_z);
+    let w = (ow + vec3<u32>(local)) % vec3<u32>(info.grid_size);
+    let flat = w.x + w.y * info.grid_size + w.z * info.grid_size * info.grid_size;
     return lod_offset + flat;
 }
 

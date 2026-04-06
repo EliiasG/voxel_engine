@@ -3,7 +3,7 @@ pub mod shadow;
 pub mod taa;
 pub mod wboit;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use bevy_ecs::prelude::*;
 use bytemuck::{Pod, Zeroable};
@@ -348,16 +348,18 @@ pub struct ChunkRenderEntry {
     pub transparent_directions: [DirectionPages; NUM_DIRECTIONS],
 }
 
-/// Pre-built draw args for one (chunk, direction) pair that passed backface
-/// and is_fully_covered checks. Only frustum culling remains per-frame.
+/// Pre-built draw args for one (chunk, direction) pair.
+/// Camera-independent — backface culling is stored separately and updated incrementally.
 pub struct CachedDraw {
     pub entity: Entity,
     pub chunk_pos: IVec3,
     pub chunk_lod: u8,
     pub dir: u8,
-    /// Stale entry (chunk re-meshed or parent became fully covered). Skipped during
-    /// frustum cull, cleared on full rebuild.
-    pub skip: bool,
+    /// Entry should be removed (chunk re-meshed, unloaded, or parent fully covered).
+    /// Skipped during frustum cull, removed during compaction.
+    pub dead: bool,
+    /// Currently backface-culled by camera position. Updated on camera chunk crossings.
+    pub backface_culled: bool,
     pub rel_chunk_pos: IVec3,
     pub lod_scale: i32,
     pub slab_index: usize,
@@ -386,6 +388,8 @@ pub struct TransparentDrawCache(pub DrawCache);
 pub struct ChunkRenderData {
     pub dirty: bool,
     pub entries: HashMap<Entity, ChunkRenderEntry>,
+    /// Entities removed this frame — drained by update_draw_cache to mark cache entries dead.
+    pub removed_entities: Vec<Entity>,
 }
 
 #[derive(Resource)]
@@ -753,9 +757,11 @@ pub fn cleanup_unloaded_chunks(
     mut bitmask_pool: ResMut<shadow::grid::BitmaskPool>,
     mut color_pool: ResMut<shadow::grid::TransparentColorPool>,
 ) {
+    let _timer = crate::SysTimer::new(&crate::TIMING_CLEANUP_US);
     for unload in unload_queue.0.drain(..) {
         if let Some(entry) = render_data.entries.remove(&unload.entity) {
             render_data.dirty = true;
+            render_data.removed_entities.push(unload.entity);
             deallocate_direction_pages(&entry.directions, &mut gpu);
             deallocate_direction_pages(&entry.transparent_directions, &mut gpu);
         }
@@ -775,10 +781,35 @@ pub fn cleanup_unloaded_chunks(
     }
 }
 
+/// Compute backface cull state for a (rel_chunk_pos, lod_scale, dir) triple given camera world position.
+/// Camera-dependent — recomputed on chunk crossings.
+fn compute_backface(rel_chunk_pos: IVec3, lod_scale: i32, dir: u8, cam_world: [f64; 3]) -> bool {
+    let cs_d = crate::chunk::CHUNK_SIZE as f64;
+    let chunk_min_w = [
+        rel_chunk_pos.x as f64 * cs_d,
+        rel_chunk_pos.y as f64 * cs_d,
+        rel_chunk_pos.z as f64 * cs_d,
+    ];
+    let w_extent = lod_scale as f64 * cs_d;
+    let chunk_max_w = [
+        chunk_min_w[0] + w_extent,
+        chunk_min_w[1] + w_extent,
+        chunk_min_w[2] + w_extent,
+    ];
+    match dir {
+        0 => cam_world[0] <= chunk_min_w[0],
+        1 => cam_world[0] >= chunk_max_w[0],
+        2 => cam_world[1] <= chunk_min_w[1],
+        3 => cam_world[1] >= chunk_max_w[1],
+        4 => cam_world[2] <= chunk_min_w[2],
+        5 => cam_world[2] >= chunk_max_w[2],
+        _ => false,
+    }
+}
+
 /// Build a cached draw entry for one (chunk, direction) pair.
-/// Returns None if backfacing (when `do_backface_cull` is true), zero faces,
-/// or chunk itself is fully covered.
-/// `directions` selects which face set (opaque or transparent) to read from.
+/// Returns None only if there are no faces to draw — backface culling is stored
+/// separately so the entry remains live and can be re-evaluated on camera moves.
 fn build_draw_for_direction(
     entity: Entity,
     entry: &ChunkRenderEntry,
@@ -796,35 +827,7 @@ fn build_draw_for_direction(
 
     let lod_scale = 1i32 << entry.lod;
     let lod = (entry.lod as usize).min(lod_count - 1);
-
-    let cs_d = crate::chunk::CHUNK_SIZE as f64;
-    let lod_scale_d = lod_scale as f64;
-    let chunk_min_w = [
-        entry.chunk_pos.x as f64 * lod_scale_d * cs_d,
-        entry.chunk_pos.y as f64 * lod_scale_d * cs_d,
-        entry.chunk_pos.z as f64 * lod_scale_d * cs_d,
-    ];
-    let w_extent = lod_scale_d * cs_d;
-    let chunk_max_w = [
-        chunk_min_w[0] + w_extent,
-        chunk_min_w[1] + w_extent,
-        chunk_min_w[2] + w_extent,
-    ];
-
-    if do_backface_cull {
-        let backface = match dir {
-            0 => cam_world[0] <= chunk_min_w[0],
-            1 => cam_world[0] >= chunk_max_w[0],
-            2 => cam_world[1] <= chunk_min_w[1],
-            3 => cam_world[1] >= chunk_max_w[1],
-            4 => cam_world[2] <= chunk_min_w[2],
-            5 => cam_world[2] >= chunk_max_w[2],
-            _ => false,
-        };
-        if backface {
-            return None;
-        }
-    }
+    let rel_chunk_pos = entry.chunk_pos * lod_scale;
 
     let neighbor_pos = entry.chunk_pos + DIR_OFFSETS[dir];
     let neighbor_covered = entry.lod > 0
@@ -860,13 +863,20 @@ fn build_draw_for_direction(
         return None;
     }
 
+    let backface_culled = if do_backface_cull {
+        compute_backface(rel_chunk_pos, lod_scale, dir as u8, cam_world)
+    } else {
+        false
+    };
+
     Some(CachedDraw {
         entity,
         chunk_pos: entry.chunk_pos,
         chunk_lod: entry.lod,
         dir: dir as u8,
-        skip: false,
-        rel_chunk_pos: entry.chunk_pos * lod_scale,
+        dead: false,
+        backface_culled,
+        rel_chunk_pos,
         lod_scale,
         slab_index,
         lod,
@@ -957,7 +967,7 @@ pub fn synchronize_gpu(
         trans_draw_cache.0.generation += 1;
     }
 
-    crate::TIMING_SYNC_UPLOAD_US.store(_t_upload.elapsed().as_micros() as u32, std::sync::atomic::Ordering::Relaxed);
+    crate::TIMING_SYNC_UPLOAD_US.fetch_max(_t_upload.elapsed().as_micros() as u32, std::sync::atomic::Ordering::Relaxed);
     let _t_draws = std::time::Instant::now();
 
     // --- Determine camera state ---
@@ -984,6 +994,7 @@ pub fn synchronize_gpu(
         cache: &mut DrawCache,
         render_data: &ChunkRenderData,
         uploaded_entities: &[Entity],
+        removed_entities: &[Entity],
         camera_chunk: IVec3,
         cam_world: [f64; 3],
         loaded_index: &LoadedChunkIndex,
@@ -992,41 +1003,16 @@ pub fn synchronize_gpu(
         get_directions: fn(&ChunkRenderEntry) -> &[DirectionPages; NUM_DIRECTIONS],
         do_backface_cull: bool,
     ) {
-        if cache.last_camera_chunk != Some(camera_chunk) {
-            // Full rebuild
-            cache.last_camera_chunk = Some(camera_chunk);
-            cache.cached_generation = cache.generation;
-            cache.entries.clear();
+        let cam_changed = cache.last_camera_chunk != Some(camera_chunk);
+        let gen_changed = cache.cached_generation != cache.generation;
 
-            for (&entity, entry) in &render_data.entries {
-                cache.entries.extend(build_draws_for_entry(
-                    entity, entry, get_directions(entry), cam_world, loaded_index, lod_count, do_backface_cull,
-                ));
-            }
-        } else if cache.cached_generation != cache.generation {
-            // Incremental update
-            cache.cached_generation = cache.generation;
+        if !cam_changed && !gen_changed {
+            return;
+        }
 
-            for cached in cache.entries.iter_mut() {
-                if cached.skip { continue; }
-                for &ent in uploaded_entities {
-                    if cached.entity == ent {
-                        cached.skip = true;
-                        break;
-                    }
-                }
-            }
-
-            for &entity in uploaded_entities {
-                if let Some(entry) = render_data.entries.get(&entity) {
-                    cache.entries.extend(build_draws_for_entry(
-                        entity, entry, get_directions(entry), cam_world, loaded_index, lod_count, do_backface_cull,
-                    ));
-                }
-            }
-
-            // Mark parent LOD entries as stale if they became fully covered
-            let mut newly_covered: Vec<(IVec3, u8)> = Vec::new();
+        // Compute newly_covered (parent LODs that became fully covered) BEFORE compaction.
+        let mut newly_covered: HashSet<(IVec3, u8)> = HashSet::new();
+        if gen_changed {
             for &entity in uploaded_entities {
                 if let Some(entry) = render_data.entries.get(&entity) {
                     let parent_lod = entry.lod + 1;
@@ -1037,73 +1023,131 @@ pub fn synchronize_gpu(
                             entry.chunk_pos.z.div_euclid(2),
                         );
                         if is_fully_covered(parent_pos, parent_lod, loaded_index) {
-                            newly_covered.push((parent_pos, parent_lod));
-                        }
-                    }
-                }
-            }
-            if !newly_covered.is_empty() {
-                for cached in cache.entries.iter_mut() {
-                    if cached.skip { continue; }
-                    for &(pos, lod) in &newly_covered {
-                        if cached.chunk_pos == pos && cached.chunk_lod == lod {
-                            cached.skip = true;
-                            break;
-                        }
-                    }
-                }
-
-                for &(covered_pos, covered_lod) in &newly_covered {
-                    let lod_idx = covered_lod as usize;
-                    if lod_idx >= lod_maps.maps.len() { continue; }
-                    for dir in 0..NUM_DIRECTIONS {
-                        let neighbor_pos = covered_pos + DIR_OFFSETS[dir];
-                        let opposite_dir = (dir ^ 1) as u8;
-
-                        if is_fully_covered(neighbor_pos, covered_lod, loaded_index) { continue; }
-
-                        let neighbor_entity = match lod_maps.maps[lod_idx].get(&neighbor_pos) {
-                            Some(&e) => e,
-                            None => continue,
-                        };
-                        let neighbor_entry = match render_data.entries.get(&neighbor_entity) {
-                            Some(e) => e,
-                            None => continue,
-                        };
-
-                        if let Some(cached) = cache.entries.iter_mut().find(|c| {
-                            !c.skip && c.entity == neighbor_entity && c.dir == opposite_dir
-                        }) {
-                            if let Some(updated) = build_draw_for_direction(
-                                neighbor_entity, neighbor_entry, get_directions(neighbor_entry),
-                                opposite_dir as usize, cam_world, loaded_index, lod_count, do_backface_cull,
-                            ) {
-                                cached.args = updated.args;
-                            }
-                        } else if let Some(new_draw) = build_draw_for_direction(
-                            neighbor_entity, neighbor_entry, get_directions(neighbor_entry),
-                            opposite_dir as usize, cam_world, loaded_index, lod_count, do_backface_cull,
-                        ) {
-                            cache.entries.push(new_draw);
+                            newly_covered.insert((parent_pos, parent_lod));
                         }
                     }
                 }
             }
         }
+
+        // Build dead-entity sets for O(1) lookup during compaction.
+        let upload_set: HashSet<Entity> = if gen_changed {
+            uploaded_entities.iter().copied().collect()
+        } else {
+            HashSet::new()
+        };
+        let removed_set: HashSet<Entity> = if gen_changed {
+            removed_entities.iter().copied().collect()
+        } else {
+            HashSet::new()
+        };
+
+        // Single O(N) pass: drop dead entries, drop newly-stale entries, update backface flags.
+        cache.entries.retain_mut(|cached| {
+            if cached.dead {
+                return false;
+            }
+            if gen_changed
+                && (upload_set.contains(&cached.entity) || removed_set.contains(&cached.entity))
+            {
+                return false;
+            }
+            if !newly_covered.is_empty()
+                && newly_covered.contains(&(cached.chunk_pos, cached.chunk_lod))
+            {
+                return false;
+            }
+            if cam_changed && do_backface_cull {
+                cached.backface_culled = compute_backface(
+                    cached.rel_chunk_pos, cached.lod_scale, cached.dir, cam_world,
+                );
+            }
+            true
+        });
+
+        if gen_changed {
+            cache.cached_generation = cache.generation;
+
+            // Add new entries for uploaded chunks
+            for &entity in uploaded_entities {
+                if let Some(entry) = render_data.entries.get(&entity) {
+                    cache.entries.extend(build_draws_for_entry(
+                        entity, entry, get_directions(entry), cam_world, loaded_index, lod_count, do_backface_cull,
+                    ));
+                }
+            }
+
+            // Newly-covered LOD parents: their neighbors' face_limits change, so rebuild
+            // those neighbor entries (the border face count depends on whether the neighbor
+            // is fully covered).
+            for &(covered_pos, covered_lod) in &newly_covered {
+                let lod_idx = covered_lod as usize;
+                if lod_idx >= lod_maps.maps.len() { continue; }
+                for dir in 0..NUM_DIRECTIONS {
+                    let neighbor_pos = covered_pos + DIR_OFFSETS[dir];
+                    let opposite_dir = (dir ^ 1) as u8;
+
+                    if is_fully_covered(neighbor_pos, covered_lod, loaded_index) { continue; }
+
+                    let neighbor_entity = match lod_maps.maps[lod_idx].get(&neighbor_pos) {
+                        Some(&e) => e,
+                        None => continue,
+                    };
+                    let neighbor_entry = match render_data.entries.get(&neighbor_entity) {
+                        Some(e) => e,
+                        None => continue,
+                    };
+
+                    if let Some(cached) = cache.entries.iter_mut().find(|c| {
+                        !c.dead && c.entity == neighbor_entity && c.dir == opposite_dir
+                    }) {
+                        if let Some(updated) = build_draw_for_direction(
+                            neighbor_entity, neighbor_entry, get_directions(neighbor_entry),
+                            opposite_dir as usize, cam_world, loaded_index, lod_count, do_backface_cull,
+                        ) {
+                            cached.args = updated.args;
+                            cached.backface_culled = updated.backface_culled;
+                        }
+                    } else if let Some(new_draw) = build_draw_for_direction(
+                        neighbor_entity, neighbor_entry, get_directions(neighbor_entry),
+                        opposite_dir as usize, cam_world, loaded_index, lod_count, do_backface_cull,
+                    ) {
+                        cache.entries.push(new_draw);
+                    }
+                }
+            }
+        }
+
+        if cam_changed {
+            cache.last_camera_chunk = Some(camera_chunk);
+        }
     }
 
     // --- Update opaque draw cache ---
-    update_draw_cache(
-        &mut draw_cache, &render_data, &uploaded_entities,
-        camera_chunk, cam_world, &loaded_index, lod_count, &lod_maps,
-        |e| &e.directions, true,
-    );
+    {
+        let _t = std::time::Instant::now();
+        update_draw_cache(
+            &mut draw_cache, &render_data, &uploaded_entities, &render_data.removed_entities,
+            camera_chunk, cam_world, &loaded_index, lod_count, &lod_maps,
+            |e| &e.directions, true,
+        );
+        crate::TIMING_DRAW_CACHE_OPAQUE_US.fetch_max(_t.elapsed().as_micros() as u32, std::sync::atomic::Ordering::Relaxed);
+    }
 
     // --- Update transparent draw cache (no backface cull — visible from both sides) ---
-    update_draw_cache(
-        &mut trans_draw_cache.0, &render_data, &uploaded_entities,
-        camera_chunk, cam_world, &loaded_index, lod_count, &lod_maps,
-        |e| &e.transparent_directions, false,
+    {
+        let _t = std::time::Instant::now();
+        update_draw_cache(
+            &mut trans_draw_cache.0, &render_data, &uploaded_entities, &render_data.removed_entities,
+            camera_chunk, cam_world, &loaded_index, lod_count, &lod_maps,
+            |e| &e.transparent_directions, false,
+        );
+        crate::TIMING_DRAW_CACHE_TRANS_US.fetch_max(_t.elapsed().as_micros() as u32, std::sync::atomic::Ordering::Relaxed);
+    }
+    render_data.removed_entities.clear();
+    crate::TIMING_DRAW_CACHE_ENTRIES.fetch_max(
+        (draw_cache.entries.len() + trans_draw_cache.0.entries.len()) as u32,
+        std::sync::atomic::Ordering::Relaxed,
     );
 
     // --- Per-frame: frustum cull cached entries and write to indirect buffer ---
@@ -1122,7 +1166,7 @@ pub fn synchronize_gpu(
         let cs = crate::chunk::CHUNK_SIZE as f32;
 
         for cached in &cache.entries {
-            if cached.skip { continue; }
+            if cached.dead || cached.backface_culled { continue; }
             let rel = cached.rel_chunk_pos - frustum_chunk_offset;
             let min = [rel.x as f32 * cs, rel.y as f32 * cs, rel.z as f32 * cs];
             let extent = cached.lod_scale as f32 * cs;
@@ -1178,27 +1222,30 @@ pub fn synchronize_gpu(
         let slab_count = gpu.slabs.len();
 
         // Opaque
+        let _t_cull = std::time::Instant::now();
         let (opaque_args, frustum_culled) = frustum_cull_cache(
             &draw_cache, &frustum_planes, frustum_chunk_offset, lod_count, slab_count,
         );
-        let (opaque_draws, next_offset) = write_draws_to_indirect(
-            &opaque_args, lod_count, &queue.0, &gpu.indirect_buffer, 0,
-        );
-
-        // Transparent
         let (trans_args, trans_culled) = frustum_cull_cache(
             &trans_draw_cache.0, &frustum_planes, frustum_chunk_offset, lod_count, slab_count,
+        );
+        crate::TIMING_FRUSTUM_CULL_US.fetch_max(_t_cull.elapsed().as_micros() as u32, std::sync::atomic::Ordering::Relaxed);
+
+        let _t_write = std::time::Instant::now();
+        let (opaque_draws, next_offset) = write_draws_to_indirect(
+            &opaque_args, lod_count, &queue.0, &gpu.indirect_buffer, 0,
         );
         let (trans_draws, _) = write_draws_to_indirect(
             &trans_args, lod_count, &queue.0, &gpu.indirect_buffer, next_offset,
         );
+        crate::TIMING_WRITE_INDIRECT_US.fetch_max(_t_write.elapsed().as_micros() as u32, std::sync::atomic::Ordering::Relaxed);
 
         gpu.draws = opaque_draws;
         gpu.transparent_draws = trans_draws;
         gpu.frustum_culled = frustum_culled + trans_culled;
     }
 
-    crate::TIMING_SYNC_DRAWS_US.store(_t_draws.elapsed().as_micros() as u32, std::sync::atomic::Ordering::Relaxed);
+    crate::TIMING_SYNC_DRAWS_US.fetch_max(_t_draws.elapsed().as_micros() as u32, std::sync::atomic::Ordering::Relaxed);
 }
 
 // --- Operations ---
