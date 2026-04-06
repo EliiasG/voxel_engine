@@ -22,7 +22,7 @@ pub struct ShadowConfig {
 impl Default for ShadowConfig {
     fn default() -> Self {
         Self {
-            scale_denominator: 2,
+            scale_denominator: 3,
             debug_overlay: false,
         }
     }
