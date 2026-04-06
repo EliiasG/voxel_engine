@@ -26,8 +26,8 @@ impl Default for ChunkSource {
         Self {
             start_radius: 4,
             step: 2,
-            end_radius: 8,
-            lod_count: 8,
+            end_radius: 6,
+            lod_count: 6,
             last_camera_chunk: None,
         }
     }
