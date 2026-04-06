@@ -24,10 +24,10 @@ pub struct ChunkSource {
 impl Default for ChunkSource {
     fn default() -> Self {
         Self {
-            start_radius: 3,
+            start_radius: 4,
             step: 2,
-            end_radius: 5,
-            lod_count: 6,
+            end_radius: 8,
+            lod_count: 8,
             last_camera_chunk: None,
         }
     }
